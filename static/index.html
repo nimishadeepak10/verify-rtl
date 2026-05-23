@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VerifyRTL — Automated RTL Verification</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="logo">
+      <div class="logo-icon">RTL</div>
+      <div>
+        <h1>VerifyRTL</h1>
+        <div class="tagline">Upload RTL · preview test plan · run Verilog / SV / UVM verification</div>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <main class="main-panel">
+      <section class="card">
+        <h3>1. Upload design (RTL)</h3>
+        <div class="tabs-inline">
+          <button type="button" class="active" data-mode="file">File upload</button>
+          <button type="button" data-mode="paste">Paste code</button>
+        </div>
+
+        <div id="uploadBlock">
+          <div class="upload-zone" id="uploadZone">
+            <input type="file" id="rtlFile" accept=".v,.sv,.verilog,.txt" />
+            <div class="icon">📁</div>
+            <p><strong>Drop Verilog / SystemVerilog here</strong></p>
+            <p>or click to browse (.v, .sv)</p>
+            <div class="file-name" id="fileName"></div>
+          </div>
+        </div>
+
+        <div id="pasteBlock" class="hidden field">
+          <label>RTL source</label>
+          <textarea id="rtlPaste" placeholder="module my_dut ( ... ); endmodule"></textarea>
+        </div>
+
+        <p style="margin-top:0.75rem">
+          <button type="button" class="btn btn-secondary" id="loadExample">Load 2-bit adder example</button>
+        </p>
+      </section>
+
+      <section class="card">
+        <h3>2. Verification language</h3>
+        <div class="lang-options">
+          <label class="lang-card">
+            <input type="radio" name="language" value="verilog" />
+            <strong>Verilog</strong>
+            <span>Directed TB, Icarus sim, VCD waveform</span>
+          </label>
+          <label class="lang-card selected">
+            <input type="radio" name="language" value="systemverilog" checked />
+            <strong>SystemVerilog</strong>
+            <span>SV testbench + simulation (recommended)</span>
+          </label>
+          <label class="lang-card">
+            <input type="radio" name="language" value="uvm" />
+            <strong>UVM</strong>
+            <span>Env, seq, driver, monitor — use Questa/VCS</span>
+          </label>
+        </div>
+
+        <div class="field">
+          <label for="topModule">Top module (optional)</label>
+          <input type="text" id="topModule" placeholder="Auto-detect first module if empty" />
+        </div>
+
+        <div class="actions">
+          <button type="button" class="btn btn-secondary" id="analyzeBtn">Refresh test plan</button>
+          <button type="button" class="btn btn-primary" id="runBtn">Run verification</button>
+        </div>
+      </section>
+
+      <section class="card results hidden" id="resultsSection">
+        <div class="results-header">
+          <h3 style="margin:0">3. Results</h3>
+          <span id="resultStatus" class="badge badge-neutral">—</span>
+        </div>
+        <p id="simulatorNote" class="side-empty" style="padding:0;margin:0 0 0.75rem;font-size:0.85rem"></p>
+        <div class="result-tabs">
+          <button type="button" class="active" data-panel="panelReport">Full report</button>
+          <button type="button" data-panel="panelTb">Generated testbench</button>
+          <button type="button" data-panel="panelLog">Simulation log</button>
+          <button type="button" data-panel="panelWave">Waveform (text)</button>
+        </div>
+        <div id="panelReport" class="result-panel active"><pre class="code-view" id="reportPre"></pre></div>
+        <div id="panelTb" class="result-panel"><pre class="code-view" id="tbPre"></pre></div>
+        <div id="panelLog" class="result-panel"><pre class="code-view" id="logPre"></pre></div>
+        <div id="panelWave" class="result-panel"><pre class="code-view" id="wavePre"></pre></div>
+        <p id="downloadRow" class="hidden" style="margin-top:0.75rem">
+          <a class="download-link" id="vcdLink" href="#">Download sim.vcd</a>
+          ·
+          <a class="download-link" id="reportLink" href="#">Download report.txt</a>
+        </p>
+      </section>
+    </main>
+
+    <aside class="side-panel">
+      <h2>Test plan preview</h2>
+      <p class="side-empty" id="sideEmpty">Upload or paste RTL to see DUT info, ports, and planned tests before you run simulation.</p>
+
+      <div id="sideContent" class="hidden">
+        <div class="info-block">
+          <div class="label">Status</div>
+          <div class="value"><span id="sideReady" class="badge badge-neutral">—</span></div>
+        </div>
+
+        <div class="info-block">
+          <div class="label">Module (DUT)</div>
+          <div class="value" id="sideModule">—</div>
+        </div>
+
+        <div class="info-block">
+          <div class="label">Source file</div>
+          <div class="value" id="sideFile">—</div>
+        </div>
+
+        <div class="info-block">
+          <div class="label">Lines / modules in file</div>
+          <div class="value"><span id="sideLines">—</span> lines · <span id="modulesList">—</span></div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="info-block">
+          <div class="label">Inferred function</div>
+          <div class="value" id="sideOp">—</div>
+        </div>
+
+        <div class="info-block">
+          <div class="label">Verification mode</div>
+          <div class="value" id="sideLang">—</div>
+        </div>
+
+        <div class="info-block">
+          <div class="label">Simulator</div>
+          <div class="value" id="sideSim">—</div>
+        </div>
+
+        <div class="info-block">
+          <div class="label">Planned tests</div>
+          <div class="value" id="sideTests">—</div>
+        </div>
+
+        <div class="info-block">
+          <div class="label">Checking style</div>
+          <div class="value" id="sideCheck">—</div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="info-block">
+          <div class="label">Port list</div>
+          <table class="port-table">
+            <thead>
+              <tr><th>Name</th><th>Dir</th><th>Range</th><th>W</th></tr>
+            </thead>
+            <tbody id="portTableBody"></tbody>
+          </table>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="info-block">
+          <div class="label">Pre-run checklist</div>
+          <ul class="checklist" id="checklist"></ul>
+        </div>
+
+        <div id="warningsBox" class="warnings hidden">
+          <strong>Notes</strong>
+          <ul id="warningsList"></ul>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
