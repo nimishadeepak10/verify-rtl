@@ -415,3 +415,9 @@ pre.code-view {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .hidden { display: none !important; }
+
+.backend-ok { color: var(--success); }
+.backend-missing { color: var(--muted); }
+
+#backendSelect option.backend-ok { color: var(--success); }
+#backendSelect option.backend-missing { color: var(--muted); }

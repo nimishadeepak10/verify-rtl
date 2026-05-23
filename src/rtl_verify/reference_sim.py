@@ -65,6 +65,8 @@ def _safe_eval_expr(expr: str, env: Dict[str, int]) -> int:
 
 
 def can_simulate_combinational(rtl: str, mod: RtlModule) -> bool:
+    if mod.is_sequential:
+        return False
     if not mod.inputs or not mod.outputs:
         return False
     try:

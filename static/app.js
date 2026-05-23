@@ -94,16 +94,45 @@ function refreshPreview() {
   previewDebounce = setTimeout(runAnalyze, 400);
 }
 
+function getBackend() {
+  const sel = $("#backendSelect");
+  return sel ? sel.value : "";
+}
+
 async function buildFormData() {
   const fd = new FormData();
   fd.append("language", getLanguage());
   fd.append("top_module", topModule.value.trim());
+  fd.append("backend", getBackend());
   if (rtlFileName && rtlFileName !== "(pasted)" && fileInput.files[0]) {
     fd.append("rtl_file", fileInput.files[0]);
   } else {
     fd.append("rtl_text", rtlContent);
   }
   return fd;
+}
+
+async function loadBackends() {
+  const select = $("#backendSelect");
+  if (!select) return;
+  try {
+    const res = await fetch("/api/backends");
+    const backends = await res.json();
+    select.innerHTML = '<option value="">Auto-detect best available</option>';
+    backends.forEach((b) => {
+      const opt = document.createElement("option");
+      opt.value = b.name;
+      const dot = b.available ? "●" : "○";
+      const ver = b.version ? ` (${b.version})` : "";
+      const suffix = b.available ? "" : " — not installed";
+      opt.textContent = `${dot} ${b.display_name}${ver}${suffix}`;
+      opt.className = b.available ? "backend-ok" : "backend-missing";
+      opt.disabled = !b.available;
+      select.appendChild(opt);
+    });
+  } catch (err) {
+    console.warn("Could not load backends:", err);
+  }
 }
 
 async function runAnalyze() {
@@ -143,6 +172,19 @@ function renderSidePanel(p) {
   $("#sideModule").textContent = p.module_name;
   $("#sideFile").textContent = p.file_name || "—";
   $("#sideLines").textContent = p.rtl_lines ?? "—";
+  const seqParts = [p.is_sequential ? "Sequential" : "Combinational"];
+  if (p.clock_port) seqParts.push(`clk=${p.clock_port}`);
+  if (p.reset_port) {
+    seqParts.push(`rst=${p.reset_port} (${p.reset_active_low ? "active-low" : "active-high"})`);
+  }
+  $("#sideSeq").textContent = seqParts.join(" · ");
+  const fsmBlock = document.getElementById("fsmBlock");
+  if (p.state_reg && p.states && p.states.length) {
+    fsmBlock.classList.remove("hidden");
+    $("#sideFsm").textContent = `${p.state_reg}: ${p.states.join(", ")}`;
+  } else {
+    fsmBlock.classList.add("hidden");
+  }
   $("#sideOp").textContent = p.inferred_operation_label;
   $("#sideLang").textContent = p.language_label;
   $("#sideSim").textContent = p.simulator;
@@ -216,9 +258,13 @@ runBtn.addEventListener("click", async () => {
     };
     $("#resultStatus").textContent = data.uvm_note ? "TB generated (UVM)" : (labels[status] || (data.success ? "PASS" : "FAIL"));
     $("#resultStatus").className = "badge " + (data.uvm_note ? "badge-warn" : (classes[status] || (data.success ? "badge-ok" : "badge-fail")));
-    if (data.simulator) {
-      const note = document.getElementById("simulatorNote");
-      if (note) note.textContent = "Simulator: " + data.simulator;
+    const note = document.getElementById("simulatorNote");
+    if (note) {
+      const parts = [];
+      if (data.backend_used) parts.push(`Backend: ${data.backend_used}`);
+      if (data.backend_version) parts.push(`v${data.backend_version}`);
+      if (data.simulator) parts.push(data.simulator);
+      note.textContent = parts.length ? parts.join(" · ") : "";
     }
 
     $("#reportPre").textContent = data.text_report || "";
@@ -266,5 +312,13 @@ $("#loadExample").addEventListener("click", async () => {
   refreshPreview();
 });
 
+const backendSelect = $("#backendSelect");
+if (backendSelect) {
+  backendSelect.addEventListener("change", () => {
+    if (rtlContent.trim()) refreshPreview();
+  });
+}
+
+loadBackends();
 setLanguage("systemverilog");
 runBtn.disabled = true;

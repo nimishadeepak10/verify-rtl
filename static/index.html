@@ -71,6 +71,13 @@
           <input type="text" id="topModule" placeholder="Auto-detect first module if empty" />
         </div>
 
+        <div class="field">
+          <label for="backendSelect">Simulator backend</label>
+          <select id="backendSelect">
+            <option value="">Auto-detect best available</option>
+          </select>
+        </div>
+
         <div class="actions">
           <button type="button" class="btn btn-secondary" id="analyzeBtn">Refresh test plan</button>
           <button type="button" class="btn btn-primary" id="runBtn">Run verification</button>
@@ -127,6 +134,16 @@
         </div>
 
         <div class="divider"></div>
+
+        <div class="info-block">
+          <div class="label">Design type</div>
+          <div class="value" id="sideSeq">—</div>
+        </div>
+
+        <div class="info-block hidden" id="fsmBlock">
+          <div class="label">FSM</div>
+          <div class="value" id="sideFsm">—</div>
+        </div>
 
         <div class="info-block">
           <div class="label">Inferred function</div>
