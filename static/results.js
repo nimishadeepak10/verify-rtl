@@ -368,7 +368,7 @@
       switchToRawTab();
       return;
     }
-    if (waveJsonCache && waveWorkDirCache === data.work_dir) {
+    if (waveJsonCache && waveWorkDirCache === data.work_dir && container._wvInstance) {
       if (window.WaveformViewer) WaveformViewer.render(container, waveJsonCache);
       return;
     }

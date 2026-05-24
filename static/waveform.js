@@ -1,17 +1,15 @@
 /**
- * VerifyRTL — in-browser SVG waveform viewer (GTKWave-style).
+ * VerifyRTL — in-browser SVG waveform viewer.
  */
 (function () {
   "use strict";
 
+  const ROW_H = 32;
+  const GROUP_H = 26;
+  const RULER_H = 32;
   const NAME_W = 220;
-  const ROW_H = 28;
-  const ROW_GAP = 4;
-  const GROUP_HDR = 24;
-  const MIN_ZOOM = 0.02;
-  const MAX_ZOOM = 200;
-  const LOD_THRESHOLD = 2000;
-  const MAX_NODES = 10000;
+  const MIN_ZOOM = 0.05;
+  const MAX_ZOOM = 500;
 
   const GROUP_ORDER = ["inputs", "outputs", "inouts", "testbench", "unknown"];
   const GROUP_LABELS = {
@@ -22,22 +20,28 @@
     unknown: "OTHER",
   };
 
+  function cssVar(name, fallback) {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || fallback;
+  }
+
   function toNs(t, data) {
     return t * (data.timescale_to_ns || 1);
   }
 
   function formatTime(ns) {
+    if (!Number.isFinite(ns)) return "—";
     if (ns >= 1000) return (ns / 1000).toFixed(3) + " µs";
     return ns.toFixed(3) + " ns";
   }
 
   function parseBin(val, width, radix, signed) {
-    const u = val.toUpperCase();
+    const u = String(val).toUpperCase();
     if (u === "X" || u === "Z") return u;
-    let bits = val.replace(/[^01]/g, "");
+    let bits = u.replace(/[^01]/g, "");
     if (!bits) bits = "0";
     bits = bits.padStart(width, "0").slice(-width);
-    const n = parseInt(bits, 2);
+    const n = parseInt(bits, 2) || 0;
     if (radix === "hex") {
       const hexW = Math.ceil(width / 4);
       return "0x" + n.toString(16).toUpperCase().padStart(hexW, "0");
@@ -46,24 +50,16 @@
     if (radix === "bin") return "0b" + bits;
     if (signed && width > 0) {
       const mask = 1 << (width - 1);
-      const v = (n ^ mask) - mask;
-      return String(v);
+      return String((n ^ mask) - mask);
     }
     return String(n);
   }
 
-  function downsample(transitions, minPxGap, timeToX) {
-    if (transitions.length <= LOD_THRESHOLD) return transitions;
-    const out = [transitions[0]];
-    let lastX = timeToX(transitions[0].time);
-    for (let i = 1; i < transitions.length; i++) {
-      const x = timeToX(transitions[i].time);
-      if (x - lastX >= minPxGap || i === transitions.length - 1) {
-        out.push(transitions[i]);
-        lastX = x;
-      }
-    }
-    return out.slice(0, 500);
+  function niceStep(spanNs) {
+    const steps = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000];
+    const target = spanNs / 8;
+    for (const s of steps) if (s >= target) return s;
+    return steps[steps.length - 1];
   }
 
   function buildGroupedSignals(data, filter, collapsed) {
@@ -74,175 +70,205 @@
       if (!groups[g]) groups[g] = [];
       groups[g].push(sig);
     });
-    Object.keys(groups).forEach((g) => {
-      groups[g].sort((a, b) => a.name.localeCompare(b.name));
+    GROUP_ORDER.forEach((g) => {
+      if (groups[g]) groups[g].sort((a, b) => a.name.localeCompare(b.name));
     });
     return { groups, collapsed };
   }
 
-  function WaveformViewer(container, data, options) {
+  function WaveformViewer(container, data) {
     this.container = container;
     this.data = data;
-    this.options = options || {};
-    this.nsMult = data.timescale_to_ns || 1;
-    this.endNs = (data.end_time || 0) * this.nsMult;
+    this.endNs = Math.max(toNs(data.end_time || 0, data), 1);
     this.zoom = 1;
     this.panNs = 0;
     this.filter = "";
-    this.collapsed = { testbench: true };
+    this.collapsed = { testbench: false };
     this.radix = {};
     this.signed = {};
     this.selected = null;
-    this.markerNs = null;
-    this.cursorNs = null;
+    this.markerNs = 0;
+    this.cursorNs = 0;
     this.dragging = false;
     this.dragStartX = 0;
     this.dragStartPan = 0;
-    this.minimapDrag = false;
     this._listeners = [];
+
+    this.colors = {
+      accent: cssVar("--accent", "#f7b955"),
+      inputs: cssVar("--led-blue", "#58a6ff"),
+      outputs: cssVar("--led-green", "#3fb950"),
+      inouts: cssVar("--led-amber", "#d29922"),
+      testbench: cssVar("--text-muted", "#8b949e"),
+      unknown: cssVar("--text-dim", "#6e7681"),
+      grid: cssVar("--border", "#30363d"),
+      gridMinor: cssVar("--border-soft", "#21262d"),
+      bgCell: "rgba(247, 185, 85, 0.15)",
+    };
+
     this._init();
   }
 
   WaveformViewer.prototype._init = function () {
     const el = this.container;
     el.innerHTML = "";
-    el.classList.add("waveform-viewer");
+    el.className = "waveform-viewer";
     el.tabIndex = 0;
 
     el.innerHTML = `
       <div class="wv-controls">
-        <button type="button" class="wv-btn" data-act="zoom-out" title="Zoom out">−</button>
-        <button type="button" class="wv-btn" data-act="zoom-in" title="Zoom in">+</button>
-        <button type="button" class="wv-btn" data-act="fit" title="Fit (0)">⤢ fit</button>
+        <button type="button" class="wv-btn" data-act="zoom-out" title="Zoom out (−)">−</button>
+        <button type="button" class="wv-btn" data-act="zoom-in" title="Zoom in (+)">+</button>
+        <button type="button" class="wv-btn" data-act="fit" title="Fit all (0)">⤢ FIT</button>
         <span class="wv-sep"></span>
-        <span class="wv-time-label">Time: <span class="wv-cursor-time">—</span></span>
+        <span class="wv-time-label">Cursor: <span class="wv-cursor-time">0 ns</span></span>
         <span class="wv-sep"></span>
+        <span class="wv-hint">Wheel = zoom · Drag = pan · Click = place marker</span>
         <label class="wv-filter">⌕ <input type="text" class="wv-filter-input" placeholder="filter signals" /></label>
+      </div>
+      <div class="wv-values-panel">
+        <div class="wv-values-title">VALUES AT CURSOR</div>
+        <div class="wv-values-table-wrap"><table class="wv-values-table"><tbody class="wv-values-body"></tbody></table></div>
       </div>
       <div class="wv-body">
         <div class="wv-names"></div>
-        <div class="wv-wave-wrap">
+        <div class="wv-wave-scroll">
           <svg class="wv-svg" xmlns="http://www.w3.org/2000/svg"></svg>
-          <div class="wv-tooltip hidden"></div>
         </div>
       </div>
-      <div class="wv-minimap">
-        <svg class="wv-minimap-svg" xmlns="http://www.w3.org/2000/svg"></svg>
-      </div>
-      <div class="wv-banner hidden"></div>
+      <div class="wv-minimap"><svg class="wv-minimap-svg" xmlns="http://www.w3.org/2000/svg"></svg></div>
     `;
 
-    this.ctrl = el.querySelector(".wv-controls");
     this.namesEl = el.querySelector(".wv-names");
-    this.waveWrap = el.querySelector(".wv-wave-wrap");
+    this.waveScroll = el.querySelector(".wv-wave-scroll");
     this.svg = el.querySelector(".wv-svg");
-    this.tooltip = el.querySelector(".wv-tooltip");
-    this.minimapSvg = el.querySelector(".wv-minimap-svg");
-    this.banner = el.querySelector(".wv-banner");
-    this.filterInput = el.querySelector(".wv-filter-input");
+    this.valuesBody = el.querySelector(".wv-values-body");
     this.cursorTimeEl = el.querySelector(".wv-cursor-time");
+    this.filterInput = el.querySelector(".wv-filter-input");
+    this.minimapSvg = el.querySelector(".wv-minimap-svg");
 
     this._bind();
-    this.fit();
-    this._render();
+    const self = this;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        self.fit();
+        self.cursorNs = 0;
+        self.markerNs = 0;
+        self._render();
+      });
+    });
   };
 
   WaveformViewer.prototype._bind = function () {
     const self = this;
-    const on = (node, ev, fn) => {
-      node.addEventListener(ev, fn);
-      self._listeners.push([node, ev, fn]);
-    };
 
-    this.ctrl.querySelector('[data-act="zoom-in"]').addEventListener("click", () => self.zoomAt(1.25, self._viewCenterNs()));
-    this.ctrl.querySelector('[data-act="zoom-out"]').addEventListener("click", () => self.zoomAt(1 / 1.25, self._viewCenterNs()));
-    this.ctrl.querySelector('[data-act="fit"]').addEventListener("click", () => self.fit());
+    this.container.querySelector('[data-act="zoom-in"]').onclick = () =>
+      self.zoomAt(1.3, self._viewCenterNs());
+    this.container.querySelector('[data-act="zoom-out"]').onclick = () =>
+      self.zoomAt(1 / 1.3, self._viewCenterNs());
+    this.container.querySelector('[data-act="fit"]').onclick = () => self.fit();
 
-    this.filterInput.addEventListener("input", () => {
+    this.filterInput.oninput = () => {
       self.filter = self.filterInput.value.trim();
       self._render();
-    });
+    };
 
-    this.waveWrap.addEventListener(
+    this.waveScroll.addEventListener(
       "wheel",
       (e) => {
         e.preventDefault();
-        const factor = e.ctrlKey ? 1.05 : 1.25;
-        const z = e.deltaY < 0 ? factor : 1 / factor;
-        const rect = self.waveWrap.getBoundingClientRect();
-        const frac = (e.clientX - rect.left) / rect.width;
-        const viewW = self._viewWidthNs();
-        const anchor = self.panNs + frac * viewW;
-        self.zoomAt(z, anchor);
+        const f = e.ctrlKey ? 1.08 : 1.25;
+        const z = e.deltaY < 0 ? f : 1 / f;
+        const rect = self.waveScroll.getBoundingClientRect();
+        const x = e.clientX - rect.left + self.waveScroll.scrollLeft;
+        const anchorNs = x / self.zoom;
+        self.zoomAt(z, anchorNs);
       },
       { passive: false }
     );
 
-    on(this.waveWrap, "mousedown", (e) => {
+    let scrollSync = false;
+    this.waveScroll.addEventListener("scroll", () => {
+      self.panNs = self.waveScroll.scrollLeft / self.zoom;
+      if (!scrollSync) {
+        scrollSync = true;
+        self.namesEl.scrollTop = self.waveScroll.scrollTop;
+        scrollSync = false;
+      }
+      self._renderGridAndCursor();
+    });
+    this.namesEl.addEventListener("scroll", () => {
+      if (!scrollSync) {
+        scrollSync = true;
+        self.waveScroll.scrollTop = self.namesEl.scrollTop;
+        scrollSync = false;
+      }
+    });
+
+    this.waveScroll.addEventListener("mousedown", (e) => {
       if (e.button !== 0) return;
       self.dragging = true;
       self.dragStartX = e.clientX;
-      self.dragStartPan = self.panNs;
-    });
-    on(window, "mousemove", (e) => {
-      if (self.dragging) {
-        const dx = e.clientX - self.dragStartX;
-        self.panNs = self.dragStartPan - dx / self.zoom;
-        self._render();
-        return;
-      }
-      const rect = self.waveWrap.getBoundingClientRect();
-      if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
-        const x = e.clientX - rect.left;
-        self.cursorNs = self.panNs + x / self.zoom;
-        self._updateCursor();
-      }
-    });
-    on(window, "mouseup", () => {
-      self.dragging = false;
-      self.minimapDrag = false;
+      self.dragStartScroll = self.waveScroll.scrollLeft;
     });
 
-    on(this.waveWrap, "click", (e) => {
-      const rect = self.waveWrap.getBoundingClientRect();
-      self.markerNs = self.panNs + (e.clientX - rect.left) / self.zoom;
+    window.addEventListener("mousemove", (e) => {
+      if (self.dragging) {
+        const dx = self.dragStartX - e.clientX;
+        self.waveScroll.scrollLeft = self.dragStartScroll + dx;
+        return;
+      }
+      const rect = self.waveScroll.getBoundingClientRect();
+      if (
+        e.clientX >= rect.left &&
+        e.clientX <= rect.right &&
+        e.clientY >= rect.top &&
+        e.clientY <= rect.bottom
+      ) {
+        const x = e.clientX - rect.left + self.waveScroll.scrollLeft;
+        self.cursorNs = x / self.zoom;
+        self._updateValuesPanel();
+        self._renderGridAndCursor();
+      }
+    });
+
+    window.addEventListener("mouseup", () => {
+      self.dragging = false;
+    });
+
+    this.waveScroll.addEventListener("click", (e) => {
+      const x = e.clientX - self.waveScroll.getBoundingClientRect().left + self.waveScroll.scrollLeft;
+      self.markerNs = x / self.zoom;
+      self.cursorNs = self.markerNs;
+      self._updateValuesPanel();
       self._render();
     });
 
-    on(this.container, "keydown", (e) => {
-      const viewW = self._viewWidthNs();
-      if (e.key === "+" || e.key === "=") self.zoomAt(1.25, self.panNs + viewW / 2);
-      if (e.key === "-") self.zoomAt(1 / 1.25, self.panNs + viewW / 2);
+    this.container.addEventListener("keydown", (e) => {
+      const vw = self._viewWidthNs();
+      if (e.key === "+" || e.key === "=") self.zoomAt(1.25, self.panNs + vw / 2);
+      if (e.key === "-") self.zoomAt(1 / 1.25, self.panNs + vw / 2);
       if (e.key === "0") self.fit();
-      if (e.key === "ArrowLeft") {
-        self.panNs -= viewW * 0.1;
-        self._render();
-      }
-      if (e.key === "ArrowRight") {
-        self.panNs += viewW * 0.1;
-        self._render();
-      }
+      if (e.key === "ArrowLeft") self.waveScroll.scrollLeft -= 40;
+      if (e.key === "ArrowRight") self.waveScroll.scrollLeft += 40;
       if (e.key === "Home") {
-        self.panNs = 0;
-        self._render();
+        self.waveScroll.scrollLeft = 0;
+        self.cursorNs = 0;
       }
       if (e.key === "End") {
-        self.panNs = Math.max(0, self.endNs - viewW);
-        self._render();
+        self.waveScroll.scrollLeft = self._contentWidth() - self.waveScroll.clientWidth;
+        self.cursorNs = self.endNs;
       }
-    });
-
-    on(this.minimapSvg, "mousedown", (e) => {
-      self.minimapDrag = true;
-      self._minimapJump(e);
-    });
-    on(this.minimapSvg, "mousemove", (e) => {
-      if (self.minimapDrag) self._minimapJump(e);
+      self._updateValuesPanel();
     });
   };
 
+  WaveformViewer.prototype._contentWidth = function () {
+    return Math.max(this.endNs * this.zoom, this.waveScroll.clientWidth || 400);
+  };
+
   WaveformViewer.prototype._viewWidthNs = function () {
-    return Math.max(this.waveWrap.clientWidth, 100) / this.zoom;
+    return (this.waveScroll.clientWidth || 400) / this.zoom;
   };
 
   WaveformViewer.prototype._viewCenterNs = function () {
@@ -250,146 +276,132 @@
   };
 
   WaveformViewer.prototype.zoomAt = function (factor, anchorNs) {
-    const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this.zoom * factor));
-    const viewW = this.waveWrap.clientWidth / this.zoom;
-    const newViewW = this.waveWrap.clientWidth / newZoom;
-    this.panNs = anchorNs - (anchorNs - this.panNs) * (newViewW / viewW);
-    this.zoom = newZoom;
+    const oldZoom = this.zoom;
+    this.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this.zoom * factor));
+    const ratio = this.zoom / oldZoom;
+    const newScroll = anchorNs * this.zoom - (anchorNs * oldZoom - this.waveScroll.scrollLeft) * ratio;
+    this.waveScroll.scrollLeft = Math.max(0, newScroll);
+    this.panNs = this.waveScroll.scrollLeft / this.zoom;
     this._render();
   };
 
   WaveformViewer.prototype.fit = function () {
-    const w = Math.max(this.waveWrap.clientWidth, 100);
-    this.zoom = w / Math.max(this.endNs, 1);
+    const w = this.waveScroll.clientWidth || 600;
+    this.zoom = w / this.endNs;
+    this.waveScroll.scrollLeft = 0;
     this.panNs = 0;
     this._render();
   };
 
-  WaveformViewer.prototype._timeToX = function (tRaw) {
-    return (toNs(tRaw, this.data) - this.panNs) * this.zoom;
+  WaveformViewer.prototype._traceColor = function (sig) {
+    return this.colors[sig.group] || this.colors.unknown;
   };
 
-  WaveformViewer.prototype._xToNs = function (x) {
-    return this.panNs + x / this.zoom;
+  WaveformViewer.prototype._buildLayout = function () {
+    const { groups } = buildGroupedSignals(this.data, this.filter, this.collapsed);
+    const rows = [];
+    let y = RULER_H;
+    GROUP_ORDER.forEach((gid) => {
+      const sigs = groups[gid];
+      if (!sigs || !sigs.length) return;
+      rows.push({ type: "group", gid, y, h: GROUP_H, count: sigs.length });
+      y += GROUP_H;
+      if (!this.collapsed[gid]) {
+        sigs.forEach((sig) => {
+          rows.push({ type: "signal", gid, sig, y, h: ROW_H });
+          y += ROW_H;
+        });
+      }
+    });
+    return { rows, totalH: Math.max(y, 160) };
   };
 
   WaveformViewer.prototype._valueAt = function (sig, ns) {
-    const tr = sig.transitions;
-    if (!tr.length) return { raw: "0", bits: "0" };
+    const tr = sig.transitions || [];
+    if (!tr.length) return "0";
     let val = tr[0].value;
     for (let i = 0; i < tr.length; i++) {
       if (toNs(tr[i].time, this.data) > ns) break;
       val = tr[i].value;
     }
-    return { raw: val, bits: val };
+    return val;
   };
 
-  WaveformViewer.prototype._updateCursor = function () {
-    if (this.cursorNs == null) return;
-    this.cursorTimeEl.textContent = formatTime(this.cursorNs);
-    const lines = [`t = ${formatTime(this.cursorNs)}`];
+  WaveformViewer.prototype._updateValuesPanel = function () {
+    const ns = this.cursorNs != null ? this.cursorNs : 0;
+    this.cursorTimeEl.textContent = formatTime(ns);
     const { groups } = buildGroupedSignals(this.data, this.filter, this.collapsed);
+    let html = "";
     GROUP_ORDER.forEach((gid) => {
       const sigs = groups[gid];
-      if (!sigs || this.collapsed[gid]) return;
+      if (!sigs || !sigs.length || this.collapsed[gid]) return;
+      const col = this.colors[gid] || this.colors.unknown;
       sigs.forEach((sig) => {
-        const v = this._valueAt(sig, this.cursorNs);
         const rad = this.radix[sig.name] || "hex";
-        const disp = parseBin(v.bits, sig.width, rad, this.signed[sig.name]);
-        lines.push(`${sig.name.padEnd(10)} = ${disp}`);
+        const disp = parseBin(this._valueAt(sig, ns), sig.width, rad, this.signed[sig.name]);
+        html += `<tr>
+          <td class="wv-val-sig" style="color:${col}">${sig.name}</td>
+          <td class="wv-val-width">[${sig.width - 1}:0]</td>
+          <td class="wv-val-v">${disp}</td>
+          <td class="wv-val-g">${GROUP_LABELS[gid] || gid}</td>
+        </tr>`;
       });
     });
-    this.tooltip.textContent = lines.join("\n");
-    this.tooltip.classList.remove("hidden");
-    const rect = this.waveWrap.getBoundingClientRect();
-    const cx = (this.cursorNs - this.panNs) * this.zoom;
-    let left = cx + 12;
-    if (left + 200 > rect.width) left = cx - 212;
-    this.tooltip.style.left = Math.max(4, left) + "px";
-    this.tooltip.style.top = "8px";
-    const line = this.svg.querySelector(".wv-cursor-line");
-    if (line) line.setAttribute("x1", cx).setAttribute("x2", cx);
-  };
-
-  WaveformViewer.prototype._minimapJump = function (e) {
-    const rect = this.minimapSvg.getBoundingClientRect();
-    const frac = (e.clientX - rect.left) / rect.width;
-    const viewW = this._viewWidthNs();
-    this.panNs = Math.max(0, Math.min(this.endNs - viewW, frac * this.endNs - viewW / 2));
-    this._render();
+    if (!html) html = '<tr><td colspan="4" class="wv-val-empty">No signals visible</td></tr>';
+    this.valuesBody.innerHTML = html;
   };
 
   WaveformViewer.prototype._render = function () {
-    const w = Math.max(this.waveWrap.clientWidth, 100);
-    const h = this._layoutHeight();
-    this.waveWrap.style.height = h + "px";
-    this.namesEl.style.height = h + "px";
+    const { rows, totalH } = this._buildLayout();
+    this._rows = rows;
+    const contentW = this._contentWidth();
 
-    this._renderNames();
-    this._renderSvg(w, h);
+    this._renderNames(rows, totalH);
+    this._renderSvg(rows, totalH, contentW);
     this._renderMinimap();
-    this._updateCursor();
+    this._updateValuesPanel();
+    this.panNs = this.waveScroll.scrollLeft / this.zoom;
   };
 
-  WaveformViewer.prototype._layoutHeight = function () {
-    const { groups } = buildGroupedSignals(this.data, this.filter, this.collapsed);
-    let rows = 0;
-    GROUP_ORDER.forEach((gid) => {
-      if (!groups[gid] || !groups[gid].length) return;
-      rows += GROUP_HDR;
-      if (!this.collapsed[gid]) rows += groups[gid].length * (ROW_H + ROW_GAP);
-    });
-    return Math.max(rows, 120) + 32;
-  };
-
-  WaveformViewer.prototype._renderNames = function () {
+  WaveformViewer.prototype._renderNames = function (rows, totalH) {
     const self = this;
-    const { groups } = buildGroupedSignals(this.data, this.filter, this.collapsed);
-    let y = 28;
-    let html = `<div class="wv-ruler-spacer"></div>`;
-    GROUP_ORDER.forEach((gid) => {
-      const sigs = groups[gid];
-      if (!sigs || !sigs.length) return;
-      const collapsed = !!this.collapsed[gid];
-      const arrow = collapsed ? "▶" : "▼";
-      html += `<div class="wv-group-hdr" data-group="${gid}" style="top:${y}px">
-        <span class="wv-group-toggle">${arrow} ${GROUP_LABELS[gid] || gid.toUpperCase()}${collapsed ? ` (${sigs.length})` : ""}</span>
-      </div>`;
-      y += GROUP_HDR;
-      if (!collapsed) {
-        sigs.forEach((sig) => {
-          const sel = this.selected === sig.name ? " wv-sig-selected" : "";
-          const dim = this.selected && this.selected !== sig.name ? " wv-sig-dim" : "";
-          const rng = sig.width > 1 ? `[${sig.width - 1}:0]` : "";
-          html += `<div class="wv-sig-row${sel}${dim}" data-sig="${sig.name}" style="height:${ROW_H}px;margin-bottom:${ROW_GAP}px">
-            <span class="wv-sig-name">${sig.name}</span>
-            <span class="wv-sig-width">${rng}</span>
-          </div>`;
-          y += ROW_H + ROW_GAP;
-        });
+    let html = `<div class="wv-ruler-spacer">TIME →</div>`;
+    rows.forEach((row) => {
+      if (row.type === "group") {
+        const collapsed = !!this.collapsed[row.gid];
+        const arrow = collapsed ? "▶" : "▼";
+        const col = this.colors[row.gid] || this.colors.unknown;
+        html += `<div class="wv-group-hdr" data-group="${row.gid}" style="height:${row.h}px;border-left-color:${col}">
+          <span style="color:${col}">${arrow} ${GROUP_LABELS[row.gid]}${collapsed ? ` (${row.count})` : ""}</span>
+        </div>`;
+      } else {
+        const sig = row.sig;
+        const sel = this.selected === sig.name ? " wv-sig-selected" : "";
+        const dim = this.selected && this.selected !== sig.name ? " wv-sig-dim" : "";
+        const col = this._traceColor(sig);
+        const rng = sig.width > 1 ? `[${sig.width - 1}:0]` : "";
+        html += `<div class="wv-sig-row${sel}${dim}" data-sig="${sig.name}" style="height:${row.h}px;border-left-color:${col}">
+          <span class="wv-sig-name" style="color:${col}">${sig.name}</span>
+          <span class="wv-sig-width">${rng}</span>
+        </div>`;
       }
     });
     this.namesEl.innerHTML = html;
+    this.namesEl.style.minHeight = totalH + "px";
 
     this.namesEl.querySelectorAll(".wv-group-hdr").forEach((hdr) => {
-      hdr.addEventListener("click", () => {
+      hdr.onclick = () => {
         const g = hdr.dataset.group;
         self.collapsed[g] = !self.collapsed[g];
         self._render();
-      });
+      };
     });
     this.namesEl.querySelectorAll(".wv-sig-row").forEach((row) => {
-      row.addEventListener("click", () => {
+      row.onclick = () => {
         self.selected = self.selected === row.dataset.sig ? null : row.dataset.sig;
         self._render();
-      });
-      row.addEventListener("dblclick", () => {
-        self._fitSignal(row.dataset.sig);
-      });
-      row.addEventListener("contextmenu", (e) => {
-        e.preventDefault();
-        self._showRadixMenu(e, row.dataset.sig);
-      });
+      };
+      row.ondblclick = () => self._fitSignal(row.dataset.sig);
     });
   };
 
@@ -398,326 +410,275 @@
     if (!sig || !sig.transitions.length) return;
     const t0 = toNs(sig.transitions[0].time, this.data);
     const t1 = toNs(sig.transitions[sig.transitions.length - 1].time, this.data);
-    const span = Math.max(t1 - t0, 1);
-    const w = this.waveWrap.clientWidth;
-    this.zoom = w / span;
-    this.panNs = Math.max(0, t0 - span * 0.05);
+    const span = Math.max(t1 - t0, this.endNs * 0.05);
+    this.zoom = (this.waveScroll.clientWidth || 400) / span;
+    this.waveScroll.scrollLeft = Math.max(0, t0 * this.zoom - 20);
     this._render();
   };
 
-  WaveformViewer.prototype._showRadixMenu = function (e, sigName) {
-    const old = document.querySelector(".wv-ctx-menu");
-    if (old) old.remove();
-    const menu = document.createElement("div");
-    menu.className = "wv-ctx-menu";
-    menu.style.left = e.clientX + "px";
-    menu.style.top = e.clientY + "px";
-    ["hex", "decimal", "binary", "unsigned", "signed"].forEach((opt) => {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.textContent = opt;
-      btn.addEventListener("click", () => {
-        if (opt === "signed") this.signed[sigName] = true;
-        else if (opt === "unsigned") this.signed[sigName] = false;
-        else this.radix[sigName] = opt === "decimal" ? "dec" : opt === "binary" ? "bin" : "hex";
-        menu.remove();
-        this._render();
-      });
-      menu.appendChild(btn);
-    });
-    document.body.appendChild(menu);
-    const close = () => {
-      menu.remove();
-      document.removeEventListener("click", close);
-    };
-    setTimeout(() => document.addEventListener("click", close), 0);
+  WaveformViewer.prototype._timeToX = function (tRaw) {
+    return toNs(tRaw, this.data) * this.zoom;
   };
 
-  WaveformViewer.prototype._renderSvg = function (w, h) {
+  WaveformViewer.prototype._renderSvg = function (rows, totalH, contentW) {
     const ns = "http://www.w3.org/2000/svg";
-    while (this.svg.firstChild) this.svg.removeChild(this.svg.firstChild);
+    const h = totalH;
+    const w = contentW;
     this.svg.setAttribute("width", w);
     this.svg.setAttribute("height", h);
+    this.svg.innerHTML = "";
 
     const defs = document.createElementNS(ns, "defs");
-    const patX = document.createElementNS(ns, "pattern");
-    patX.setAttribute("id", "wv-hatch-x");
-    patX.setAttribute("width", "6");
-    patX.setAttribute("height", "6");
-    patX.setAttribute("patternUnits", "userSpaceOnUse");
-    const lx = document.createElementNS(ns, "line");
-    lx.setAttribute("x1", "0");
-    lx.setAttribute("y1", "0");
-    lx.setAttribute("x2", "6");
-    lx.setAttribute("y2", "6");
-    lx.setAttribute("stroke", "var(--led-red)");
-    patX.appendChild(lx);
-    defs.appendChild(patX);
+    const pat = document.createElementNS(ns, "pattern");
+    pat.setAttribute("id", "wv-hatch-x");
+    pat.setAttribute("width", "6");
+    pat.setAttribute("height", "6");
+    pat.setAttribute("patternUnits", "userSpaceOnUse");
+    const ln = document.createElementNS(ns, "line");
+    ln.setAttribute("x1", "0");
+    ln.setAttribute("y1", "0");
+    ln.setAttribute("x2", "6");
+    ln.setAttribute("y2", "6");
+    ln.setAttribute("stroke", "#f85149");
+    pat.appendChild(ln);
+    defs.appendChild(pat);
     this.svg.appendChild(defs);
 
+    const gGrid = document.createElementNS(ns, "g");
+    const pan = this.waveScroll.scrollLeft / this.zoom;
     const viewW = this._viewWidthNs();
-    const major = 100;
-    const minor = 10;
-    for (let t = Math.floor(this.panNs / minor) * minor; t < this.panNs + viewW; t += minor) {
-      const x = (t - this.panNs) * this.zoom;
-      if (x < 0 || x > w) continue;
-      const ln = document.createElementNS(ns, "line");
-      ln.setAttribute("x1", x);
-      ln.setAttribute("x2", x);
-      ln.setAttribute("y1", 0);
-      ln.setAttribute("y2", h);
-      ln.setAttribute("stroke", t % major === 0 ? "var(--border)" : "var(--border-soft)");
-      ln.setAttribute("stroke-width", t % major === 0 ? "1" : "0.5");
-      ln.setAttribute("stroke-dasharray", t % major === 0 ? "" : "2,4");
-      this.svg.appendChild(ln);
-      if (t % major === 0 && t >= 0) {
+    const major = niceStep(viewW);
+    const minor = major / 5;
+    const nSteps = Math.ceil((this.endNs + major) / minor);
+    for (let i = 0; i <= nSteps; i++) {
+      const t = i * minor;
+      const x = t * this.zoom;
+      if (x > w + 10) break;
+      const isMajor = i % 5 === 0;
+      const gl = document.createElementNS(ns, "line");
+      gl.setAttribute("x1", x);
+      gl.setAttribute("x2", x);
+      gl.setAttribute("y1", 0);
+      gl.setAttribute("y2", h);
+      gl.setAttribute("stroke", isMajor ? this.colors.grid : this.colors.gridMinor);
+      gl.setAttribute("stroke-width", isMajor ? "1" : "0.5");
+      if (!isMajor) gl.setAttribute("stroke-dasharray", "2,4");
+      gGrid.appendChild(gl);
+      if (isMajor) {
         const tx = document.createElementNS(ns, "text");
-        tx.setAttribute("x", x + 2);
-        tx.setAttribute("y", 12);
-        tx.setAttribute("class", "wv-grid-label");
+        tx.setAttribute("x", x + 4);
+        tx.setAttribute("y", 20);
+        tx.setAttribute("fill", "#8b949e");
+        tx.setAttribute("font-family", "JetBrains Mono, monospace");
+        tx.setAttribute("font-size", "10");
         tx.textContent = formatTime(t);
-        this.svg.appendChild(tx);
+        gGrid.appendChild(tx);
       }
     }
+    this.svg.appendChild(gGrid);
 
-    let nodeCount = 0;
-    let y = 28;
-    const { groups } = buildGroupedSignals(this.data, this.filter, this.collapsed);
-    const timeToX = (t) => this._timeToX(t);
-
-    GROUP_ORDER.forEach((gid) => {
-      const sigs = groups[gid];
-      if (!sigs || !sigs.length) return;
-      y += GROUP_HDR;
-      if (this.collapsed[gid]) return;
-      sigs.forEach((sig) => {
-        const rowY = y;
-        const dim = this.selected && this.selected !== sig.name;
-        const trs = downsample(sig.transitions, 2, timeToX);
-        if (sig.width === 1) {
-          nodeCount += this._drawScalar(sig, trs, rowY, dim);
-        } else {
-          nodeCount += this._drawBus(sig, trs, rowY, dim);
-        }
-        y += ROW_H + ROW_GAP;
-      });
+    rows.forEach((row) => {
+      if (row.type !== "signal") return;
+      const sig = row.sig;
+      const color = this._traceColor(sig);
+      const y0 = row.y;
+      const trs = sig.transitions || [];
+      if (sig.width === 1) this._drawScalar(sig, trs, y0, color);
+      else this._drawBus(sig, trs, y0, color);
     });
 
-    if (nodeCount > MAX_NODES) {
-      this.banner.textContent =
-        "Showing first 500 signal transitions per signal. Zoom in for full detail.";
-      this.banner.classList.remove("hidden");
-    } else {
-      this.banner.classList.add("hidden");
-    }
+    const mx = this.markerNs * this.zoom;
+    const ml = document.createElementNS(ns, "line");
+    ml.setAttribute("class", "wv-marker-line");
+    ml.setAttribute("x1", mx);
+    ml.setAttribute("x2", mx);
+    ml.setAttribute("y1", 0);
+    ml.setAttribute("y2", h);
+    ml.setAttribute("stroke", "#58a6ff");
+    ml.setAttribute("stroke-width", "2");
+    ml.setAttribute("stroke-dasharray", "6,3");
+    this.svg.appendChild(ml);
 
-    if (this.markerNs != null) {
-      const mx = (this.markerNs - this.panNs) * this.zoom;
-      const ml = document.createElementNS(ns, "line");
-      ml.setAttribute("class", "wv-marker-line");
-      ml.setAttribute("x1", mx);
-      ml.setAttribute("x2", mx);
-      ml.setAttribute("y1", 0);
-      ml.setAttribute("y2", h);
-      this.svg.appendChild(ml);
-    }
+    this._cursorLine = document.createElementNS(ns, "line");
+    this._cursorLine.setAttribute("class", "wv-cursor-line");
+    this._cursorLine.setAttribute("y1", 0);
+    this._cursorLine.setAttribute("y2", h);
+    this._cursorLine.setAttribute("stroke", this.colors.accent);
+    this._cursorLine.setAttribute("stroke-width", "2");
+    this.svg.appendChild(this._cursorLine);
 
-    const cl = document.createElementNS(ns, "line");
-    cl.setAttribute("class", "wv-cursor-line");
-    cl.setAttribute("y1", 0);
-    cl.setAttribute("y2", h);
-    this.svg.appendChild(cl);
+    this._renderGridAndCursor();
   };
 
-  WaveformViewer.prototype._drawScalar = function (sig, trs, rowY, dim) {
+  WaveformViewer.prototype._renderGridAndCursor = function () {
+    if (!this._cursorLine) return;
+    const cx = this.cursorNs * this.zoom;
+    this._cursorLine.setAttribute("x1", cx);
+    this._cursorLine.setAttribute("x2", cx);
+  };
+
+  WaveformViewer.prototype._drawScalar = function (sig, trs, rowY, color) {
     const ns = "http://www.w3.org/2000/svg";
-    const base = rowY + 20;
-    const hi = rowY + 6;
-    let nodes = 0;
+    const hi = rowY + 8;
+    const lo = rowY + 26;
     const g = document.createElementNS(ns, "g");
-    if (dim) g.setAttribute("opacity", "0.5");
-    let prevX = null;
-    let prevHi = false;
+    let px = null;
+    let ph = false;
     trs.forEach((tr, i) => {
       const x = this._timeToX(tr.time);
-      const v = tr.value.toUpperCase();
+      const v = String(tr.value).toUpperCase();
       const isHi = v === "1";
       const isX = v === "X" || v === "Z";
-      if (prevX !== null) {
+      if (px !== null) {
         const path = document.createElementNS(ns, "path");
-        let d = `M ${prevX} ${prevHi ? hi : base} H ${x}`;
-        if (prevHi !== isHi && !isX) d += ` V ${isHi ? hi : base}`;
-        path.setAttribute("d", d);
+        const y1 = ph ? hi : lo;
+        const y2 = isHi ? hi : lo;
+        path.setAttribute("d", `M ${px} ${y1} H ${x} V ${y2}`);
         path.setAttribute("fill", "none");
-        path.setAttribute("stroke", isX ? "var(--led-red)" : "var(--accent)");
-        path.setAttribute("stroke-width", "1.5");
-        if (isX) path.setAttribute("stroke-dasharray", "4,2");
+        path.setAttribute("stroke", isX ? "#f85149" : color);
+        path.setAttribute("stroke-width", "2");
         g.appendChild(path);
-        nodes++;
       }
-      if (isX) {
-        const r = document.createElementNS(ns, "rect");
-        r.setAttribute("x", x - 4);
-        r.setAttribute("y", hi);
-        r.setAttribute("width", 8);
-        r.setAttribute("height", base - hi);
-        r.setAttribute("fill", "url(#wv-hatch-x)");
-        g.appendChild(r);
-        nodes++;
-      }
-      prevX = x;
-      prevHi = isHi;
+      px = x;
+      ph = isHi;
       if (i === trs.length - 1) {
         const tail = document.createElementNS(ns, "line");
         tail.setAttribute("x1", x);
-        tail.setAttribute("x2", this.waveWrap.clientWidth + 10);
-        tail.setAttribute("y1", isHi ? hi : base);
-        tail.setAttribute("y2", isHi ? hi : base);
-        tail.setAttribute("stroke", "var(--accent)");
-        tail.setAttribute("stroke-width", "1.5");
+        tail.setAttribute("x2", this._contentWidth());
+        tail.setAttribute("y1", isHi ? hi : lo);
+        tail.setAttribute("y2", isHi ? hi : lo);
+        tail.setAttribute("stroke", color);
+        tail.setAttribute("stroke-width", "2");
         g.appendChild(tail);
-        nodes++;
       }
     });
     this.svg.appendChild(g);
-    return nodes;
   };
 
-  WaveformViewer.prototype._drawBus = function (sig, trs, rowY, dim) {
+  WaveformViewer.prototype._drawBus = function (sig, trs, rowY, color) {
     const ns = "http://www.w3.org/2000/svg";
     const top = rowY + 6;
-    const bot = rowY + 22;
+    const bot = rowY + 26;
     const mid = (top + bot) / 2;
     const rad = this.radix[sig.name] || "hex";
-    const signed = !!this.signed[sig.name];
-    let nodes = 0;
     const g = document.createElementNS(ns, "g");
-    if (dim) g.setAttribute("opacity", "0.5");
 
     for (let i = 0; i < trs.length; i++) {
-      const t0 = trs[i].time;
-      const t1 = i + 1 < trs.length ? trs[i + 1].time : this.data.end_time;
-      const x0 = this._timeToX(t0);
-      const x1 = this._timeToX(t1);
-      const w = x1 - x0;
-      if (x1 < 0 || x0 > this.waveWrap.clientWidth) continue;
+      const x0 = this._timeToX(trs[i].time);
+      const x1 = i + 1 < trs.length ? this._timeToX(trs[i + 1].time) : this.endNs * this.zoom;
+      const bw = Math.max(x1 - x0, 3);
       const val = trs[i].value;
-      const u = val.toUpperCase();
+      const u = String(val).toUpperCase();
+
       const fill = document.createElementNS(ns, "rect");
       fill.setAttribute("x", x0);
       fill.setAttribute("y", top);
-      fill.setAttribute("width", Math.max(w, 2));
+      fill.setAttribute("width", bw);
       fill.setAttribute("height", bot - top);
-      fill.setAttribute("fill", "var(--accent-soft)");
-      fill.setAttribute("stroke", "none");
+      fill.setAttribute("fill", color);
+      fill.setAttribute("opacity", "0.2");
       g.appendChild(fill);
 
       const path = document.createElementNS(ns, "path");
-      const d = `M ${x0} ${top} L ${x0 + 5} ${mid} L ${x0} ${bot} H ${x1 - 5} L ${x1} ${mid} L ${x1 - 5} ${top} H ${x0}`;
+      const d = `M ${x0} ${top} L ${x0 + 5} ${mid} L ${x0} ${bot} H ${x0 + bw - 5} L ${x0 + bw} ${mid} L ${x0 + bw - 5} ${top} Z`;
       path.setAttribute("d", d);
-      path.setAttribute("fill", "none");
-      path.setAttribute("stroke", u === "X" || u === "Z" ? "var(--led-amber)" : "var(--accent)");
+      path.setAttribute("fill", color);
+      path.setAttribute("fill-opacity", "0.25");
+      path.setAttribute("stroke", color);
       path.setAttribute("stroke-width", "1.5");
       g.appendChild(path);
-      nodes += 2;
 
-      if (w > 28) {
-        const label = parseBin(val, sig.width, rad, signed);
+      if (bw > 24) {
+        const label = parseBin(val, sig.width, rad, this.signed[sig.name]);
         const tx = document.createElementNS(ns, "text");
-        tx.setAttribute("x", x0 + w / 2);
+        tx.setAttribute("x", x0 + bw / 2);
         tx.setAttribute("y", mid + 4);
         tx.setAttribute("text-anchor", "middle");
-        tx.setAttribute("class", "wv-val-label");
+        tx.setAttribute("fill", "#e6edf3");
+        tx.setAttribute("font-family", "JetBrains Mono, monospace");
+        tx.setAttribute("font-size", "11");
         tx.textContent = u === "X" || u === "Z" ? u : label;
         g.appendChild(tx);
-        nodes++;
-      } else if (w > 8) {
-        const tx = document.createElementNS(ns, "text");
-        tx.setAttribute("x", x0 + w / 2);
-        tx.setAttribute("y", mid + 4);
-        tx.setAttribute("text-anchor", "middle");
-        tx.setAttribute("class", "wv-val-label");
-        tx.textContent = "›";
-        g.appendChild(tx);
-        nodes++;
       }
     }
     this.svg.appendChild(g);
-    return nodes;
   };
 
   WaveformViewer.prototype._renderMinimap = function () {
     const ns = "http://www.w3.org/2000/svg";
-    const w = this.minimapSvg.clientWidth || this.container.clientWidth;
-    const h = 40;
-    while (this.minimapSvg.firstChild) this.minimapSvg.removeChild(this.minimapSvg.firstChild);
+    const w = this.minimapSvg.clientWidth || this.container.clientWidth || 400;
+    const h = 48;
     this.minimapSvg.setAttribute("width", w);
     this.minimapSvg.setAttribute("height", h);
-    const end = Math.max(this.endNs, 1);
-    const bandH = 6;
-    let by = 4;
-    (this.data.signals || []).slice(0, 32).forEach((sig) => {
-      const trs = sig.transitions;
-      if (!trs.length) return;
+    this.minimapSvg.innerHTML = "";
+    const end = this.endNs;
+    let by = 2;
+    (this.data.signals || []).forEach((sig, si) => {
+      const col = this._traceColor(sig);
+      const trs = sig.transitions || [];
       trs.forEach((tr, i) => {
         const t0 = toNs(tr.time, this.data);
-        const t1 =
-          i + 1 < trs.length ? toNs(trs[i + 1].time, this.data) : end;
-        const rect = document.createElementNS(ns, "rect");
-        rect.setAttribute("x", (t0 / end) * w);
-        rect.setAttribute("y", by);
-        rect.setAttribute("width", Math.max(((t1 - t0) / end) * w, 0.5));
-        rect.setAttribute("height", bandH);
-        rect.setAttribute("fill", "var(--accent)");
-        rect.setAttribute("opacity", "0.6");
-        this.minimapSvg.appendChild(rect);
+        const t1 = i + 1 < trs.length ? toNs(trs[i + 1].time, this.data) : end;
+        const r = document.createElementNS(ns, "rect");
+        r.setAttribute("x", (t0 / end) * w);
+        r.setAttribute("y", by + (si % 4) * 2);
+        r.setAttribute("width", Math.max(((t1 - t0) / end) * w, 1));
+        r.setAttribute("height", 8);
+        r.setAttribute("fill", col);
+        r.setAttribute("opacity", "0.85");
+        this.minimapSvg.appendChild(r);
       });
-      by += bandH + 1;
     });
     const viewW = this._viewWidthNs();
     const vx = (this.panNs / end) * w;
-    const vw = Math.min(w, (viewW / end) * w);
+    const vw = Math.max(8, (viewW / end) * w);
     const vp = document.createElementNS(ns, "rect");
-    vp.setAttribute("class", "wv-minimap-viewport");
+    vp.setAttribute("fill", "rgba(247,185,85,0.15)");
+    vp.setAttribute("stroke", this.colors.accent);
+    vp.setAttribute("stroke-width", "1.5");
     vp.setAttribute("x", vx);
     vp.setAttribute("y", 0);
     vp.setAttribute("width", vw);
     vp.setAttribute("height", h);
     this.minimapSvg.appendChild(vp);
+
+    this.minimapSvg.onmousedown = (e) => {
+      const rect = this.minimapSvg.getBoundingClientRect();
+      const frac = (e.clientX - rect.left) / rect.width;
+      this.waveScroll.scrollLeft = Math.max(0, frac * this._contentWidth() - this.waveScroll.clientWidth / 2);
+      this._render();
+    };
   };
 
   WaveformViewer.prototype.destroy = function () {
-    this._listeners.forEach(([node, ev, fn]) => node.removeEventListener(ev, fn));
-    this._listeners = [];
     this.container.innerHTML = "";
     this.container.classList.remove("waveform-viewer");
-    document.querySelectorAll(".wv-ctx-menu").forEach((m) => m.remove());
   };
 
   window.WaveformViewer = {
-    render: function (container, data, options) {
-      if (container._wvInstance) {
-        container._wvInstance.destroy();
-      }
+    render: function (container, data) {
+      if (container._wvInstance) container._wvInstance.destroy();
       if (data.error) {
         container.innerHTML = `<div class="wv-error">${data.error}</div>`;
         return null;
       }
-      const inst = new WaveformViewer(container, data, options);
+      const inst = new WaveformViewer(container, data);
       container._wvInstance = inst;
-      const ro = new ResizeObserver(() => inst._render());
+      const ro = new ResizeObserver(() => {
+        if (container._wvInstance) container._wvInstance._render();
+      });
       ro.observe(container);
-      inst._resizeObs = ro;
+      container._wvResizeObs = ro;
       return inst;
     },
     destroy: function (container) {
+      if (container._wvResizeObs) {
+        container._wvResizeObs.disconnect();
+        delete container._wvResizeObs;
+      }
       if (container._wvInstance) {
         container._wvInstance.destroy();
         delete container._wvInstance;
-      }
-      if (container._resizeObs) {
-        container._resizeObs.disconnect();
-        delete container._resizeObs;
       }
     },
   };
