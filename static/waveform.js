@@ -658,8 +658,13 @@
   window.WaveformViewer = {
     render: function (container, data) {
       if (container._wvInstance) container._wvInstance.destroy();
-      if (data.error) {
-        container.innerHTML = `<div class="wv-error">${data.error}</div>`;
+      if (!data || data.error) {
+        container.innerHTML = `<div class="wv-error">${(data && data.error) || "No waveform data"}</div>`;
+        return null;
+      }
+      if (!data.signals || !data.signals.length) {
+        container.innerHTML =
+          '<div class="wv-error">No signals in waveform data. Re-run verification after restarting the server.</div>';
         return null;
       }
       const inst = new WaveformViewer(container, data);

@@ -143,6 +143,13 @@ async def verify(
     report_path = result.work_dir / "report.txt"
     report_path.write_text(result.text_report, encoding="utf-8")
 
+    waveform_json_data = None
+    if result.vcd_path is not None:
+        mod_info = load_module_info(result.work_dir)
+        waveform_json_data = vcd_to_json(result.vcd_path, module_info=mod_info)
+        if "error" in waveform_json_data:
+            waveform_json_data = None
+
     return {
         "success": result.success,
         "status": getattr(result, "status", "pass" if result.success else "fail"),
@@ -157,8 +164,9 @@ async def verify(
         "text_report": result.text_report,
         "waveform_text": result.waveform_text,
         "uvm_note": result.uvm_note,
-        "work_dir": str(result.work_dir),
+        "work_dir": result.work_dir.as_posix(),
         "has_vcd": result.vcd_path is not None,
+        "waveform_json": waveform_json_data,
         "preview": preview,
     }
 

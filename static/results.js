@@ -1,11 +1,10 @@
 /**
- * VerifyRTL — results screen: summary, case table, tabs, downloads.
+ * VerifyRTL — results screen: summary, case table, tabs, waveform loader.
  */
 (function () {
   "use strict";
 
   let activeFilter = "all";
-  let expandedRow = null;
   let waveJsonCache = null;
   let waveWorkDirCache = null;
 
@@ -23,47 +22,22 @@
       const trimmed = line.trim();
       if (!trimmed) continue;
 
-      // PASS t=5000 a=0 b=0 sum=0
       let m = trimmed.match(/^PASS\s+t=\d+\s+(.+)$/i);
       if (m) {
-        const fields = parseFields(m[1]);
-        rows.push(makeRow(idx++, "Simulation", "Vector check", fields, fields, "PASS", trimmed));
+        rows.push(makeRow(idx++, "Simulation", "Vector check", parseFields(m[1]), parseFields(m[1]), "PASS", trimmed));
         continue;
       }
 
-      // PASS a=0 b=0 sum=0 (legacy)
       m = trimmed.match(/^PASS\s+(.+)$/i);
       if (m && !trimmed.includes("PASS=")) {
-        const fields = parseFields(m[1]);
-        rows.push(makeRow(idx++, "Simulation", "Vector check", fields, fields, "PASS", trimmed));
+        rows.push(makeRow(idx++, "Simulation", "Vector check", parseFields(m[1]), parseFields(m[1]), "PASS", trimmed));
         continue;
       }
 
-      // FAIL t=5000 exp_sum=0 got_sum=3
       m = trimmed.match(/^FAIL\s+t=\d+\s+(.+)$/i);
       if (m) {
         const parts = parseFailFields(m[1]);
-        rows.push(
-          makeRow(idx++, "Simulation", "Mismatch", parts.inputs, parts.expected, "FAIL", trimmed, parts.got)
-        );
-        continue;
-      }
-
-      // FAIL test N ...
-      m = trimmed.match(/^FAIL\s+test\s+(\d+)\s+exp=(\S+)\s+got=(\S+)/i);
-      if (m) {
-        rows.push(
-          makeRow(
-            idx++,
-            "Simulation",
-            `Test ${m[1]} mismatch`,
-            {},
-            { out: m[2] },
-            "FAIL",
-            trimmed,
-            { out: m[3] }
-          )
-        );
+        rows.push(makeRow(idx++, "Simulation", "Mismatch", parts.inputs, parts.expected, "FAIL", trimmed, parts.got));
       }
     }
     return rows;
@@ -101,19 +75,8 @@
       got,
       result,
       detail,
-      tags: inferTags(category, desc),
+      tags: ["simulation"],
     };
-  }
-
-  function inferTags(category, desc) {
-    const d = (desc || "").toLowerCase();
-    const tags = [];
-    if (d.includes("directed") || category.toLowerCase().includes("directed")) tags.push("directed");
-    if (d.includes("corner")) tags.push("corner");
-    if (d.includes("random")) tags.push("random");
-    if (d.includes("negative")) tags.push("negative");
-    if (!tags.length) tags.push("simulation");
-    return tags;
   }
 
   function rowsFromVplan(plan, overallPass) {
@@ -161,6 +124,7 @@
   function render(data) {
     const mount = $("#resultsMount");
     if (!mount) return;
+
     if (waveWorkDirCache !== data.work_dir) {
       waveJsonCache = null;
       waveWorkDirCache = null;
@@ -179,13 +143,11 @@
 
     const passed = rows.filter((r) => r.result === "PASS").length;
     const failed = rows.filter((r) => r.result === "FAIL").length;
-    const total = rows.length || (pass ? 16 : 0);
-
     const passCnt = simLog.match(/PASS=(\d+)/);
     const failCnt = simLog.match(/FAIL=(\d+)/);
     const pN = passCnt ? passCnt[1] : passed;
     const fN = failCnt ? failCnt[1] : failed;
-    const tN = passCnt && failCnt ? String(+pN + +fN) : String(total);
+    const tN = passCnt && failCnt ? String(+pN + +fN) : String(rows.length || 0);
 
     const backendParts = [];
     if (data.backend_used) backendParts.push(data.backend_used);
@@ -245,12 +207,18 @@
     `;
 
     App._resultRows = rows;
+    App._lastVerifyData = data;
     renderTableBody(rows);
 
     $("#reportPre").textContent = data.text_report || "";
     $("#tbPre").textContent = data.testbench || "";
     $("#logPre").textContent = simLog;
     $("#wavePre").textContent = data.waveform_text || "No waveform data.";
+
+    if (data.waveform_json && data.waveform_json.signals && data.waveform_json.signals.length) {
+      waveJsonCache = data.waveform_json;
+      waveWorkDirCache = data.work_dir;
+    }
 
     const dl = $("#downloadRow");
     if (data.has_vcd && data.work_dir) {
@@ -260,10 +228,8 @@
         `<button type="button" id="dlTb">↓ testbench.sv</button>`;
       $("#dlTb").addEventListener("click", () => downloadText(data.testbench || "", "testbench.sv"));
     } else {
-      dl.innerHTML =
-        `<button type="button" id="dlTb">↓ testbench.sv</button>`;
-      const tbBtn = $("#dlTb");
-      if (tbBtn) tbBtn.addEventListener("click", () => downloadText(data.testbench || "", "testbench.sv"));
+      dl.innerHTML = `<button type="button" id="dlTb">↓ testbench.sv</button>`;
+      $("#dlTb").addEventListener("click", () => downloadText(data.testbench || "", "testbench.sv"));
     }
 
     document.querySelectorAll(".filter-chips .chip").forEach((chip) => {
@@ -291,11 +257,6 @@
 
     if (!pass && status !== "sim_missing") {
       document.querySelector('.result-tabs button[data-panel="panelLog"]')?.click();
-    }
-
-    App.stepState.results = "done";
-    if (window.App && App.gotoStep) {
-      /* already on results */
     }
   }
 
@@ -359,37 +320,65 @@
     });
   }
 
+  function showWaveError(container, message) {
+    if (window.WaveformViewer) WaveformViewer.destroy(container);
+    container.innerHTML = `<div class="wv-error">${App.escapeHtml(message)}</div>`;
+  }
+
+  async function fetchWaveformJson(workDir) {
+    const res = await fetch("/api/waveform/json?work_dir=" + encodeURIComponent(workDir));
+    const json = await res.json();
+    if (!res.ok) {
+      throw new Error(json.detail || json.error || `HTTP ${res.status} — restart the server to load Phase A.8`);
+    }
+    if (json.error) {
+      throw new Error(json.error);
+    }
+    if (!json.signals || !json.signals.length) {
+      throw new Error("Waveform JSON has no signals — re-run verification.");
+    }
+    return json;
+  }
+
   async function loadWaveformVisual(data) {
     const container = $("#waveVisual");
     if (!container) return;
-    if (!data.has_vcd || !data.work_dir) {
-      container.innerHTML =
-        '<div class="wv-error">No VCD waveform available for this run.</div>';
+
+    if (!data.has_vcd) {
+      showWaveError(container, "No VCD waveform available for this run.");
       switchToRawTab();
       return;
     }
-    if (waveJsonCache && waveWorkDirCache === data.work_dir && container._wvInstance) {
+
+    const workDir = data.work_dir;
+
+    if (waveJsonCache && waveWorkDirCache === workDir && waveJsonCache.signals && waveJsonCache.signals.length) {
       if (window.WaveformViewer) WaveformViewer.render(container, waveJsonCache);
       return;
     }
+
+    if (data.waveform_json && data.waveform_json.signals && data.waveform_json.signals.length) {
+      waveJsonCache = data.waveform_json;
+      waveWorkDirCache = workDir;
+      if (window.WaveformViewer) WaveformViewer.render(container, waveJsonCache);
+      return;
+    }
+
     container.innerHTML = '<div class="plan-loading"><span class="spinner"></span> Loading waveform…</div>';
+
     try {
-      const res = await fetch(
-        "/api/waveform/json?work_dir=" + encodeURIComponent(data.work_dir)
-      );
-      const json = await res.json();
-      if (json.error) {
-        container.innerHTML = `<div class="wv-error">${App.escapeHtml(json.error)}</div>`;
-        switchToRawTab();
-        return;
-      }
+      const json = await fetchWaveformJson(workDir);
       waveJsonCache = json;
-      waveWorkDirCache = data.work_dir;
+      waveWorkDirCache = workDir;
       if (window.WaveformViewer) {
         WaveformViewer.render(container, json);
       }
     } catch (err) {
-      container.innerHTML = `<div class="wv-error">Failed to load waveform: ${App.escapeHtml(String(err))}</div>`;
+      showWaveError(
+        container,
+        String(err.message || err) +
+          " Tip: stop old servers and run: python -m uvicorn api.main:app --host 127.0.0.1 --port 8004"
+      );
       switchToRawTab();
     }
   }

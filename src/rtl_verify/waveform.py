@@ -191,6 +191,7 @@ def _parse_vcd_events(vcd_path: Path) -> Tuple[str, float, Dict[str, Dict[str, A
     by_name: Dict[str, Dict[str, Any]] = {}
     current_time = 0
     definitions_done = False
+    pending_timescale = False
 
     def ensure_signal(sig_name: str, sym: str, width: int) -> None:
         if sig_name not in by_name:
@@ -216,7 +217,17 @@ def _parse_vcd_events(vcd_path: Path) -> Tuple[str, float, Dict[str, Dict[str, A
             if m:
                 timescale = m.group(1).strip()
                 ns_mult = _timescale_to_ns(timescale)
+            else:
+                pending_timescale = True
             continue
+        if pending_timescale:
+            if line.startswith("$"):
+                pending_timescale = False
+            elif line.strip() and not line.startswith("$"):
+                timescale = line.strip()
+                ns_mult = _timescale_to_ns(timescale)
+                pending_timescale = False
+                continue
         if line.startswith("$scope"):
             parts = line.split()
             if len(parts) >= 3:
