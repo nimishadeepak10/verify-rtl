@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from .analyzer import PortDirection, RtlModule, analyze_rtl, _strip_comments
 from .backends.registry import ALL_BACKENDS, auto_select, get_backend
+from .combinational_model import can_evaluate_combinational
 from .generators.base import TbLanguage
 from .generators import verilog_tb as vtb
 
@@ -32,11 +33,13 @@ def _resolve_simulator_label(
             return f"Unknown backend: {backend}", False
         if not chosen.is_available():
             return f"{chosen.display_name} — not installed", False
+        if chosen.name == "reference" and mod.is_sequential:
+            return f"{chosen.display_name} — sequential RTL needs Icarus", False
         ver = chosen.version()
         label = chosen.display_name + (f" ({ver})" if ver else "")
         return label, True
 
-    chosen = auto_select(language.value)
+    chosen = auto_select(language.value, is_sequential=mod.is_sequential)
     if chosen:
         ver = chosen.version()
         label = chosen.display_name + (f" ({ver})" if ver else "")
@@ -69,7 +72,12 @@ def build_test_preview(
         test_count = 0
         strategy = "manual"
 
-    self_check = mod.inferred_op in ("add", "and", "xor") and mod.inputs and mod.outputs
+    self_check = (
+        not mod.is_sequential
+        and mod.inputs
+        and mod.outputs
+        and can_evaluate_combinational(rtl, mod)
+    )
     stim_ports = mod.data_inputs if mod.is_sequential else mod.inputs
     stim_space = 1
     for p in stim_ports:
@@ -88,8 +96,13 @@ def build_test_preview(
         warnings.append("No input ports — directed stimulus cannot be auto-generated.")
     if not mod.outputs:
         warnings.append("No output ports — results cannot be checked automatically.")
-    if not self_check:
-        warnings.append("Golden model unknown — simulation will log outputs (monitor mode).")
+    if not self_check and not mod.is_sequential:
+        warnings.append(
+            "Golden model unavailable — simulation will log outputs (monitor mode). "
+            "Use assign-based combinational RTL for automatic checking."
+        )
+    elif not self_check and mod.is_sequential:
+        warnings.append("Sequential designs use monitor-only checks unless a reference model is provided.")
     if language == TbLanguage.UVM:
         warnings.append("UVM will not run in-browser; download TB and use your UVM simulator.")
     if mod.is_sequential and not mod.clock_port:
@@ -172,9 +185,12 @@ def _op_label(op: Optional[str]) -> str:
     return {
         "add": "Addition (a + b)",
         "and": "Bitwise AND",
+        "or": "Bitwise OR",
         "xor": "Bitwise XOR",
+        "sub": "Subtraction (a - b)",
+        "not": "Bitwise NOT",
         "binary_op": "Two-input combinational logic",
-        None: "Not inferred — monitor-only",
+        None: "Derived from assign statements when available",
     }.get(op, op or "Unknown")
 
 

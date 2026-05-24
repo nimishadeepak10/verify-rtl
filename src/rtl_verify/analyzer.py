@@ -265,8 +265,12 @@ def _infer_operation(clean: str, ports: List[Port]) -> Optional[str]:
         return "add"
     if re.search(r"assign\s+\w+\s*=\s*\w+\s*&\s*\w+", clean):
         return "and"
-    if re.search(r"assign\s+\w+\s*=\s*\w+\s*\^\s*\w+", clean):
-        return "xor"
+    if re.search(r"assign\s+\w+\s*=\s*\w+\s*\|\s*\w+", clean):
+        return "or"
+    if re.search(r"assign\s+\w+\s*=\s*\w+\s*-\s*\w+", clean):
+        return "sub"
+    if re.search(r"assign\s+\w+\s*=\s*~\s*\w+", clean):
+        return "not"
     ins = [p for p in ports if p.direction == PortDirection.INPUT]
     outs = [p for p in ports if p.direction == PortDirection.OUTPUT]
     if len(ins) == 2 and len(outs) == 1:

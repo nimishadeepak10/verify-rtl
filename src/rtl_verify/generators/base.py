@@ -12,9 +12,13 @@ class TbLanguage(str, Enum):
     UVM = "uvm"
 
 
-def generate_testbench(mod: RtlModule, language: TbLanguage) -> str:
+def generate_testbench(
+    mod: RtlModule,
+    language: TbLanguage,
+    rtl_source: str | None = None,
+) -> str:
     if language == TbLanguage.VERILOG:
-        return verilog_tb.generate(mod)
+        return verilog_tb.generate(mod, rtl_source)
     if language == TbLanguage.UVM:
         return uvm_tb.generate(mod)
-    return sv_tb.generate(mod)
+    return sv_tb.generate(mod, rtl_source)

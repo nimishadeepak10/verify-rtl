@@ -24,10 +24,15 @@ def get_backend(name: str) -> Optional[SimulatorBackend]:
     return None
 
 
-def auto_select(language: str = "systemverilog") -> Optional[SimulatorBackend]:
+def auto_select(
+    language: str = "systemverilog",
+    is_sequential: bool = False,
+) -> Optional[SimulatorBackend]:
     """Pick the best available backend for the language."""
     for b in available_backends():
         if language == "uvm" and not b.supports_uvm:
+            continue
+        if is_sequential and b.name == "reference":
             continue
         return b
     return None

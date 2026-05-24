@@ -10,7 +10,7 @@ Automates a **directed-test** RTL verification flow: parse your design, generate
 | 2. Analyze | Extract ports; infer combinational ops; detect **clock**, **reset**, **FSM** for sequential designs |
 | 3. Generate TB | Combinational: exhaustive/random data tests. Sequential: clock + reset sequence, then clocked data stimulus |
 | 4. Simulate | Pluggable backend (`icarus`, `reference`, …) → `sim.vcd` |
-| 5. Report | PASS/FAIL in log, full text report, waveform samples as text, VCD download |
+| 5. Report | PASS/FAIL in log, full text report, interactive waveform viewer, VCD download |
 
 ## Sequential designs
 
@@ -56,11 +56,31 @@ pip install -r requirements.txt
 python -m uvicorn api.main:app --reload --app-dir c:\Users\Nimisha\verification_tb
 ```
 
-Open http://127.0.0.1:8000 (or another port if 8000 is in use).
+Open http://127.0.0.1:8000 (use another port if 8000 is busy, e.g. `--port 8005`).
 
-**Workspace UI (Phase A.7):** a five-step flow — **Design → Plan → Run → Results → Coverage** — with left navigation, instrument-panel styling (JetBrains Mono + IBM Plex Sans, amber trace accent), and a full **verification plan** on the Plan screen (expandable categories, toggles, coverage goals). Load `examples/adder_2bit.v` via **Load example**, analyze, then run verification end-to-end.
+**Workspace UI (Phase A.7):** a five-step flow — **Design → Plan → Run → Results → Coverage** — with left navigation, instrument-panel styling (JetBrains Mono + IBM Plex Sans, amber trace accent), and a full **verification plan** on the Plan screen (expandable categories, toggles, coverage goals). Load an example via **Load example**, analyze, then run verification end-to-end.
 
-**Waveform viewer (Phase A.8):** on the Results screen, open the **Waveform** tab and use **Visual** (default) for an interactive in-browser SVG viewer — zoom/pan, cursor values, signal groups, and minimap. Combinational runs include a **reference clock** (`ref_clk`) at the top of the viewer as a visual time ruler (10 ns period, not connected to the DUT). **Raw VCD Dump** keeps the text fallback. Data comes from `GET /api/waveform/json`.
+**Waveform viewer (Phase A.8–A.9):** on the Results screen, open the **Waveform** tab and use **Visual** (default) for an in-browser SVG viewer:
+
+| Feature | Description |
+|---------|-------------|
+| Signal groups | **REFERENCE** (combinational only), **INPUTS**, **OUTPUTS**, **TESTBENCH**, **RESULTS** (`pass_cnt` / `fail_cnt`) |
+| Reference clock | Combinational TBs emit `ref_clk` (toggle every 5 ns, 10 ns period) as a visual time ruler — not connected to the DUT |
+| Multi-bit buses | Shown as a bus row plus per-bit rows `signal(n)` (MSB first); counters stay as single rows |
+| Time axis | Fixed time scale above the traces, aligned with vertical grid lines |
+| Controls | **+** / **−** / **FIT** zoom; click to place cursor; filter box for signal names |
+| Data | Embedded in `POST /api/verify` as `waveform_json`, or `GET /api/waveform/json?work_dir=...` |
+
+**Raw VCD Dump** keeps the text fallback. After a code change, hard-refresh the browser (**Ctrl+Shift+R**) so `waveform.js` reloads.
+
+### Examples
+
+| File | Type | Notes |
+|------|------|--------|
+| `examples/adder_2bit.v` | Combinational | 2-bit adder (classic demo) |
+| `examples/and_2bit.v`, `or_2bit.v`, `xor_2bit.v` | Combinational | Gate primitives |
+| `examples/alu_4bit.v`, `examples/alu_8bit.v` | Combinational | Wider ops, good for bus expansion in the viewer |
+| `examples/traffic_light_fsm.v` | Sequential | Moore FSM with `clk`, `rst_n`, `go` — uses real clock, no `ref_clk` |
 
 ## Languages
 
@@ -70,10 +90,11 @@ Open http://127.0.0.1:8000 (or another port if 8000 is in use).
 ## Architecture
 
 ```
-RTL upload → analyzer.py (ports, clock/reset, FSM, inferred op)
+RTL upload → analyzer.py (ports, clock/reset, FSM, is_sequential)
+          → combinational_model.py (assign-based golden reference, when applicable)
           → generators/ (verilog | sv | uvm)
           → backends/ (pluggable simulators via registry)
-          → waveform.py (VCD → text)
+          → waveform.py (VCD → text / JSON + dut_info.json grouping)
           → report.txt + sim.vcd
 ```
 
@@ -96,11 +117,15 @@ Structured verification plans (`vplan`) model industry-style test planning **bef
 **CLI:** `python run_verify.py examples\adder_2bit.v --vplan`  
 **API:** `POST /api/vplan` (JSON body via form fields, same toggles as above)
 
-The existing `/api/analyze` preview and web UI are unchanged in Part 1; Part 2 will render the vplan in the UI and drive the testbench from it.
+The web UI renders the vplan on the Plan step; testbench generation uses the same analyzer and vplan builder logic as the CLI.
+
+## Combinational golden model
+
+For non-sequential RTL, `combinational_model.py` can evaluate `assign`-based expressions (arithmetic and bitwise) to produce expected outputs for self-checking testbenches and the Python **reference** simulator backend. The analyzer still tags common ops (`add`, `and`, `xor`) for reporting; the model extends checking to a broader class of assign-only designs when parsing succeeds.
 
 ## Limitations
 
-- Self-checking golden model only for inferred combinational ops (add/and/xor)
+- Self-checking depends on parseable `assign` expressions or inferred ops; complex RTL may need manual review
 - Sequential designs use monitor-style checks unless a combinational golden model applies
 - FSM path coverage is directed (exhaustive on data inputs), not formal
 - Complex SystemVerilog RTL may need manual top module name

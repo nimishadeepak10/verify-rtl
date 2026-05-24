@@ -86,13 +86,16 @@ class IcarusBackend(SimulatorBackend):
                 success=False,
                 log="Icarus Verilog (iverilog) not found. Install from https://bleyer.org/icarus/",
                 vcd_path=None,
-                work_dir=work_dir,
+                work_dir=work_abs,
                 duration_sec=time.perf_counter() - t0,
             )
 
         work_dir.mkdir(parents=True, exist_ok=True)
-        sim_v = work_dir / "sim.vvp"
-        vcd = work_dir / "sim.vcd"
+        work_abs = work_dir.resolve()
+        rtl_abs = rtl_path.resolve()
+        tb_abs = tb_path.resolve()
+        sim_v = work_abs / "sim.vvp"
+        vcd = work_abs / "sim.vcd"
 
         vvp = find_vvp(iverilog)
         if not vvp:
@@ -100,11 +103,11 @@ class IcarusBackend(SimulatorBackend):
                 success=False,
                 log="vvp not found (install Icarus Verilog and add bin to PATH).",
                 vcd_path=None,
-                work_dir=work_dir,
+                work_dir=work_abs,
                 duration_sec=time.perf_counter() - t0,
             )
 
-        compile_cmd = [iverilog, "-g2012", "-o", str(sim_v), str(rtl_path), str(tb_path)]
+        compile_cmd = [iverilog, "-g2012", "-o", str(sim_v), str(rtl_abs), str(tb_abs)]
         run_cmd = [vvp, str(sim_v)]
         log_lines: list[str] = []
 
@@ -113,7 +116,7 @@ class IcarusBackend(SimulatorBackend):
                 compile_cmd,
                 capture_output=True,
                 text=True,
-                cwd=str(work_dir),
+                cwd=str(work_abs),
                 timeout=60,
             )
             log_lines.append("=== COMPILE ===")
@@ -124,7 +127,7 @@ class IcarusBackend(SimulatorBackend):
                     success=False,
                     log="\n".join(log_lines),
                     vcd_path=None,
-                    work_dir=work_dir,
+                    work_dir=work_abs,
                     duration_sec=time.perf_counter() - t0,
                 )
 
@@ -132,7 +135,7 @@ class IcarusBackend(SimulatorBackend):
                 run_cmd,
                 capture_output=True,
                 text=True,
-                cwd=str(work_dir),
+                cwd=str(work_abs),
                 timeout=120,
             )
             log_lines.append("=== SIMULATION ===")
@@ -143,7 +146,7 @@ class IcarusBackend(SimulatorBackend):
                 success=ok,
                 log="\n".join(log_lines),
                 vcd_path=vcd if vcd.exists() else None,
-                work_dir=work_dir,
+                work_dir=work_abs,
                 duration_sec=time.perf_counter() - t0,
             )
         except subprocess.TimeoutExpired:
@@ -152,7 +155,7 @@ class IcarusBackend(SimulatorBackend):
                 success=False,
                 log="\n".join(log_lines),
                 vcd_path=None,
-                work_dir=work_dir,
+                work_dir=work_abs,
                 duration_sec=time.perf_counter() - t0,
             )
         except FileNotFoundError as e:
@@ -161,6 +164,6 @@ class IcarusBackend(SimulatorBackend):
                 success=False,
                 log="\n".join(log_lines),
                 vcd_path=None,
-                work_dir=work_dir,
+                work_dir=work_abs,
                 duration_sec=time.perf_counter() - t0,
             )

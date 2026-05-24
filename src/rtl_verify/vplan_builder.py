@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .analyzer import Port, PortDirection, RtlModule, _strip_comments
 from .backends.registry import ALL_BACKENDS, auto_select, get_backend
+from .combinational_model import can_evaluate_combinational, expected_outputs
 from .vplan import (
     CategoryStatus,
     CoverageGoal,
@@ -24,6 +25,9 @@ _HANDSHAKE_NAMES = frozenset(
 )
 
 
+_PLAN_RTL: str = ""
+
+
 def build_vplan(
     rtl: str,
     module: RtlModule,
@@ -33,6 +37,8 @@ def build_vplan(
     language: str = "systemverilog",
 ) -> VerificationPlan:
     """Build full verification plan with category-level toggles."""
+    global _PLAN_RTL
+    _PLAN_RTL = rtl
     enabled_categories = enabled_categories or {}
     enabled_subcategories = enabled_subcategories or {}
     notes: List[PlanNote] = []
@@ -41,7 +47,11 @@ def build_vplan(
     has_io = bool(data_ins) and bool(module.outputs)
     input_bits = sum(p.width for p in data_ins)
     input_space = 1 << input_bits if input_bits else 0
-    self_check = module.inferred_op in ("add", "and", "xor") and has_io
+    self_check = (
+        not module.is_sequential
+        and has_io
+        and can_evaluate_combinational(rtl, module)
+    )
 
     categories: List[TestCategory] = []
 
@@ -134,9 +144,22 @@ def _fmt(v: int, width: int) -> str:
 
 
 def _expected(
-    module: RtlModule, inputs: Dict[str, int]
+    module: RtlModule,
+    inputs: Dict[str, int],
+    rtl: str = "",
 ) -> Optional[Dict[str, str]]:
-    if not module.outputs or module.inferred_op not in ("add", "and", "xor"):
+    if not module.outputs:
+        return None
+    if rtl and not module.is_sequential and can_evaluate_combinational(rtl, module):
+        try:
+            golden = expected_outputs(rtl, module, inputs)
+            return {
+                name: _fmt(val, next(p.width for p in module.outputs if p.name == name))
+                for name, val in golden.items()
+            }
+        except Exception:
+            return None
+    if module.inferred_op not in ("add", "and", "xor"):
         return None
     ins = module.data_inputs if module.is_sequential else module.inputs
     if len(ins) < 2:
@@ -164,7 +187,7 @@ def _case(
     self_check: bool = True,
 ) -> TestCase:
     ins = {k: _fmt(v, next(p.width for p in module.ports if p.name == k)) for k, v in inputs.items()}
-    exp = _expected(module, inputs) if self_check else None
+    exp = _expected(module, inputs, _PLAN_RTL) if self_check else None
     return TestCase(
         id=cid,
         description=desc,
@@ -801,16 +824,7 @@ def _derive_methodology(categories: List[TestCategory]) -> str:
 def _reference_model_text(module: RtlModule, self_check: bool) -> str:
     if not self_check:
         return "Monitor-only — no golden model; outputs are logged, not checked"
-    out = module.outputs[0]
-    mask = (1 << out.width) - 1
-    if module.inferred_op == "add" and len(module.data_inputs) >= 2:
-        a, b = module.data_inputs[0].name, module.data_inputs[1].name
-        return f"Inferred golden model: out = ({a} + {b}) & 0x{mask:X}"
-    if module.inferred_op == "and":
-        return "Inferred golden model: out = a & b"
-    if module.inferred_op == "xor":
-        return "Inferred golden model: out = a ^ b"
-    return "Inferred golden model (partial)"
+    return "Golden model derived from RTL assign statements (Python reference evaluator)"
 
 
 def _coverage_goals(
