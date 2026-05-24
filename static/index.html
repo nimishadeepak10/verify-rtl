@@ -4,199 +4,169 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>VerifyRTL — Automated RTL Verification</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <header class="app-header">
-    <div class="logo">
-      <div class="logo-icon">RTL</div>
-      <div>
-        <h1>VerifyRTL</h1>
-        <div class="tagline">Upload RTL · preview test plan · run Verilog / SV / UVM verification</div>
-      </div>
+  <header class="top-bar" role="banner">
+    <div class="top-bar__brand">
+      <span class="top-bar__mark">RTL</span>
+      <span class="top-bar__title">VerifyRTL</span>
     </div>
+    <div class="top-bar__crumb" id="topCrumb" aria-live="polite">
+      <span class="crumb-dim">no design loaded</span>
+    </div>
+    <a class="top-bar__docs" href="https://github.com/nimishadeepak10/verify-rtl#readme" target="_blank" rel="noopener">DOCS</a>
   </header>
 
-  <div class="layout">
-    <main class="main-panel">
-      <section class="card">
-        <h3>1. Upload design (RTL)</h3>
-        <div class="tabs-inline">
-          <button type="button" class="active" data-mode="file">File upload</button>
-          <button type="button" data-mode="paste">Paste code</button>
+  <nav class="nav-tabs-mobile" id="navTabsMobile" aria-label="Workflow steps"></nav>
+
+  <div class="workspace">
+    <aside class="left-nav" id="leftNav" aria-label="Verification workflow">
+      <ol class="step-nav" id="stepNav"></ol>
+      <div class="nav-divider"></div>
+      <div class="nav-context">
+        <div class="ctx-label">BACKEND</div>
+        <div class="ctx-row">
+          <span class="led led-dim" id="ctxBackendLed"></span>
+          <span class="ctx-value" id="ctxBackendName">—</span>
         </div>
-
-        <div id="uploadBlock">
-          <div class="upload-zone" id="uploadZone">
-            <input type="file" id="rtlFile" accept=".v,.sv,.verilog,.txt" />
-            <div class="icon">📁</div>
-            <p><strong>Drop Verilog / SystemVerilog here</strong></p>
-            <p>or click to browse (.v, .sv)</p>
-            <div class="file-name" id="fileName"></div>
-          </div>
-        </div>
-
-        <div id="pasteBlock" class="hidden field">
-          <label>RTL source</label>
-          <textarea id="rtlPaste" placeholder="module my_dut ( ... ); endmodule"></textarea>
-        </div>
-
-        <p style="margin-top:0.75rem">
-          <button type="button" class="btn btn-secondary" id="loadExample">Load 2-bit adder example</button>
-        </p>
-      </section>
-
-      <section class="card">
-        <h3>2. Verification language</h3>
-        <div class="lang-options">
-          <label class="lang-card">
-            <input type="radio" name="language" value="verilog" />
-            <strong>Verilog</strong>
-            <span>Directed TB, Icarus sim, VCD waveform</span>
-          </label>
-          <label class="lang-card selected">
-            <input type="radio" name="language" value="systemverilog" checked />
-            <strong>SystemVerilog</strong>
-            <span>SV testbench + simulation (recommended)</span>
-          </label>
-          <label class="lang-card">
-            <input type="radio" name="language" value="uvm" />
-            <strong>UVM</strong>
-            <span>Env, seq, driver, monitor — use Questa/VCS</span>
-          </label>
-        </div>
-
-        <div class="field">
-          <label for="topModule">Top module (optional)</label>
-          <input type="text" id="topModule" placeholder="Auto-detect first module if empty" />
-        </div>
-
-        <div class="field">
-          <label for="backendSelect">Simulator backend</label>
-          <select id="backendSelect">
-            <option value="">Auto-detect best available</option>
-          </select>
-        </div>
-
-        <div class="actions">
-          <button type="button" class="btn btn-secondary" id="analyzeBtn">Refresh test plan</button>
-          <button type="button" class="btn btn-primary" id="runBtn">Run verification</button>
-        </div>
-      </section>
-
-      <section class="card results hidden" id="resultsSection">
-        <div class="results-header">
-          <h3 style="margin:0">3. Results</h3>
-          <span id="resultStatus" class="badge badge-neutral">—</span>
-        </div>
-        <p id="simulatorNote" class="side-empty" style="padding:0;margin:0 0 0.75rem;font-size:0.85rem"></p>
-        <div class="result-tabs">
-          <button type="button" class="active" data-panel="panelReport">Full report</button>
-          <button type="button" data-panel="panelTb">Generated testbench</button>
-          <button type="button" data-panel="panelLog">Simulation log</button>
-          <button type="button" data-panel="panelWave">Waveform (text)</button>
-        </div>
-        <div id="panelReport" class="result-panel active"><pre class="code-view" id="reportPre"></pre></div>
-        <div id="panelTb" class="result-panel"><pre class="code-view" id="tbPre"></pre></div>
-        <div id="panelLog" class="result-panel"><pre class="code-view" id="logPre"></pre></div>
-        <div id="panelWave" class="result-panel"><pre class="code-view" id="wavePre"></pre></div>
-        <p id="downloadRow" class="hidden" style="margin-top:0.75rem">
-          <a class="download-link" id="vcdLink" href="#">Download sim.vcd</a>
-          ·
-          <a class="download-link" id="reportLink" href="#">Download report.txt</a>
-        </p>
-      </section>
-    </main>
-
-    <aside class="side-panel">
-      <h2>Test plan preview</h2>
-      <p class="side-empty" id="sideEmpty">Upload or paste RTL to see DUT info, ports, and planned tests before you run simulation.</p>
-
-      <div id="sideContent" class="hidden">
-        <div class="info-block">
-          <div class="label">Status</div>
-          <div class="value"><span id="sideReady" class="badge badge-neutral">—</span></div>
-        </div>
-
-        <div class="info-block">
-          <div class="label">Module (DUT)</div>
-          <div class="value" id="sideModule">—</div>
-        </div>
-
-        <div class="info-block">
-          <div class="label">Source file</div>
-          <div class="value" id="sideFile">—</div>
-        </div>
-
-        <div class="info-block">
-          <div class="label">Lines / modules in file</div>
-          <div class="value"><span id="sideLines">—</span> lines · <span id="modulesList">—</span></div>
-        </div>
-
-        <div class="divider"></div>
-
-        <div class="info-block">
-          <div class="label">Design type</div>
-          <div class="value" id="sideSeq">—</div>
-        </div>
-
-        <div class="info-block hidden" id="fsmBlock">
-          <div class="label">FSM</div>
-          <div class="value" id="sideFsm">—</div>
-        </div>
-
-        <div class="info-block">
-          <div class="label">Inferred function</div>
-          <div class="value" id="sideOp">—</div>
-        </div>
-
-        <div class="info-block">
-          <div class="label">Verification mode</div>
-          <div class="value" id="sideLang">—</div>
-        </div>
-
-        <div class="info-block">
-          <div class="label">Simulator</div>
-          <div class="value" id="sideSim">—</div>
-        </div>
-
-        <div class="info-block">
-          <div class="label">Planned tests</div>
-          <div class="value" id="sideTests">—</div>
-        </div>
-
-        <div class="info-block">
-          <div class="label">Checking style</div>
-          <div class="value" id="sideCheck">—</div>
-        </div>
-
-        <div class="divider"></div>
-
-        <div class="info-block">
-          <div class="label">Port list</div>
-          <table class="port-table">
-            <thead>
-              <tr><th>Name</th><th>Dir</th><th>Range</th><th>W</th></tr>
-            </thead>
-            <tbody id="portTableBody"></tbody>
-          </table>
-        </div>
-
-        <div class="divider"></div>
-
-        <div class="info-block">
-          <div class="label">Pre-run checklist</div>
-          <ul class="checklist" id="checklist"></ul>
-        </div>
-
-        <div id="warningsBox" class="warnings hidden">
-          <strong>Notes</strong>
-          <ul id="warningsList"></ul>
-        </div>
+        <div class="ctx-sub" id="ctxBackendVer"></div>
+        <div class="ctx-label">TESTS PLANNED</div>
+        <div class="ctx-big" id="ctxTestCount">—</div>
       </div>
     </aside>
+
+    <main class="main-panel">
+      <!-- ① Design -->
+      <section class="screen screen-active" id="screen-design" data-step="design">
+        <div class="screen-inner">
+          <div class="panel">
+            <div class="panel__header">
+              <h2 class="panel__title">SOURCE</h2>
+              <div class="segmented" role="tablist" aria-label="Input mode">
+                <button type="button" class="segmented__btn active" data-mode="file" role="tab" aria-selected="true">FILE</button>
+                <button type="button" class="segmented__btn" data-mode="paste" role="tab" aria-selected="false">PASTE</button>
+              </div>
+            </div>
+            <div class="panel__body">
+              <div id="uploadBlock">
+                <div class="drop-zone" id="uploadZone">
+                  <input type="file" id="rtlFile" accept=".v,.sv,.verilog,.txt" />
+                  <p class="drop-prompt">&gt; drop .v / .sv — or click to browse</p>
+                </div>
+              </div>
+              <div id="pasteBlock" class="hidden">
+                <div class="code-editor">
+                  <div class="code-gutter" id="pasteGutter" aria-hidden="true">1</div>
+                  <textarea id="rtlPaste" class="code-input" spellcheck="false" placeholder="module my_dut ( ... );&#10;endmodule"></textarea>
+                </div>
+              </div>
+              <div class="source-meta">
+                <button type="button" class="btn btn-ghost" id="loadExample">Load example</button>
+                <span class="source-info" id="sourceInfo"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel__header">
+              <h2 class="panel__title">CONFIGURATION</h2>
+            </div>
+            <div class="panel__body">
+              <div class="config-row">
+                <label class="config-label">LANGUAGE</label>
+                <div class="segmented lang-segments" role="radiogroup" aria-label="Language">
+                  <label class="segmented__btn lang-opt"><input type="radio" name="language" value="verilog" /> Verilog</label>
+                  <label class="segmented__btn lang-opt selected"><input type="radio" name="language" value="systemverilog" checked /> SystemVerilog</label>
+                  <label class="segmented__btn lang-opt"><input type="radio" name="language" value="uvm" /> UVM</label>
+                </div>
+              </div>
+              <div class="config-row">
+                <label class="config-label" for="backendSelect">BACKEND</label>
+                <select id="backendSelect" class="input-mono">
+                  <option value="">Auto-detect best available</option>
+                </select>
+              </div>
+              <div class="config-row">
+                <label class="config-label" for="topModule">TOP MODULE</label>
+                <input type="text" id="topModule" class="input-mono" placeholder="auto-detect" />
+              </div>
+              <div class="config-actions">
+                <button type="button" class="btn btn-primary" id="analyzeBtn">ANALYZE →</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ② Plan -->
+      <section class="screen" id="screen-plan" data-step="plan">
+        <div class="screen-inner screen-inner--plan">
+          <div id="planLoading" class="plan-loading hidden">
+            <span class="spinner"></span>
+            <span class="mono">Loading verification plan…</span>
+          </div>
+          <div id="planEmpty" class="plan-empty">
+            <p>Load RTL on the Design screen, then click <strong>ANALYZE →</strong> to build the verification plan.</p>
+          </div>
+          <div id="planContent" class="hidden"></div>
+          <div class="plan-footer hidden" id="planFooter">
+            <button type="button" class="btn btn-secondary" data-goto="design">← Back to Design</button>
+            <button type="button" class="btn btn-primary" id="runFromPlan" disabled>RUN VERIFICATION →</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ③ Run -->
+      <section class="screen" id="screen-run" data-step="run">
+        <div class="screen-inner screen-inner--narrow">
+          <h1 class="screen-title">RUNNING VERIFICATION</h1>
+          <ul class="run-steps" id="runSteps">
+            <li data-step="tb"><span class="led led-dim"></span> Generating testbench</li>
+            <li data-step="compile"><span class="led led-dim"></span> Compiling RTL with <span id="runBackendLabel">simulator</span></li>
+            <li data-step="sim"><span class="led led-dim"></span> Running simulation</li>
+            <li data-step="wave"><span class="led led-dim"></span> Parsing waveform</li>
+            <li data-step="cov"><span class="led led-dim"></span> Building coverage report</li>
+          </ul>
+          <div id="runSpinner" class="run-spinner hidden">
+            <span class="spinner"></span>
+            <span class="mono">Waiting for simulation…</span>
+          </div>
+          <div id="runError" class="callout callout-warn hidden"></div>
+          <pre class="code-block" id="runLog"></pre>
+        </div>
+      </section>
+
+      <!-- ④ Results -->
+      <section class="screen" id="screen-results" data-step="results">
+        <div class="screen-inner" id="resultsMount"></div>
+      </section>
+
+      <!-- ⑤ Coverage -->
+      <section class="screen" id="screen-coverage" data-step="coverage">
+        <div class="screen-inner screen-inner--narrow">
+          <div class="panel">
+            <div class="panel__header">
+              <h2 class="panel__title">COVERAGE ANALYSIS</h2>
+            </div>
+            <div class="panel__body">
+              <p class="coverage-intro">
+                Coverage analysis runs after Phase 3 ships. The verification plan defined coverage goals —
+                once enabled, this screen will show progress toward each goal.
+              </p>
+              <div id="coverageGoals"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
   </div>
 
   <script src="/static/app.js"></script>
+  <script src="/static/vplan.js"></script>
+  <script src="/static/results.js"></script>
 </body>
 </html>

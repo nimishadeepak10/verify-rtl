@@ -56,10 +56,9 @@ pip install -r requirements.txt
 python -m uvicorn api.main:app --reload --app-dir c:\Users\Nimisha\verification_tb
 ```
 
-Open http://127.0.0.1:8000
+Open http://127.0.0.1:8000 (or another port if 8000 is in use).
 
-- **Left:** upload or paste RTL, choose Verilog / SystemVerilog / UVM, run verification
-- **Right sidebar:** live **test plan preview** (ports, clock/reset, FSM states, planned tests) before you click Run
+**Workspace UI (Phase A.7):** a five-step flow — **Design → Plan → Run → Results → Coverage** — with left navigation, instrument-panel styling (JetBrains Mono + IBM Plex Sans, amber trace accent), and a full **verification plan** on the Plan screen (expandable categories, toggles, coverage goals). Load `examples/adder_2bit.v` via **Load example**, analyze, then run verification end-to-end.
 
 ## Languages
 
