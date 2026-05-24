@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from ..analyzer import PortDirection, RtlModule
+from ..combinational_model import (
+    can_evaluate_combinational,
+    expected_outputs,
+    verilog_literal,
+)
 
 
-def generate(mod: RtlModule) -> str:
+def generate(mod: RtlModule, rtl_source: Optional[str] = None) -> str:
     outputs = mod.outputs
     data_ins = mod.data_inputs
     if not data_ins and not mod.is_sequential:
@@ -20,17 +27,21 @@ def generate(mod: RtlModule) -> str:
     if not mod.inputs:
         raise ValueError("Need at least one input and one output port to auto-generate tests")
 
-    return _generate_combinational(mod)
+    return _generate_combinational(mod, rtl_source)
 
 
-def _generate_combinational(mod: RtlModule) -> str:
+def _generate_combinational(mod: RtlModule, rtl_source: Optional[str] = None) -> str:
     cases = _build_cases(mod)
-    stim = _stimulus_blocks(mod, cases)
+    stim = _stimulus_blocks(mod, cases, rtl_source)
 
     return f"""`timescale 1ns/1ps
 // Auto-generated Verilog testbench for {mod.name} (combinational)
 module tb_{mod.name};
 {_dut_port_connections(mod)}
+    // Reference clock: visual time marker (does not drive DUT)
+    reg ref_clk;
+    initial ref_clk = 0;
+    always #5 ref_clk = ~ref_clk;
     integer pass_cnt;
     integer fail_cnt;
 
@@ -235,43 +246,54 @@ def _random_cases(ins, n: int) -> list[dict[str, int]]:
     return cases
 
 
-def _expected_expr(mod: RtlModule) -> str | None:
-    ins = mod.data_inputs if mod.is_sequential else mod.inputs
-    outs = mod.outputs
-    if mod.inferred_op == "add" and len(ins) >= 2 and outs:
-        out = outs[0]
-        ow = out.width
-        mask = (1 << ow) - 1
-        return f"(({ins[0].name} + {ins[1].name}) & {mask})"
-    if mod.inferred_op == "and" and len(ins) >= 2:
-        return f"({ins[0].name} & {ins[1].name})"
-    if mod.inferred_op == "xor" and len(ins) >= 2:
-        return f"({ins[0].name} ^ {ins[1].name})"
-    return None
-
-
-def _stimulus_blocks(mod: RtlModule, cases: list[dict[str, int]]) -> str:
+def _stimulus_blocks(
+    mod: RtlModule,
+    cases: list[dict[str, int]],
+    rtl_source: Optional[str] = None,
+) -> str:
     lines = []
-    data_ins = mod.inputs
+    use_golden = bool(
+        rtl_source
+        and not mod.is_sequential
+        and can_evaluate_combinational(rtl_source, mod)
+    )
     for i, case in enumerate(cases):
         assigns = [f"        {k} = {v};" for k, v in case.items()]
         lines.append(f"        // test {i}")
         lines.extend(assigns)
         lines.append("        #5;")
-        exp = _expected_expr(mod)
-        if exp and mod.outputs:
-            out = mod.outputs[0].name
-            in0 = data_ins[0].name if data_ins else "0"
-            in1 = data_ins[1].name if len(data_ins) > 1 else "0"
+        golden: dict[str, int] | None = None
+        if use_golden and rtl_source:
+            try:
+                golden = expected_outputs(rtl_source, mod, case)
+            except Exception:
+                golden = None
+        if golden and mod.outputs:
+            checks = [
+                f"{p.name} !== {verilog_literal(golden[p.name], p.width)}"
+                for p in mod.outputs
+            ]
+            cond = " || ".join(checks)
+            exp_nums = ", ".join(str(golden[p.name]) for p in mod.outputs)
+            got_args = ", ".join(p.name for p in mod.outputs)
+            exp_fmt = " ".join(f"exp_{p.name}=%0d" for p in mod.outputs)
+            got_fmt = " ".join(f"got_{p.name}=%0d" for p in mod.outputs)
+            in_fmt = " ".join(f"{p.name}=%0d" for p in mod.inputs)
+            in_args = ", ".join(p.name for p in mod.inputs)
+            out_fmt = " ".join(f"{p.name}=%0d" for p in mod.outputs)
             lines.append(
-                f'        if ({out} !== {exp}) begin fail_cnt = fail_cnt + 1; '
-                f'$display("FAIL t=%0d exp=%0d got=%0d", $time, {exp}, {out}); end '
+                f"        if ({cond}) begin fail_cnt = fail_cnt + 1; "
+                f'$display("FAIL t=%0d {exp_fmt} {got_fmt}", '
+                f"$time, {exp_nums}, {got_args}); end "
                 f"else begin pass_cnt = pass_cnt + 1; "
-                f'$display("PASS a=%0d b=%0d sum=%0d", {in0}, {in1}, {out}); end'
+                f'$display("PASS t=%0d {in_fmt} {out_fmt}", '
+                f"$time, {in_args}, {got_args}); end"
             )
-        else:
+        elif mod.outputs:
             outs = ", ".join(f"{p.name}=%0d" for p in mod.outputs)
             args = ", ".join(p.name for p in mod.outputs)
             lines.append(f'        $display("STIM t=%0d {outs}", $time, {args});')
+            lines.append("        pass_cnt = pass_cnt + 1;")
+        else:
             lines.append("        pass_cnt = pass_cnt + 1;")
     return "\n".join(lines)

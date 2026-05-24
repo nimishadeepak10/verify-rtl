@@ -135,6 +135,18 @@ def write_dut_info(work_dir: Path, module: RtlModule) -> None:
             }
             for p in module.ports
         ],
+        "synthetic_signals": (
+            [
+                {
+                    "name": "ref_clk",
+                    "width": 1,
+                    "group": "reference",
+                    "description": "Visual time marker — not driving DUT",
+                }
+            ]
+            if not module.is_sequential
+            else []
+        ),
     }
     (work_dir / "dut_info.json").write_text(
         json.dumps(info, indent=2),
@@ -167,6 +179,8 @@ def _signal_group(
                 if d == "inout":
                     return "inouts"
     low = name.lower()
+    if low in ("pass_cnt", "fail_cnt"):
+        return "results"
     if low in _TB_NAME_HINTS:
         return "testbench"
     if any(low.endswith(s) for s in _TB_SUFFIXES):
@@ -321,14 +335,22 @@ def vcd_to_json(
                 norm.append({"time": tr["time"], "value": val.zfill(pad)})
             else:
                 norm.append({"time": tr["time"], "value": val.zfill(pad) if val.isdigit() else val})
-        signals.append(
-            {
-                "name": name,
-                "width": width,
-                "group": _signal_group(name, module=module, module_info=module_info),
-                "transitions": norm,
-            }
-        )
+        sig_entry: Dict[str, Any] = {
+            "name": name,
+            "width": width,
+            "group": _signal_group(name, module=module, module_info=module_info),
+            "transitions": norm,
+        }
+        signals.append(sig_entry)
+
+    if module_info:
+        synth = {s["name"]: s for s in module_info.get("synthetic_signals", [])}
+        for sig in signals:
+            if sig["name"] in synth:
+                meta = synth[sig["name"]]
+                sig["group"] = meta.get("group", "reference")
+                if meta.get("description"):
+                    sig["description"] = meta["description"]
 
     return {
         "timescale": timescale,
