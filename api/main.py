@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from rtl_verify.backends.registry import backend_info_list  # noqa: E402
 from rtl_verify.generators.base import TbLanguage  # noqa: E402
 from rtl_verify.pipeline import run_verification  # noqa: E402
+from rtl_verify.waveform import load_module_info, vcd_to_json  # noqa: E402
 from rtl_verify.analyzer import analyze_rtl  # noqa: E402
 from rtl_verify.preview import build_test_preview  # noqa: E402
 from rtl_verify.vplan_builder import build_vplan  # noqa: E402
@@ -160,6 +161,17 @@ async def verify(
         "has_vcd": result.vcd_path is not None,
         "preview": preview,
     }
+
+
+@app.get("/api/waveform/json")
+async def waveform_json(work_dir: str):
+    """Return structured waveform data for visual rendering."""
+    base = Path(work_dir)
+    vcd = base / "sim.vcd"
+    if not vcd.is_file():
+        return {"error": "No waveform available"}
+    mod_info = load_module_info(base)
+    return vcd_to_json(vcd, module_info=mod_info)
 
 
 @app.get("/api/download/vcd")

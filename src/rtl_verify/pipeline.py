@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Optional
 
 from .analyzer import RtlModule, analyze_rtl
+from .combinational_model import can_evaluate_combinational
 from .backends.registry import (
     auto_select,
     get_backend,
     missing_backend_message,
 )
 from .generators.base import TbLanguage, generate_testbench
-from .waveform import vcd_to_html, vcd_to_text
+from .waveform import vcd_to_html, vcd_to_text, write_dut_info
 
 
 @dataclass
@@ -44,7 +45,7 @@ def run_verification(
     backend: Optional[str] = None,
 ) -> VerificationResult:
     mod = analyze_rtl(rtl_source, top_module=top_module)
-    tb_source = generate_testbench(mod, language)
+    tb_source = generate_testbench(mod, language, rtl_source=rtl_source)
 
     base = work_dir or Path(tempfile.mkdtemp(prefix="rtl_verify_"))
     base.mkdir(parents=True, exist_ok=True)
@@ -63,7 +64,7 @@ def run_verification(
             language=language,
             testbench=tb_source,
             sim_log=uvm_note,
-            text_report=_text_summary(mod, tb_source, uvm_note, None, "", ""),
+            text_report=_text_summary(mod, tb_source, uvm_note, None, "", "", rtl_source),
             waveform_text="N/A (UVM requires commercial simulator)",
             waveform_html="<p>UVM simulation not run in this tool.</p>",
             success=True,
@@ -79,16 +80,31 @@ def run_verification(
         chosen = get_backend(backend.strip().lower())
         if chosen is None:
             sim_log = missing_backend_message(backend)
-            return _sim_missing_result(mod, language, tb_source, base, sim_log, backend)
+            return _sim_missing_result(mod, language, tb_source, base, sim_log, backend, rtl_source)
         if not chosen.is_available():
             sim_log = missing_backend_message(backend)
-            return _sim_missing_result(mod, language, tb_source, base, sim_log, backend)
+            return _sim_missing_result(mod, language, tb_source, base, sim_log, backend, rtl_source)
     else:
-        chosen = auto_select(language.value)
+        chosen = auto_select(language.value, is_sequential=mod.is_sequential)
 
     if chosen is None:
-        sim_log = missing_backend_message()
-        return _sim_missing_result(mod, language, tb_source, base, sim_log, None)
+        extra = ""
+        if mod.is_sequential:
+            extra = (
+                "\n\nThis design is sequential (clocked). Install Icarus Verilog "
+                "to simulate it — the Python reference backend only supports "
+                "simple combinational RTL."
+            )
+        sim_log = missing_backend_message() + extra
+        return _sim_missing_result(mod, language, tb_source, base, sim_log, None, rtl_source)
+
+    if chosen.name == "reference" and mod.is_sequential:
+        sim_log = (
+            "Sequential designs cannot be simulated with the Python reference backend.\n"
+            "Install Icarus Verilog: https://bleyer.org/icarus/\n"
+            "Add C:\\iverilog\\bin to PATH, then restart the app."
+        )
+        return _sim_missing_result(mod, language, tb_source, base, sim_log, chosen.name, rtl_source)
 
     tb_top = f"tb_{mod.name}"
     sim_result = chosen.run(rtl_path, tb_path, base, top=tb_top)
@@ -101,10 +117,17 @@ def run_verification(
         simulator_name = f"{simulator_name} ({backend_version})"
 
     passed = "RESULT: PASS" in sim_log
+    status = "pass" if passed else "fail"
+    if not passed and mod.is_sequential and chosen.name == "reference":
+        status = "sim_missing"
+    elif not passed and "not found" in sim_log.lower():
+        status = "sim_missing"
+    if vcd_path:
+        write_dut_info(base, mod)
     wf_text = vcd_to_text(vcd_path) if vcd_path else "No waveform."
     wf_html = vcd_to_html(vcd_path) if vcd_path else "<p>No VCD produced.</p>"
     text_report = _text_summary(
-        mod, tb_source, sim_log, wf_text, backend_used, backend_version
+        mod, tb_source, sim_log, wf_text, backend_used, backend_version, rtl_source
     )
 
     return VerificationResult(
@@ -118,7 +141,7 @@ def run_verification(
         success=passed,
         work_dir=base,
         vcd_path=vcd_path,
-        status="pass" if passed else "fail",
+        status=status,
         simulator=simulator_name,
         backend_used=backend_used,
         backend_version=backend_version,
@@ -132,13 +155,14 @@ def _sim_missing_result(
     base: Path,
     sim_log: str,
     backend: Optional[str],
+    rtl_source: str = "",
 ) -> VerificationResult:
     return VerificationResult(
         module=mod,
         language=language,
         testbench=tb_source,
         sim_log=sim_log,
-        text_report=_text_summary(mod, tb_source, sim_log, None, backend or "", ""),
+        text_report=_text_summary(mod, tb_source, sim_log, None, backend or "", "", rtl_source),
         waveform_text="No waveform — simulator not installed.",
         waveform_html="<p>Install a simulator backend to generate VCD.</p>",
         success=False,
@@ -157,6 +181,7 @@ def _text_summary(
     waveform: str | None,
     backend_used: str,
     backend_version: str,
+    rtl_source: str = "",
 ) -> str:
     seq_line = f"Sequential: {mod.is_sequential}"
     if mod.is_sequential:
@@ -177,7 +202,8 @@ def _text_summary(
         f"Module: {mod.name}",
         backend_line,
         seq_line,
-        f"Inferred operation: {mod.inferred_op or 'unknown (monitor-only)'}",
+        f"Inferred operation: {mod.inferred_op or 'unknown'}",
+        f"Self-check: {_self_check_label(mod, rtl_source)}",
         f"Data inputs: {[p.name for p in mod.data_inputs]}",
         f"Outputs: {[p.name for p in mod.outputs]}",
         "",
@@ -188,5 +214,15 @@ def _text_summary(
         sim_log,
     ]
     if waveform:
-        lines.extend(["", waveform])
+        lines.extend(["", "=== WAVEFORM (text) ===", waveform])
     return "\n".join(lines)
+
+
+def _self_check_label(mod: RtlModule, rtl_source: str) -> str:
+    if mod.is_sequential:
+        return "monitor-only (sequential)"
+    if rtl_source and can_evaluate_combinational(rtl_source, mod):
+        return "golden model from RTL assign statements"
+    if mod.inferred_op in ("add", "and", "xor", "or", "sub"):
+        return f"inferred {mod.inferred_op}"
+    return "monitor-only (unsupported RTL shape)"

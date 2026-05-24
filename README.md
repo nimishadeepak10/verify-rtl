@@ -60,6 +60,8 @@ Open http://127.0.0.1:8000 (or another port if 8000 is in use).
 
 **Workspace UI (Phase A.7):** a five-step flow — **Design → Plan → Run → Results → Coverage** — with left navigation, instrument-panel styling (JetBrains Mono + IBM Plex Sans, amber trace accent), and a full **verification plan** on the Plan screen (expandable categories, toggles, coverage goals). Load `examples/adder_2bit.v` via **Load example**, analyze, then run verification end-to-end.
 
+**Waveform viewer (Phase A.8):** on the Results screen, open the **Waveform** tab and use **Visual** (default) for an interactive in-browser SVG viewer — zoom/pan, cursor values, signal groups, and minimap. **Raw VCD Dump** keeps the text fallback. Data comes from `GET /api/waveform/json`.
+
 ## Languages
 
 - **verilog** / **systemverilog**: Full flow (TB + sim + VCD + text waveform)

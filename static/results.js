@@ -6,6 +6,8 @@
 
   let activeFilter = "all";
   let expandedRow = null;
+  let waveJsonCache = null;
+  let waveWorkDirCache = null;
 
   function $(sel) {
     return document.querySelector(sel);
@@ -159,6 +161,12 @@
   function render(data) {
     const mount = $("#resultsMount");
     if (!mount) return;
+    if (waveWorkDirCache !== data.work_dir) {
+      waveJsonCache = null;
+      waveWorkDirCache = null;
+      const wv = $("#waveVisual");
+      if (wv && window.WaveformViewer) WaveformViewer.destroy(wv);
+    }
 
     const status = data.status || (data.success ? "pass" : "fail");
     const pass = status === "pass" || data.uvm_note;
@@ -224,7 +232,14 @@
       <div id="panelReport" class="result-panel active"><pre class="code-block" id="reportPre"></pre></div>
       <div id="panelTb" class="result-panel"><pre class="code-block" id="tbPre"></pre></div>
       <div id="panelLog" class="result-panel"><pre class="code-block" id="logPre"></pre></div>
-      <div id="panelWave" class="result-panel"><pre class="code-block code-block--wave" id="wavePre"></pre></div>
+      <div id="panelWave" class="result-panel">
+        <div class="wave-subtabs" role="tablist">
+          <button type="button" class="active" data-wave-sub="visual">Visual</button>
+          <button type="button" data-wave-sub="raw">Raw VCD Dump</button>
+        </div>
+        <div id="waveVisual" class="wave-visual-panel active"></div>
+        <div id="waveRaw" class="wave-raw-panel"><pre class="code-block code-block--wave" id="wavePre"></pre></div>
+      </div>
 
       <div class="download-row" id="downloadRow"></div>
     `;
@@ -266,8 +281,13 @@
         document.querySelectorAll(".result-panel").forEach((p) => p.classList.remove("active"));
         btn.classList.add("active");
         document.getElementById(btn.dataset.panel).classList.add("active");
+        if (btn.dataset.panel === "panelWave") {
+          loadWaveformVisual(data);
+        }
       });
     });
+
+    bindWaveSubtabs(data);
 
     if (!pass && status !== "sim_missing") {
       document.querySelector('.result-tabs button[data-panel="panelLog"]')?.click();
@@ -326,5 +346,57 @@
     URL.revokeObjectURL(a.href);
   }
 
-  window.Results = { render };
+  function bindWaveSubtabs(data) {
+    document.querySelectorAll(".wave-subtabs button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".wave-subtabs button").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        const sub = btn.dataset.waveSub;
+        $("#waveVisual").classList.toggle("active", sub === "visual");
+        $("#waveRaw").classList.toggle("active", sub === "raw");
+        if (sub === "visual") loadWaveformVisual(data);
+      });
+    });
+  }
+
+  async function loadWaveformVisual(data) {
+    const container = $("#waveVisual");
+    if (!container) return;
+    if (!data.has_vcd || !data.work_dir) {
+      container.innerHTML =
+        '<div class="wv-error">No VCD waveform available for this run.</div>';
+      switchToRawTab();
+      return;
+    }
+    if (waveJsonCache && waveWorkDirCache === data.work_dir) {
+      if (window.WaveformViewer) WaveformViewer.render(container, waveJsonCache);
+      return;
+    }
+    container.innerHTML = '<div class="plan-loading"><span class="spinner"></span> Loading waveform…</div>';
+    try {
+      const res = await fetch(
+        "/api/waveform/json?work_dir=" + encodeURIComponent(data.work_dir)
+      );
+      const json = await res.json();
+      if (json.error) {
+        container.innerHTML = `<div class="wv-error">${App.escapeHtml(json.error)}</div>`;
+        switchToRawTab();
+        return;
+      }
+      waveJsonCache = json;
+      waveWorkDirCache = data.work_dir;
+      if (window.WaveformViewer) {
+        WaveformViewer.render(container, json);
+      }
+    } catch (err) {
+      container.innerHTML = `<div class="wv-error">Failed to load waveform: ${App.escapeHtml(String(err))}</div>`;
+      switchToRawTab();
+    }
+  }
+
+  function switchToRawTab() {
+    document.querySelector('.wave-subtabs button[data-wave-sub="raw"]')?.click();
+  }
+
+  window.Results = { render, loadWaveformVisual };
 })();
