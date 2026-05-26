@@ -119,6 +119,20 @@ Structured verification plans (`vplan`) model industry-style test planning **bef
 
 The web UI renders the vplan on the Plan step; testbench generation uses the same analyzer and vplan builder logic as the CLI.
 
+## Code Coverage
+
+After simulation completes, VerifyRTL computes **code coverage as a post-pass** (no RTL instrumentation, no injected statements). Coverage is derived by combining:
+
+- **VCD timelines** (`waveform.py`): per-signal transition histories
+- **Coverage interpreter** (`rtl_interpreter.py`): walks common RTL control structures (`always @(*)`, `if/else`, `case`) using signal values from the VCD to determine which statements/branches were exercised
+
+Metrics reported in `report.txt` and the Coverage screen:
+
+- **Statement**: which executable statement lines ran at least once
+- **Branch**: which `if` arms and `case` arms were taken at least once (includes implicit `else` for `if` without `else`)
+- **Toggle**: per-bit 0→1 and 1→0 toggles for **DUT ports only** (excludes testbench/results/reference signals so they don’t inflate coverage)
+- **FSM**: sequential-only state-visit and transition-taken coverage (shown as N/A for combinational designs)
+
 ## Combinational golden model
 
 For non-sequential RTL, `combinational_model.py` can evaluate `assign`-based expressions (arithmetic and bitwise) to produce expected outputs for self-checking testbenches and the Python **reference** simulator backend. The analyzer still tags common ops (`add`, `and`, `xor`) for reporting; the model extends checking to a broader class of assign-only designs when parsing succeeds.

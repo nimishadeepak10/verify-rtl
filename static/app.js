@@ -35,6 +35,41 @@
     previewDebounce: null,
   };
 
+  // Exposed navigation helpers (used by Coverage screen interactions).
+  App.gotoStep = gotoStep;
+
+  App.jumpToLine = function jumpToLine(lineNo) {
+    const ln = Math.max(1, Number(lineNo) || 1);
+    gotoStep("design");
+    // ensure paste mode visible
+    const pasteBtn = document.querySelector('.segmented__btn[data-mode="paste"]');
+    if (pasteBtn) pasteBtn.click();
+    if (!rtlPaste) return;
+    const lines = (rtlPaste.value || "").split("\n");
+    let pos = 0;
+    for (let i = 0; i < Math.min(lines.length, ln - 1); i++) pos += lines[i].length + 1;
+    rtlPaste.focus();
+    rtlPaste.setSelectionRange(pos, pos + (lines[ln - 1] ? lines[ln - 1].length : 0));
+    // scroll roughly
+    const lh = 18;
+    rtlPaste.scrollTop = Math.max(0, (ln - 3) * lh);
+  };
+
+  App.highlightWaveSignal = function highlightWaveSignal(signalName) {
+    // Best-effort: jump to Results → Waveform and rely on viewer's search/highlight if present.
+    if (!App.currentResult) return;
+    gotoStep("results");
+    try {
+      document.querySelector('.result-tabs button[data-panel="panelWave"]')?.click();
+      // viewer may implement an optional highlight API
+      if (window.WaveformViewer && WaveformViewer.highlightSignal) {
+        WaveformViewer.highlightSignal(signalName);
+      }
+    } catch (e) {
+      /* ignore */
+    }
+  };
+
   const uploadZone = $("#uploadZone");
   const fileInput = $("#rtlFile");
   const rtlPaste = $("#rtlPaste");
@@ -126,6 +161,43 @@
     const d = document.createElement("div");
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  function showToast(message, type) {
+    const host = $("#toastHost");
+    if (!host) return;
+    const t = document.createElement("div");
+    t.className = "toast toast--" + (type || "info");
+    t.textContent = message;
+    host.appendChild(t);
+    setTimeout(() => {
+      t.style.opacity = "0";
+      t.style.transition = "opacity 0.2s";
+      setTimeout(() => t.remove(), 220);
+    }, 4200);
+  }
+
+  function setActionLoading(loading) {
+    const analyze = $("#analyzeBtn");
+    const run = $("#runFromPlan");
+    if (analyze) {
+      analyze.classList.toggle("is-loading", loading === "analyze");
+      analyze.disabled = loading === "analyze";
+    }
+    if (run) {
+      run.classList.toggle("is-loading", loading === "run");
+      if (loading === "run") run.disabled = true;
+    }
+  }
+
+  function updateRunButton() {
+    const run = $("#runFromPlan");
+    if (!run) return;
+    const ready = App.currentPreview && App.currentPreview.ready_to_run;
+    run.disabled = !ready || run.classList.contains("is-loading");
+    run.title = ready
+      ? "Generate TB, simulate, and view results"
+      : "Analyze your design first to enable verification";
   }
 
   function setStepState(stepId, state) {
@@ -242,18 +314,21 @@
       App.currentPreview = null;
       updateTopCrumb();
       updateNavContext();
-      $("#runFromPlan").disabled = true;
+      updateRunButton();
+      showToast("Load RTL first — drop a file, paste code, or use Load example.", "error");
       return;
     }
 
+    setActionLoading("analyze");
     try {
       const fd = await buildFormData();
       const res = await fetch("/api/analyze", { method: "POST", body: fd });
       const data = await res.json();
       if (data.error) {
         App.currentPreview = null;
-        console.warn(data.error);
         updateTopCrumb();
+        updateRunButton();
+        showToast(data.error, "error");
         return;
       }
       App.currentPreview = data;
@@ -263,18 +338,33 @@
       updateNavContext();
       setStepState("design", "done");
       setStepState("plan", "current");
-      $("#runFromPlan").disabled = !data.ready_to_run;
+      updateRunButton();
 
       App.currentVplan = null;
       if (window.VPlan && VPlan.invalidate) VPlan.invalidate();
+      showToast(
+        `Analyzed ${data.module_name || "design"} — ${data.is_sequential ? "sequential" : "combinational"}`,
+        "success"
+      );
     } catch (err) {
-      console.warn("Analysis failed:", err);
+      showToast("Analysis failed: " + String(err), "error");
+    } finally {
+      setActionLoading(null);
     }
   }
 
   async function runVerify() {
-    if (!App.rtlContent.trim()) return;
+    if (!App.rtlContent.trim()) {
+      showToast("Load RTL before running verification.", "error");
+      return;
+    }
+    if (!App.currentPreview || !App.currentPreview.ready_to_run) {
+      showToast("Run Analyze first — your design is not ready yet.", "error");
+      gotoStep("plan");
+      return;
+    }
 
+    setActionLoading("run");
     gotoStep("run");
     setRunStep("tb", "active");
     $("#runSpinner").classList.remove("hidden");
@@ -299,6 +389,7 @@
 
       if (data.error) {
         showRunError(data.error);
+        showToast(data.error, "error");
         return;
       }
 
@@ -308,6 +399,7 @@
       if (data.preview) {
         App.currentPreview = data.preview;
         updateTopCrumb();
+        updateRunButton();
       }
 
       const status = data.status || (data.success ? "pass" : "fail");
@@ -316,18 +408,25 @@
         setStepState("results", "current");
         if (window.Results && Results.render) Results.render(data);
         gotoStep("results");
+        showToast(data.uvm_note ? "UVM skeleton generated" : "Verification passed", "success");
       } else {
-        showRunError(
+        const msg =
           status === "sim_missing"
             ? "Simulator not available. Install Icarus Verilog or choose Auto-detect."
-            : "Verification failed — see log below."
-        );
+            : "Verification failed — see log and Results.";
+        showRunError(msg);
+        showToast(msg, "error");
         if (window.Results && Results.render) Results.render(data);
+        gotoStep("results");
         setStepState("results", "current");
       }
     } catch (err) {
       $("#runSpinner").classList.add("hidden");
       showRunError(String(err));
+      showToast(String(err), "error");
+    } finally {
+      setActionLoading(null);
+      updateRunButton();
     }
   }
 
@@ -433,12 +532,15 @@
       updatePasteGutter();
       updateSourceInfo();
       refreshPreview();
+      showToast("Loaded adder_2bit.v example", "info");
     });
 
     $("#analyzeBtn").addEventListener("click", async () => {
       await runAnalyze();
-      gotoStep("plan");
-      if (window.VPlan && VPlan.load) await VPlan.load();
+      if (App.currentPreview && !App.currentPreview.error) {
+        gotoStep("plan");
+        if (window.VPlan && VPlan.load) await VPlan.load();
+      }
     });
 
     $("#runFromPlan").addEventListener("click", () => runVerify());
@@ -457,6 +559,8 @@
   window.App.escapeHtml = escapeHtml;
   window.App.updateNavContext = updateNavContext;
   window.App.updateTopCrumb = updateTopCrumb;
+  window.App.showToast = showToast;
+  window.App.updateRunButton = updateRunButton;
 
   initDesign();
   renderNav();

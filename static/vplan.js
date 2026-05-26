@@ -206,7 +206,8 @@
     $("#planContent").classList.remove("hidden");
     $("#planEmpty").classList.add("hidden");
     $("#planFooter").classList.remove("hidden");
-    $("#runFromPlan").disabled = !(App.currentPreview && App.currentPreview.ready_to_run);
+    if (window.App.updateRunButton) App.updateRunButton();
+    else $("#runFromPlan").disabled = !(App.currentPreview && App.currentPreview.ready_to_run);
 
     bindPlanEvents();
   }
@@ -326,24 +327,183 @@
   function renderCoverage() {
     const mount = $("#coverageGoals");
     if (!mount) return;
-    const plan = App.currentVplan;
-    if (!plan || !plan.coverage_goals || !plan.coverage_goals.length) {
-      mount.innerHTML = '<p class="coverage-intro">Load and analyze a design to see coverage goals from the verification plan.</p>';
+
+    const result = App.currentResult;
+    const cov = result && result.coverage ? result.coverage : null;
+
+    if (!result || !result.work_dir) {
+      mount.innerHTML =
+        '<div class="empty-state"><h2 class="empty-state__title">No coverage yet</h2><p class="empty-state__lead">Run verification on the Run screen to see coverage results.</p><button type="button" class="btn btn-primary" data-goto="run">Go to Run →</button></div>';
+      mount.querySelector('button[data-goto="run"]')?.addEventListener("click", () => App.gotoStep && App.gotoStep("run"));
       return;
     }
-    mount.innerHTML = plan.coverage_goals
-      .map(
-        (g) =>
-          `<div class="coverage-goal">
-        <div class="coverage-goal__head">
-          <span class="coverage-goal__name">${App.escapeHtml(g.name).toUpperCase()}</span>
-          <span class="coverage-goal__pct">≥ ${g.target_percent}%</span>
+
+    const ledClass = (p, na) => {
+      if (na) return "led-dim";
+      if (p >= 90) return "led-green";
+      if (p >= 50) return "led-amber";
+      return "led-red";
+    };
+
+    const bar = (pct) => {
+      const v = Math.max(0, Math.min(100, Number(pct) || 0));
+      return `<div class="cov-bar"><div class="cov-bar__fill" style="width:${v}%"></div><div class="cov-bar__label">${v.toFixed(1)}%</div></div>`;
+    };
+
+    const fmtLoc = (lineNo) => `dut.v:${lineNo}`;
+
+    if (!cov) {
+      mount.innerHTML =
+        '<p class="coverage-intro">Coverage data not found for this run. Re-run verification (coverage is computed post-simulation).</p>';
+      return;
+    }
+
+    const overall = Number(cov.overall_percent || 0);
+    const meta = cov.meta || {};
+    const dut = meta.dut || result.module || "design";
+    const tests = (result.sim_log || "").match(/PASS=(\d+)/i);
+    const passN = tests ? tests[1] : "—";
+
+    const stmt = cov.statement || {};
+    const br = cov.branch || {};
+    const tg = cov.toggle || {};
+    const fsm = cov.fsm || {};
+
+    const fsmNA = !!fsm.not_applicable || (fsm.total_transitions === 0 && fsm.total_states === 0);
+
+    mount.innerHTML = `
+      <div class="cov-card">
+        <div class="cov-head">
+          <div class="cov-title mono">CODE COVERAGE</div>
+          <div class="cov-overall">
+            <span class="led ${ledClass(overall,false)}"></span>
+            <span class="mono cov-overall__label">OVERALL</span>
+            <span class="mono cov-overall__pct">${overall.toFixed(1)}%</span>
+          </div>
         </div>
-        <p class="coverage-goal__desc">${App.escapeHtml(g.rationale)}</p>
-        <div class="progress-stub"><div class="progress-stub__bar"></div></div>
-      </div>`
-      )
-      .join("");
+        ${bar(overall)}
+        <div class="cov-meta">${App.escapeHtml(`${dut} · ${passN} test cases · ${result.work_dir}`)}</div>
+
+        <div class="cov-section" data-section="stmt">
+          <button type="button" class="cov-section__head">
+            <span class="led ${ledClass(Number(stmt.percent||0),false)}"></span>
+            <span class="mono">STATEMENT COVERAGE</span>
+            <span class="mono cov-section__pct">${Number(stmt.percent||0).toFixed(1)}%</span>
+          </button>
+          <div class="cov-section__body">
+            <div class="cov-sub mono">${stmt.hit || 0} / ${stmt.total || 0} statements executed</div>
+            ${bar(Number(stmt.percent||0))}
+            <div class="cov-subhead mono">UNCOVERED STATEMENTS (${(stmt.uncovered_lines||[]).length})</div>
+            <div class="cov-list">
+              ${(stmt.uncovered_lines || []).slice(0, 200).map((ln) => `<button type="button" class="cov-link" data-jump="${ln}">${fmtLoc(ln)}</button>`).join("") || '<div class="cov-dim">—</div>'}
+            </div>
+          </div>
+        </div>
+
+        <div class="cov-section" data-section="branch">
+          <button type="button" class="cov-section__head">
+            <span class="led ${ledClass(Number(br.percent||0),false)}"></span>
+            <span class="mono">BRANCH COVERAGE</span>
+            <span class="mono cov-section__pct">${Number(br.percent||0).toFixed(1)}%</span>
+          </button>
+          <div class="cov-section__body">
+            <div class="cov-sub mono">${br.hit || 0} / ${br.total || 0} branches taken</div>
+            ${bar(Number(br.percent||0))}
+            <div class="cov-branch-list">
+              ${(br.branches || []).slice(0, 500).map((b) => {
+                const hit = !!b.hit;
+                const mark = hit ? "✓" : "✗";
+                const cls = hit ? "cov-ok" : "cov-miss";
+                const ln = b.line_no || "";
+                return `<div class="cov-branch ${cls}">
+                  <div class="cov-branch__mark mono">${mark}</div>
+                  <div class="cov-branch__label mono">${App.escapeHtml(String(b.label||""))}</div>
+                  <div class="cov-branch__count mono">${hit ? `hit ${b.count||0}×` : "not taken"}</div>
+                  <button type="button" class="cov-branch__jump" data-jump="${ln}">↗</button>
+                </div>`;
+              }).join("") || '<div class="cov-dim">—</div>'}
+            </div>
+          </div>
+        </div>
+
+        <div class="cov-section" data-section="toggle">
+          <button type="button" class="cov-section__head">
+            <span class="led ${ledClass(Number(tg.percent||0),false)}"></span>
+            <span class="mono">TOGGLE COVERAGE</span>
+            <span class="mono cov-section__pct">${Number(tg.percent||0).toFixed(1)}%</span>
+          </button>
+          <div class="cov-section__body">
+            <div class="cov-sub mono">${tg.bits_toggled_both || 0} / ${tg.total_bits || 0} bits toggled both directions</div>
+            ${bar(Number(tg.percent||0))}
+            <div class="cov-subhead mono">BITS PER SIGNAL</div>
+            <div class="cov-toggle-legend mono">
+              <span><span class="cov-bit cov-bit--both"></span> both</span>
+              <span><span class="cov-bit cov-bit--up"></span> up only</span>
+              <span><span class="cov-bit cov-bit--down"></span> down only</span>
+              <span><span class="cov-bit cov-bit--never"></span> never</span>
+            </div>
+            <div class="cov-toggle-list">
+              ${Object.entries(tg.per_signal || {}).slice(0, 200).map(([name, meta]) => {
+                const w = meta.width || 1;
+                const both = meta.bits_both || [];
+                const up = meta.bits_up || [];
+                const down = meta.bits_down || [];
+                const bits = [];
+                for (let i = w - 1; i >= 0; i--) {
+                  const cls = both[i] ? "both" : up[i] && !down[i] ? "up" : down[i] && !up[i] ? "down" : "never";
+                  bits.push(`<span class="cov-bit cov-bit--${cls}" title="${name}[${i}]"></span>`);
+                }
+                return `<div class="cov-toggle-row" data-sig="${App.escapeHtml(name)}">
+                  <button type="button" class="cov-sig mono" data-signal="${App.escapeHtml(name)}">${App.escapeHtml(name)}</button>
+                  <span class="cov-sigw mono">[${w-1}:0]</span>
+                  <div class="cov-bits">${bits.join("")}</div>
+                </div>`;
+              }).join("") || '<div class="cov-dim">—</div>'}
+            </div>
+          </div>
+        </div>
+
+        <div class="cov-section" data-section="fsm">
+          <button type="button" class="cov-section__head">
+            <span class="led ${ledClass(Number(fsm.state_percent||0),fsmNA)}"></span>
+            <span class="mono">FSM COVERAGE</span>
+            <span class="mono cov-section__pct">${fsmNA ? "N/A" : `${Number(fsm.state_percent||0).toFixed(1)}%`}</span>
+          </button>
+          <div class="cov-section__body">
+            ${fsmNA ? `<div class="cov-dim">${App.escapeHtml(fsm.na_reason || "N/A")}</div>` : `
+              <div class="cov-sub mono">${fsm.states_visited || 0} / ${fsm.total_states || 0} states visited</div>
+              ${bar(Number(fsm.state_percent||0))}
+              ${(fsm.total_transitions || 0) ? `<div class="cov-sub mono">${fsm.transitions_taken || 0} / ${fsm.total_transitions || 0} transitions taken</div>${bar(Number(fsm.transition_percent||0))}` : ""}
+            `}
+          </div>
+        </div>
+      </div>
+    `;
+
+    // collapsible behavior
+    mount.querySelectorAll(".cov-section__head").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const sec = btn.closest(".cov-section");
+        sec.classList.toggle("open");
+      });
+      btn.closest(".cov-section")?.classList.add("open");
+    });
+
+    // jump handlers
+    mount.querySelectorAll("[data-jump]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const ln = parseInt(el.dataset.jump, 10);
+        if (Number.isFinite(ln) && App.jumpToLine) App.jumpToLine(ln);
+      });
+    });
+
+    // toggle signal click -> try highlight in waveform
+    mount.querySelectorAll("[data-signal]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const sig = el.dataset.signal;
+        if (sig && App.highlightWaveSignal) App.highlightWaveSignal(sig);
+      });
+    });
   }
 
   window.VPlan = {

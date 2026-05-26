@@ -20,6 +20,8 @@ from rtl_verify.waveform import load_module_info, vcd_to_json  # noqa: E402
 from rtl_verify.analyzer import analyze_rtl  # noqa: E402
 from rtl_verify.preview import build_test_preview  # noqa: E402
 from rtl_verify.vplan_builder import build_vplan  # noqa: E402
+from rtl_verify.sim_results import parse_test_results  # noqa: E402
+from rtl_verify.coverage import CoverageReport  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 STATIC = ROOT / "static"
@@ -150,6 +152,14 @@ async def verify(
         if "error" in waveform_json_data:
             waveform_json_data = None
 
+    overall_pass = result.success or bool(result.uvm_note)
+    test_results = parse_test_results(
+        result.sim_log,
+        mod=result.module,
+        rtl_source=rtl_source,
+        overall_pass=overall_pass,
+    )
+
     return {
         "success": result.success,
         "status": getattr(result, "status", "pass" if result.success else "fail"),
@@ -168,6 +178,8 @@ async def verify(
         "has_vcd": result.vcd_path is not None,
         "waveform_json": waveform_json_data,
         "preview": preview,
+        "test_results": test_results,
+        "coverage": result.coverage.to_dict() if result.coverage else None,
     }
 
 
@@ -196,3 +208,15 @@ async def download_report(work_dir: str):
     if not path.is_file():
         return PlainTextResponse("Report not found", status_code=404)
     return FileResponse(path, filename="report.txt", media_type="text/plain")
+
+
+@app.get("/api/coverage")
+async def coverage(work_dir: str):
+    """Return coverage report JSON from a completed run."""
+    path = Path(work_dir) / "coverage.json"
+    if not path.is_file():
+        return {"error": "coverage.json not found — run verification first"}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return {"error": f"Failed to read coverage.json: {e}"}

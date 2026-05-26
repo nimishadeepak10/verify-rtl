@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,16 @@ from .backends.registry import (
 )
 from .generators.base import TbLanguage, generate_testbench
 from .waveform import vcd_to_html, vcd_to_text, write_dut_info
+from .waveform import load_module_info, vcd_to_json
+from .coverage import (
+    CoverageReport,
+    FsmCoverage,
+    build_env_timeline_from_vcd_signals,
+    compute_fsm_coverage,
+    compute_overall_percent,
+    compute_toggle_coverage,
+)
+from .rtl_interpreter import CoverageInterpreter
 
 
 @dataclass
@@ -35,6 +46,7 @@ class VerificationResult:
     simulator: str = ""
     backend_used: str = ""
     backend_version: str = ""
+    coverage: CoverageReport | None = None
 
 
 def run_verification(
@@ -126,9 +138,58 @@ def run_verification(
         write_dut_info(base, mod)
     wf_text = vcd_to_text(vcd_path) if vcd_path else "No waveform."
     wf_html = vcd_to_html(vcd_path) if vcd_path else "<p>No VCD produced.</p>"
+
+    coverage_report: CoverageReport | None = None
+    if vcd_path:
+        try:
+            module_info = load_module_info(base) or {}
+            wave_json = vcd_to_json(vcd_path, module_info=module_info)
+            vcd_signals = wave_json.get("signals") if isinstance(wave_json, dict) else None
+            if isinstance(vcd_signals, list) and vcd_signals:
+                dut_ports = [
+                    p.get("name")
+                    for p in (module_info.get("ports") or [])
+                    if p.get("name")
+                ]
+                toggle_cov = compute_toggle_coverage(vcd_signals, dut_ports)
+                env_by_time = build_env_timeline_from_vcd_signals(vcd_signals)
+                interp = CoverageInterpreter(rtl_source, filename="dut.v")
+                interp.execute_over_timeline(env_by_time)
+                stmt_cov = interp.get_statement_coverage()
+                branch_cov = interp.get_branch_coverage()
+                fsm_cov = (
+                    compute_fsm_coverage(mod, vcd_signals)
+                    if mod.is_sequential
+                    else FsmCoverage.not_applicable_result(
+                        "Design is combinational — no state register detected"
+                    )
+                )
+                overall = compute_overall_percent(
+                    stmt_cov,
+                    branch_cov,
+                    toggle_cov,
+                    fsm_cov,
+                    is_sequential=mod.is_sequential,
+                )
+                coverage_report = CoverageReport(
+                    statement=stmt_cov,
+                    branch=branch_cov,
+                    toggle=toggle_cov,
+                    fsm=fsm_cov,
+                    overall_percent=overall,
+                    meta={"dut": mod.name},
+                )
+                (base / "coverage.json").write_text(
+                    json.dumps(coverage_report.to_dict(), indent=2),
+                    encoding="utf-8",
+                )
+        except Exception:
+            coverage_report = None
     text_report = _text_summary(
         mod, tb_source, sim_log, wf_text, backend_used, backend_version, rtl_source
     )
+    if coverage_report is not None:
+        text_report = text_report + "\n\n" + _format_coverage_text(coverage_report, mod)
 
     return VerificationResult(
         module=mod,
@@ -145,7 +206,54 @@ def run_verification(
         simulator=simulator_name,
         backend_used=backend_used,
         backend_version=backend_version,
+        coverage=coverage_report,
     )
+
+
+def _format_coverage_text(cov: CoverageReport, mod: RtlModule) -> str:
+    def pct(x: float) -> str:
+        return f"{x:.1f}%"
+
+    stmt = cov.statement
+    br = cov.branch
+    tg = cov.toggle
+    fsm = cov.fsm
+
+    out: list[str] = []
+    out.append("=" * 64)
+    out.append("CODE COVERAGE")
+    out.append("=" * 64)
+    out.append(f"  Statement:    {pct(stmt.percent):>6}   ({stmt.hit} / {stmt.total} statements)")
+    if stmt.uncovered_lines:
+        out.append("                Uncovered lines: " + ", ".join(str(x) for x in stmt.uncovered_lines[:64]))
+    out.append("")
+    out.append(f"  Branch:       {pct(br.percent):>6}   ({br.hit} / {br.total} branches)")
+    missed = [b for b in (br.branches or []) if not b.get('hit')]
+    if missed:
+        m0 = missed[0]
+        out.append(
+            f"                Missed: {m0.get('location','')}"
+            + f" arm {m0.get('label','')}"
+        )
+    out.append("")
+    out.append(f"  Toggle:       {pct(tg.percent):>6}   ({tg.bits_toggled_both} / {tg.total_bits} bits both directions)")
+    partial = []
+    for sig, meta in (tg.per_signal or {}).items():
+        both = meta.get("bits_both") or []
+        if both and not all(bool(x) for x in both):
+            partial.append(sig)
+    if partial:
+        out.append("                Signals with partial toggle: " + ", ".join(partial[:12]))
+    out.append("")
+    if fsm.not_applicable:
+        out.append("  FSM:          N/A     " + (fsm.na_reason or ""))
+    else:
+        out.append(f"  FSM:          {pct(fsm.state_percent):>6}   ({fsm.states_visited} / {fsm.total_states} states)")
+        if fsm.total_transitions:
+            out.append(f"                Transitions: {pct(fsm.transition_percent):>6}   ({fsm.transitions_taken} / {fsm.total_transitions})")
+    out.append("")
+    out.append(f"  OVERALL:      {pct(cov.overall_percent):>6}")
+    return "\n".join(out)
 
 
 def _sim_missing_result(

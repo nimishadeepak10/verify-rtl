@@ -53,6 +53,8 @@ class RtlModule:
     is_sequential: bool = False
     state_reg: Optional[str] = None
     states: List[str] = field(default_factory=list)
+    fsm_value_map: dict[str, str] = field(default_factory=dict)  # literal -> state name
+    fsm_transitions: list[tuple[str, str]] = field(default_factory=list)  # (from,to) pairs (best-effort)
 
     @property
     def inputs(self) -> List[Port]:
@@ -117,7 +119,7 @@ def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
     clock_port = _detect_clock_port(ports)
     reset_port, reset_active_low = _detect_reset_port(ports)
     is_sequential = _detect_sequential(body)
-    state_reg, states = _detect_fsm(body, clock_port)
+    state_reg, states, fsm_value_map, fsm_transitions = _detect_fsm(body, clock_port)
     inferred = _infer_operation(clean, ports)
 
     return RtlModule(
@@ -131,6 +133,8 @@ def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
         is_sequential=is_sequential,
         state_reg=state_reg,
         states=states,
+        fsm_value_map=fsm_value_map,
+        fsm_transitions=fsm_transitions,
     )
 
 
@@ -211,34 +215,68 @@ def _detect_sequential(body: str) -> bool:
     return False
 
 
-def _detect_fsm(body: str, clock_port: Optional[str]) -> Tuple[Optional[str], List[str]]:
-    """Find state register and case labels in a clocked FSM."""
-    case_map: dict[str, List[str]] = {}
+def _detect_fsm(
+    body: str, clock_port: Optional[str]
+) -> Tuple[Optional[str], List[str], dict[str, str], list[tuple[str, str]]]:
+    """Find state register + best-effort state labels and transitions in a clocked FSM."""
+    case_map: dict[str, Tuple[List[str], dict[str, str], list[tuple[str, str]]]] = {}
     for m in re.finditer(
         r"case\s*\(\s*(\w+)\s*\)(.*?)endcase",
         body,
         re.DOTALL | re.IGNORECASE,
     ):
         var = m.group(1)
-        labels = _extract_case_labels(m.group(2))
+        labels, value_map, transitions = _extract_case_labels_and_transitions(m.group(2))
         if labels:
-            case_map[var] = labels
+            case_map[var] = (labels, value_map, transitions)
 
-    for var, labels in case_map.items():
+    for var, tup in case_map.items():
+        labels, value_map, transitions = tup
         if not re.search(rf"\b{re.escape(var)}\s*<=", body):
             continue
         if _assigned_in_clocked_block(body, var, clock_port):
-            return var, labels
-    return None, []
+            return var, labels, value_map, transitions
+    return None, [], {}, []
 
 
-def _extract_case_labels(case_body: str) -> List[str]:
+def _extract_case_labels_and_transitions(
+    case_body: str,
+) -> Tuple[List[str], dict[str, str], list[tuple[str, str]]]:
+    """
+    Extract case arm labels (state names) and a best-effort literal->name map and transitions.
+    Supported arm forms:
+    - IDLE: begin ... state <= ACTIVE; ... end
+    - 3'b000: begin ... end   (no name)
+    """
     labels: List[str] = []
-    for m in re.finditer(r"^\s*([A-Za-z_]\w*)\s*:", case_body, re.MULTILINE):
-        lab = m.group(1)
-        if lab.lower() not in _CASE_KEYWORDS:
-            labels.append(lab)
-    return labels
+    value_map: dict[str, str] = {}
+    transitions: list[tuple[str, str]] = []
+
+    # Capture each arm block as text for simple transition extraction.
+    arm_re = re.compile(
+        r"^\s*([A-Za-z_]\w*|default|\d+'\s*[bhdBHD]\s*[0-9a-fA-F_]+)\s*:\s*(begin)?(.*?)(?=^\s*(?:[A-Za-z_]\w*|default|\d+'\s*[bhdBHD]\s*[0-9a-fA-F_]+)\s*:|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    for m in arm_re.finditer(case_body):
+        lab = m.group(1).strip()
+        if lab.lower() in _CASE_KEYWORDS:
+            continue
+        labels.append(lab)
+        # heuristic: if label is a name, keep it as-is; if it's a literal, map literal->literal
+        if re.match(r"^\d+'\s*[bhdBHD]\s*", lab):
+            value_map[re.sub(r"\s+", "", lab)] = lab
+        else:
+            value_map[lab] = lab
+
+        arm_text = m.group(3) or ""
+        # best-effort transition extraction: find "state <= NEXT" with NEXT as identifier
+        for t in re.finditer(r"\b(\w+)\s*<=\s*(\w+)\s*;", arm_text):
+            from_state = lab
+            to_state = t.group(2)
+            if to_state and from_state and to_state != from_state:
+                transitions.append((from_state, to_state))
+
+    return labels, value_map, transitions
 
 
 def _assigned_in_clocked_block(body: str, signal: str, clock_port: Optional[str]) -> bool:

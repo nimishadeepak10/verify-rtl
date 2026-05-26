@@ -18,6 +18,10 @@
     <div class="top-bar__crumb" id="topCrumb" aria-live="polite">
       <span class="crumb-dim">no design loaded</span>
     </div>
+    <div class="top-bar__actions">
+      <button type="button" class="btn btn-secondary" id="analyzeBtn" title="Build verification plan from RTL (step 2)">ANALYZE →</button>
+      <button type="button" class="btn btn-primary" id="runFromPlan" disabled title="Generate TB, simulate, and view results (step 3)">RUN VERIFICATION →</button>
+    </div>
     <a class="top-bar__docs" href="https://github.com/nimishadeepak10/verify-rtl#readme" target="_blank" rel="noopener">DOCS</a>
   </header>
 
@@ -42,7 +46,20 @@
     <main class="main-panel">
       <!-- ① Design -->
       <section class="screen screen-active" id="screen-design" data-step="design">
-        <div class="screen-inner">
+        <div class="screen-inner screen-inner--design-grid">
+          <header class="screen-header">
+            <h1 class="screen-title">Design</h1>
+            <p class="screen-lead">Load your RTL, choose simulator settings, then use <strong>Analyze</strong> in the top bar to continue.</p>
+          </header>
+          <div class="workflow-hint" aria-label="Quick start">
+            <div class="workflow-hint__step"><span class="workflow-hint__num">1</span> Load RTL</div>
+            <div class="workflow-hint__arrow" aria-hidden="true">→</div>
+            <div class="workflow-hint__step"><span class="workflow-hint__num">2</span> Analyze</div>
+            <div class="workflow-hint__arrow" aria-hidden="true">→</div>
+            <div class="workflow-hint__step"><span class="workflow-hint__num">3</span> Run</div>
+            <div class="workflow-hint__arrow" aria-hidden="true">→</div>
+            <div class="workflow-hint__step"><span class="workflow-hint__num">4</span> Results</div>
+          </div>
           <div class="panel">
             <div class="panel__header">
               <h2 class="panel__title">SOURCE</h2>
@@ -55,7 +72,8 @@
               <div id="uploadBlock">
                 <div class="drop-zone" id="uploadZone">
                   <input type="file" id="rtlFile" accept=".v,.sv,.verilog,.txt" />
-                  <p class="drop-prompt">&gt; drop .v / .sv — or click to browse</p>
+                  <p class="drop-prompt"><span class="drop-prompt__icon" aria-hidden="true">⬆</span> Drop a <code>.v</code> or <code>.sv</code> file here</p>
+                  <p class="drop-prompt-sub">or click to browse · try <strong>Load example</strong> below</p>
                 </div>
               </div>
               <div id="pasteBlock" class="hidden">
@@ -86,16 +104,15 @@
               </div>
               <div class="config-row">
                 <label class="config-label" for="backendSelect">BACKEND</label>
+                <p class="config-hint">Icarus Verilog for simulation; reference model for combinational-only checks.</p>
                 <select id="backendSelect" class="input-mono">
                   <option value="">Auto-detect best available</option>
                 </select>
               </div>
               <div class="config-row">
                 <label class="config-label" for="topModule">TOP MODULE</label>
+                <p class="config-hint">Leave blank to use the first <code>module</code> in the file.</p>
                 <input type="text" id="topModule" class="input-mono" placeholder="auto-detect" />
-              </div>
-              <div class="config-actions">
-                <button type="button" class="btn btn-primary" id="analyzeBtn">ANALYZE →</button>
               </div>
             </div>
           </div>
@@ -110,12 +127,19 @@
             <span class="mono">Loading verification plan…</span>
           </div>
           <div id="planEmpty" class="plan-empty">
-            <p>Load RTL on the Design screen, then click <strong>ANALYZE →</strong> to build the verification plan.</p>
+            <div class="empty-state">
+              <h2 class="empty-state__title">No verification plan yet</h2>
+              <p class="empty-state__lead">Follow these steps to generate a structured test plan for your design.</p>
+              <ol class="empty-state__steps">
+                <li>Go to <button type="button" class="link-btn" data-goto="design">Design</button> and load RTL (file, paste, or example).</li>
+                <li>Click <strong>Analyze →</strong> in the top bar.</li>
+                <li>Review categories here, then click <strong>Run Verification →</strong>.</li>
+              </ol>
+            </div>
           </div>
           <div id="planContent" class="hidden"></div>
           <div class="plan-footer hidden" id="planFooter">
             <button type="button" class="btn btn-secondary" data-goto="design">← Back to Design</button>
-            <button type="button" class="btn btn-primary" id="runFromPlan" disabled>RUN VERIFICATION →</button>
           </div>
         </div>
       </section>
@@ -123,7 +147,10 @@
       <!-- ③ Run -->
       <section class="screen" id="screen-run" data-step="run">
         <div class="screen-inner screen-inner--narrow">
-          <h1 class="screen-title">RUNNING VERIFICATION</h1>
+          <header class="screen-header">
+            <h1 class="screen-title">Running verification</h1>
+            <p class="screen-lead">Generating the testbench, simulating, and collecting waveforms. This may take a few seconds.</p>
+          </header>
           <ul class="run-steps" id="runSteps">
             <li data-step="tb"><span class="led led-dim"></span> Generating testbench</li>
             <li data-step="compile"><span class="led led-dim"></span> Compiling RTL with <span id="runBackendLabel">simulator</span></li>
@@ -165,9 +192,11 @@
     </main>
   </div>
 
+  <div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="true"></div>
+
   <script src="/static/app.js"></script>
   <script src="/static/vplan.js"></script>
   <script src="/static/waveform.js?v=5"></script>
-  <script src="/static/results.js"></script>
+  <script src="/static/results.js?v=2"></script>
 </body>
 </html>
