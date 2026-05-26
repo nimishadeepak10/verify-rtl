@@ -1,11 +1,20 @@
-// 4-bit ALU — smaller input space for exhaustive simulation (512 vectors)
 module alu_4bit (
-    input  wire [3:0] a,
-    input  wire [3:0] b,
-    input  wire [1:0] opcode,
-    output wire [3:0] result
+    input  [3:0] a, b,
+    input  [2:0] opcode,
+    output reg [3:0] result,
+    output reg       zero
 );
-    assign result = (opcode == 2'd0) ? (a + b) :
-                    (opcode == 2'd1) ? (a & b) :
-                    (opcode == 2'd2) ? (a ^ b) : (a - b);
+    always @(*) begin
+        case (opcode)
+            3'b000: result = a + b;
+            3'b001: result = a - b;
+            3'b010: result = a & b;
+            3'b011: result = a | b;
+            3'b100: result = a ^ b;
+            3'b101: result = ~a;
+            3'b110: result = a << 1;
+            3'b111: result = a >> 1;
+        endcase
+        zero = (result == 4'b0);
+    end
 endmodule

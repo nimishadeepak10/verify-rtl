@@ -46,7 +46,8 @@ class RtlModule:
     name: str
     ports: List[Port] = field(default_factory=list)
     source: str = ""
-    inferred_op: Optional[str] = None  # e.g. "add", "and", "xor"
+    inferred_op: Optional[str] = None  # e.g. "add", "sum_with_carry", "case_dispatch"
+    unsupported_constructs: List[str] = field(default_factory=list)
     clock_port: Optional[str] = None
     reset_port: Optional[str] = None
     reset_active_low: bool = False
@@ -55,6 +56,7 @@ class RtlModule:
     states: List[str] = field(default_factory=list)
     fsm_value_map: dict[str, str] = field(default_factory=dict)  # literal -> state name
     fsm_transitions: list[tuple[str, str]] = field(default_factory=list)  # (from,to) pairs (best-effort)
+    combinational_blocks: List[str] = field(default_factory=list)  # always @(*) bodies
 
     @property
     def inputs(self) -> List[Port]:
@@ -120,13 +122,21 @@ def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
     reset_port, reset_active_low = _detect_reset_port(ports)
     is_sequential = _detect_sequential(body)
     state_reg, states, fsm_value_map, fsm_transitions = _detect_fsm(body, clock_port)
-    inferred = _infer_operation(clean, ports)
+    comb_blocks = _detect_combinational_blocks(body)
+    from .unsupported_scan import scan_rtl_for_unsupported
+
+    scan = scan_rtl_for_unsupported(rtl)
+    unsupported_msgs = [u.message() for u in scan.unsupported_constructs]
+    inferred = _infer_operation(clean, ports, body, rtl_source=clean)
+    if unsupported_msgs:
+        inferred = "unverifiable"
 
     return RtlModule(
         name=target_name,
         ports=ports,
         source=rtl,
         inferred_op=inferred,
+        unsupported_constructs=unsupported_msgs,
         clock_port=clock_port,
         reset_port=reset_port,
         reset_active_low=reset_active_low,
@@ -135,6 +145,7 @@ def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
         states=states,
         fsm_value_map=fsm_value_map,
         fsm_transitions=fsm_transitions,
+        combinational_blocks=comb_blocks,
     )
 
 
@@ -165,7 +176,8 @@ def _parse_port_list(header: str) -> List[Port]:
         if not chunk:
             continue
         m = re.match(
-            r"(input|output|inout)\s+(?:(?:wire|reg|logic)\s+)?(?:\[(\d+)\s*:\s*(\d+)\]\s+)?(\w+)",
+            r"(input|output|inout)\s+(?:(?:wire|reg|logic|signed|unsigned)\s+)*"
+            r"(?:\[(\d+)\s*:\s*(\d+)\]\s+)?(.+)",
             chunk,
             re.IGNORECASE,
         )
@@ -176,7 +188,9 @@ def _parse_port_list(header: str) -> List[Port]:
             msb, lsb = _parse_width(m.group(2), m.group(3))
         else:
             msb, lsb = 0, 0
-        ports.append(Port(name=m.group(4), direction=direction, msb=msb, lsb=lsb))
+        names_blob = m.group(4).strip().rstrip(",").strip()
+        for name in re.findall(r"\w+", names_blob):
+            ports.append(Port(name=name, direction=direction, msb=msb, lsb=lsb))
     return ports
 
 
@@ -298,17 +312,119 @@ def _assigned_in_clocked_block(body: str, signal: str, clock_port: Optional[str]
     return False
 
 
-def _infer_operation(clean: str, ports: List[Port]) -> Optional[str]:
-    if re.search(r"assign\s+\w+\s*=\s*\w+\s*\+\s*\w+", clean):
-        return "add"
-    if re.search(r"assign\s+\w+\s*=\s*\w+\s*&\s*\w+", clean):
-        return "and"
-    if re.search(r"assign\s+\w+\s*=\s*\w+\s*\|\s*\w+", clean):
-        return "or"
-    if re.search(r"assign\s+\w+\s*=\s*\w+\s*-\s*\w+", clean):
-        return "sub"
-    if re.search(r"assign\s+\w+\s*=\s*~\s*\w+", clean):
-        return "not"
+def _detect_combinational_blocks(body: str) -> List[str]:
+    from .always_model import extract_always_blocks
+
+    return extract_always_blocks(body)
+
+
+def _detect_case_selector(text: str) -> Optional[str]:
+    m = re.search(r"case\s*\(\s*(\w+)\s*\)", text, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _detect_case_dispatch_labels(text: str) -> List[str]:
+    labels: List[str] = []
+    for m in re.finditer(r"case\s*\([^)]+\)(.*?)endcase", text, re.DOTALL | re.IGNORECASE):
+        for lab in re.finditer(r"^\s*(\w+)\s*:", m.group(1), re.MULTILINE):
+            name = lab.group(1)
+            if name.lower() not in _CASE_KEYWORDS:
+                labels.append(name)
+    return labels
+
+
+def _infer_operation(
+    clean: str, ports: List[Port], body: str = "", rtl_source: str = ""
+) -> Optional[str]:
+    from .combinational_model import can_evaluate_combinational
+
+    src = body or clean
+    patterns: List[str] = []
+
+    m_concat = re.search(
+        r"assign\s*\{([^}]+)\}\s*=\s*([^;]+)\s*;",
+        src,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m_concat and "+" in m_concat.group(2):
+        lhs = m_concat.group(1).strip()
+        rhs = re.sub(r"\s+", "", m_concat.group(2).strip())
+        return f"sum_with_carry: {{{lhs}}} = {rhs}"
+
+    if re.search(r"casez\s*\(", src, re.IGNORECASE):
+        sel_m = re.search(r"casez\s*\(\s*(\w+)\s*\)", src, re.IGNORECASE)
+        sel = sel_m.group(1) if sel_m else "sel"
+        return f"casez_dispatch on {sel}"
+
+    if re.search(r"casex\s*\(", src, re.IGNORECASE):
+        sel_m = re.search(r"casex\s*\(\s*(\w+)\s*\)", src, re.IGNORECASE)
+        sel = sel_m.group(1) if sel_m else "sel"
+        return f"casex_dispatch on {sel}"
+
+    if re.search(r"always\s*@\s*\(\s*\*\s*\)", src, re.IGNORECASE):
+        if re.search(r"case\s*\(", src, re.IGNORECASE):
+            sel = _detect_case_selector(src)
+            from .always_model import infer_case_arm_ops
+
+            case_m = re.search(
+                r"case\s*\([^)]+\)(.*?)endcase", src, re.DOTALL | re.IGNORECASE
+            )
+            ops = infer_case_arm_ops(case_m.group(1)) if case_m else []
+            if sel and ops:
+                return f"case_dispatch on {sel} → {{{', '.join(ops)}}}"
+            return "case_dispatch"
+        if re.search(r"\bif\s*\(", src, re.IGNORECASE):
+            sel_m = re.search(r"if\s*\(\s*\w+\s*==[^)]+\)", src)
+            if sel_m:
+                return "if_chain on sel"
+            return "if_chain"
+
+    if re.search(r"\$signed\s*\(", src, re.IGNORECASE):
+        patterns.append("signed_arithmetic")
+
+    red_ops = []
+    for op, name in (("^", "xor"), ("&", "and"), ("|", "or")):
+        if re.search(rf"assign\s+\w+\s*=\s*~?{re.escape(op)}\w+", src):
+            red_ops.append(f"reduction_{name}")
+    if red_ops:
+        patterns.extend(red_ops)
+
+    if re.search(r"assign\s+\w+\s*=\s*[^;]+\?[^;]+:[^;]+;", src):
+        m = re.search(r"assign\s+(\w+)\s*=\s*([^;]+);", src)
+        if m:
+            rhs = m.group(2).strip()
+            if "?" in rhs:
+                return f"conditional: {rhs[:60]}"
+
+    m = re.search(r"assign\s+(\w+)\s*=\s*(\w+)\s*\+\s*(\w+)\s*;", clean)
+    if m:
+        return f"add: {m.group(1)} = {m.group(2)} + {m.group(3)}"
+
+    m_add = re.search(r"assign\s+(\w+)\s*=\s*(.+)\s*;", src, re.DOTALL)
+    if m_add:
+        lhs, rhs = m_add.group(1), m_add.group(2).strip()
+        rhs_compact = re.sub(r"\s+", "", rhs)
+        plus_count = rhs_compact.count("+")
+        if plus_count >= 2:
+            return f"n_input_add: {lhs} = {rhs_compact}"
+        if "&" in rhs_compact and rhs_compact.count("&") >= 2:
+            return "n_input_and"
+        if "|" in rhs_compact and rhs_compact.count("|") >= 2:
+            return "n_input_or"
+
+    if len(patterns) > 1:
+        return "multi_pattern: " + ", ".join(patterns)
+    if patterns:
+        return patterns[0]
+
+    if rtl_source:
+        try:
+            mod_tmp = RtlModule(name="_", ports=ports, source=rtl_source)
+            if can_evaluate_combinational(rtl_source, mod_tmp):
+                return "combinational_golden"
+        except Exception:
+            pass
+
     ins = [p for p in ports if p.direction == PortDirection.INPUT]
     outs = [p for p in ports if p.direction == PortDirection.OUTPUT]
     if len(ins) == 2 and len(outs) == 1:

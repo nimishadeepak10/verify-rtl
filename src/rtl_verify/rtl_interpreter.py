@@ -48,6 +48,9 @@ class ParseResult:
 
 
 _RE_ASSIGN = re.compile(r"^\s*assign\s+(\w+)\s*=\s*([^;]+);\s*$", re.IGNORECASE)
+_RE_ASSIGN_CONCAT = re.compile(
+    r"^\s*assign\s*\{[^}]+\}\s*=\s*[^;]+;\s*$", re.IGNORECASE
+)
 _RE_ASSIGN_START = re.compile(r"^\s*assign\b", re.IGNORECASE)
 _RE_ALWAYS = re.compile(r"^\s*always\s*@\s*\(\s*\*\s*\)\s*begin\s*$", re.IGNORECASE)
 _RE_END = re.compile(r"^\s*end\s*$", re.IGNORECASE)
@@ -56,7 +59,22 @@ _RE_ENDCASE = re.compile(r"^\s*endcase\s*$", re.IGNORECASE)
 _RE_IF = re.compile(r"^\s*if\s*\(\s*(.+?)\s*\)\s*begin\s*$", re.IGNORECASE)
 _RE_ELSE_BEGIN = re.compile(r"^\s*else\s*begin\s*$", re.IGNORECASE)
 _RE_LABEL = re.compile(r"^\s*([^:]+)\s*:\s*begin\s*$", re.IGNORECASE)
+_RE_LABEL_INLINE = re.compile(
+    r"^\s*([^:]+)\s*:\s*(\w+)\s*=\s*[^;]+;\s*$", re.IGNORECASE
+)
 _RE_DEFAULT = re.compile(r"^\s*default\s*:\s*begin\s*$", re.IGNORECASE)
+_RE_DEFAULT_INLINE = re.compile(
+    r"^\s*default\s*:\s*(\w+)\s*=\s*[^;]+;\s*$", re.IGNORECASE
+)
+_RE_IF_INLINE = re.compile(
+    r"^\s*if\s*\(\s*(.+?)\s*\)\s*(\w+)\s*=\s*[^;]+;\s*$", re.IGNORECASE
+)
+_RE_ELIF_INLINE = re.compile(
+    r"^\s*else\s+if\s*\(\s*(.+?)\s*\)\s*(\w+)\s*=\s*[^;]+;\s*$", re.IGNORECASE
+)
+_RE_ELSE_INLINE = re.compile(
+    r"^\s*else\s+(\w+)\s*=\s*[^;]+;\s*$", re.IGNORECASE
+)
 _RE_STMT_ASSIGN = re.compile(r"^\s*\w+\s*(?:<=|=)\s*[^;]+;\s*$")
 
 
@@ -103,6 +121,11 @@ def parse_rtl_for_coverage(rtl: str, filename: str = "dut.v") -> ParseResult:
 
         m = _RE_ASSIGN.match(raw)
         if m:
+            statements.append(StatementRef(line_no=line_no, text=s))
+            i += 1
+            continue
+
+        if _RE_ASSIGN_CONCAT.match(raw):
             statements.append(StatementRef(line_no=line_no, text=s))
             i += 1
             continue
@@ -197,6 +220,13 @@ def _parse_always_block(
             items.append({"kind": "case", "site_id": site.site_id, "expr": expr, "arms": case_items, "line_no": line_no})
             continue
 
+        if _RE_IF_INLINE.match(raw):
+            chain_items, i = _parse_if_inline_chain(
+                lines, i, filename, new_site_id, branch_sites, statements
+            )
+            items.extend(chain_items)
+            continue
+
         if _RE_STMT_ASSIGN.match(raw):
             statements.append(StatementRef(line_no=line_no, text=s))
             items.append({"kind": "stmt", "line_no": line_no, "text": s})
@@ -206,6 +236,69 @@ def _parse_always_block(
         i += 1
 
     return {"kind": "always", "items": items, "line_no": start_idx + 1}, i
+
+
+def _parse_if_inline_chain(
+    lines: Sequence[str],
+    start_idx: int,
+    filename: str,
+    new_site_id,
+    branch_sites: List[BranchSite],
+    statements: List[StatementRef],
+) -> Tuple[List[dict], int]:
+    """Parse if / else-if / else with inline assignments (no begin/end)."""
+    i = start_idx
+    arm_entries: List[dict] = []
+    site = BranchSite(
+        site_id=new_site_id("if"),
+        kind="if",
+        line_no=start_idx + 1,
+        expr="if_chain",
+        location=f"{filename}:{start_idx + 1} if_chain",
+        arms=[],
+    )
+    branch_sites.append(site)
+
+    while i < len(lines):
+        raw = lines[i]
+        line_no = i + 1
+        s = raw.strip()
+        if _RE_END.match(raw):
+            break
+        m_if = _RE_IF_INLINE.match(raw)
+        m_elif = _RE_ELIF_INLINE.match(raw)
+        m_else = _RE_ELSE_INLINE.match(raw)
+        if m_if or m_elif:
+            expr = (m_if or m_elif).group(1).strip()
+            label = expr
+            site.arms.append(BranchArm(label=label, line_no=line_no))
+            statements.append(StatementRef(line_no=line_no, text=s))
+            arm_entries.append(
+                {
+                    "label": label,
+                    "expr": expr,
+                    "items": [{"kind": "stmt", "line_no": line_no, "text": s}],
+                    "line_no": line_no,
+                }
+            )
+            i += 1
+            continue
+        if m_else:
+            site.arms.append(BranchArm(label="else", line_no=line_no))
+            statements.append(StatementRef(line_no=line_no, text=s))
+            arm_entries.append(
+                {
+                    "label": "else",
+                    "expr": "",
+                    "items": [{"kind": "stmt", "line_no": line_no, "text": s}],
+                    "line_no": line_no,
+                }
+            )
+            i += 1
+            break
+        break
+
+    return [{"kind": "if_chain", "site_id": site.site_id, "arms": arm_entries, "line_no": start_idx + 1}], i
 
 
 def _parse_begin_end(
@@ -284,6 +377,7 @@ def _parse_case(
     while i < len(lines):
         raw = lines[i]
         line_no = i + 1
+        s = raw.strip()
         if _RE_ENDCASE.match(raw):
             # implicit default arm if missing
             if not any(a.get("label") == "default" for a in arms):
@@ -304,6 +398,35 @@ def _parse_case(
             site.arms.append(BranchArm(label=label, line_no=line_no))
             items, i = _parse_begin_end(lines, i + 1, filename, new_site_id, branch_sites, statements)
             arms.append({"label": label, "items": items, "line_no": line_no})
+            continue
+
+        m = _RE_LABEL_INLINE.match(raw)
+        if m:
+            label = m.group(1).strip()
+            site.arms.append(BranchArm(label=label, line_no=line_no))
+            statements.append(StatementRef(line_no=line_no, text=s))
+            arms.append(
+                {
+                    "label": label,
+                    "items": [{"kind": "stmt", "line_no": line_no, "text": s}],
+                    "line_no": line_no,
+                }
+            )
+            i += 1
+            continue
+
+        m = _RE_DEFAULT_INLINE.match(raw)
+        if m:
+            site.arms.append(BranchArm(label="default", line_no=line_no))
+            statements.append(StatementRef(line_no=line_no, text=s))
+            arms.append(
+                {
+                    "label": "default",
+                    "items": [{"kind": "stmt", "line_no": line_no, "text": s}],
+                    "line_no": line_no,
+                }
+            )
+            i += 1
             continue
 
         i += 1
@@ -445,6 +568,30 @@ class CoverageInterpreter:
                             a.hit_count += 1
                             break
                 self._exec_items((chosen or {}).get("items") or [], env)
+                continue
+            if kind == "if_chain":
+                site = self._branch_by_id.get(it.get("site_id"))
+                taken = None
+                for arm in it.get("arms") or []:
+                    lab = str(arm.get("label"))
+                    if lab == "else":
+                        continue
+                    cond = _eval_bool(str(arm.get("expr") or ""), env)
+                    if cond:
+                        taken = arm
+                        break
+                if taken is None:
+                    taken = next(
+                        (a for a in (it.get("arms") or []) if a.get("label") == "else"),
+                        None,
+                    )
+                if site and taken:
+                    label = str(taken.get("label"))
+                    for a in site.arms:
+                        if a.label == label:
+                            a.hit_count += 1
+                            break
+                self._exec_items((taken or {}).get("items") or [], env)
                 continue
 
     def get_statement_coverage(self):

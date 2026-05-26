@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Optional
 
 from .analyzer import RtlModule, analyze_rtl
-from .combinational_model import can_evaluate_combinational
+from .combinational_model import can_self_check
+from .verification_mode import resolve_status
 from .backends.registry import (
     auto_select,
     get_backend,
@@ -47,6 +48,9 @@ class VerificationResult:
     backend_used: str = ""
     backend_version: str = ""
     coverage: CoverageReport | None = None
+    verification_mode: str = "monitor_only"
+    verdict: str = "error"
+    verification_mode_explanation: str = ""
 
 
 def run_verification(
@@ -128,12 +132,17 @@ def run_verification(
     if backend_version:
         simulator_name = f"{simulator_name} ({backend_version})"
 
-    passed = "RESULT: PASS" in sim_log
-    status = "pass" if passed else "fail"
-    if not passed and mod.is_sequential and chosen.name == "reference":
+    compile_ok = "error:" not in sim_log.lower() or "RESULT:" in sim_log
+    sim_completed = "RESULT: PASS" in sim_log or "RESULT: FAIL" in sim_log or "PASS=" in sim_log
+    v_mode, verdict, v_expl, success = resolve_status(
+        mod, rtl_source, sim_log, compile_ok=compile_ok, sim_completed=sim_completed
+    )
+    status = verdict if verdict in ("pass", "fail", "unverified") else "fail"
+    if not sim_completed and "not found" in sim_log.lower():
         status = "sim_missing"
-    elif not passed and "not found" in sim_log.lower():
-        status = "sim_missing"
+        verdict = "error"
+        v_mode = "sim_failed"
+    passed = success
     if vcd_path:
         write_dut_info(base, mod)
     wf_text = vcd_to_text(vcd_path) if vcd_path else "No waveform."
@@ -186,7 +195,15 @@ def run_verification(
         except Exception:
             coverage_report = None
     text_report = _text_summary(
-        mod, tb_source, sim_log, wf_text, backend_used, backend_version, rtl_source
+        mod,
+        tb_source,
+        sim_log,
+        wf_text,
+        backend_used,
+        backend_version,
+        rtl_source,
+        verification_mode=v_mode,
+        verdict=verdict,
     )
     if coverage_report is not None:
         text_report = text_report + "\n\n" + _format_coverage_text(coverage_report, mod)
@@ -207,6 +224,9 @@ def run_verification(
         backend_used=backend_used,
         backend_version=backend_version,
         coverage=coverage_report,
+        verification_mode=v_mode,
+        verdict=verdict,
+        verification_mode_explanation=v_expl,
     )
 
 
@@ -290,6 +310,8 @@ def _text_summary(
     backend_used: str,
     backend_version: str,
     rtl_source: str = "",
+    verification_mode: str = "",
+    verdict: str = "",
 ) -> str:
     seq_line = f"Sequential: {mod.is_sequential}"
     if mod.is_sequential:
@@ -310,8 +332,10 @@ def _text_summary(
         f"Module: {mod.name}",
         backend_line,
         seq_line,
-        f"Inferred operation: {mod.inferred_op or 'unknown'}",
+        _inferred_operation_lines(mod, rtl_source),
         f"Self-check: {_self_check_label(mod, rtl_source)}",
+        f"Verification mode: {verification_mode or '—'}",
+        f"Verdict: {(verdict or '—').upper()}",
         f"Data inputs: {[p.name for p in mod.data_inputs]}",
         f"Outputs: {[p.name for p in mod.outputs]}",
         "",
@@ -326,10 +350,32 @@ def _text_summary(
     return "\n".join(lines)
 
 
+def _inferred_operation_lines(mod: RtlModule, rtl_source: str) -> str:
+    op = mod.inferred_op or "unknown"
+    if op == "unverifiable" or mod.unsupported_constructs:
+        lines = ["Inferred operation: unverifiable"]
+        if mod.unsupported_constructs:
+            lines.append("Reason: unsupported construct —")
+            for msg in mod.unsupported_constructs:
+                detail = msg.replace("unsupported construct — ", "")
+                lines.append(f"        {detail}")
+            lines.append(
+                "Workaround: simplify the RTL or contact tool author to add support."
+            )
+        elif not can_self_check(rtl_source, mod):
+            lines.append(
+                "Reason: golden model could not evaluate this RTL shape."
+            )
+        return "\n".join(lines)
+    return f"Inferred operation: {op}"
+
+
 def _self_check_label(mod: RtlModule, rtl_source: str) -> str:
     if mod.is_sequential:
         return "monitor-only (sequential)"
-    if rtl_source and can_evaluate_combinational(rtl_source, mod):
+    if rtl_source and can_self_check(rtl_source, mod):
+        if mod.inferred_op and "case_dispatch" in str(mod.inferred_op):
+            return "golden model from RTL case/ternary structure"
         return "golden model from RTL assign statements"
     if mod.inferred_op in ("add", "and", "xor", "or", "sub"):
         return f"inferred {mod.inferred_op}"

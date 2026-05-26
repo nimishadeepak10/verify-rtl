@@ -6,7 +6,7 @@ from typing import Optional
 
 from ..analyzer import PortDirection, RtlModule
 from ..combinational_model import (
-    can_evaluate_combinational,
+    can_self_check,
     expected_outputs,
     verilog_literal,
 )
@@ -246,6 +246,31 @@ def _random_cases(ins, n: int) -> list[dict[str, int]]:
     return cases
 
 
+def _emit_test_display(
+    mod: RtlModule,
+    test_idx: int,
+    golden: Optional[dict[str, int]],
+    verdict: str,
+) -> str:
+    """Structured TEST line: IN inputs, optional EXP expected, OUT got wires, RESULT verdict."""
+    in_ports = mod.inputs if not mod.is_sequential else mod.data_inputs
+    out_ports = mod.outputs
+    in_pipe = "|".join(f"{p.name}=%0d" for p in in_ports)
+    out_pipe = "|".join(f"{p.name}=%0d" for p in out_ports)
+    in_wires = ", ".join(p.name for p in in_ports)
+    out_wires = ", ".join(p.name for p in out_ports)
+    vlit = f'"{verdict}"'
+    if golden and out_ports:
+        exp_pipe = "|".join(f"{p.name}=%0d" for p in out_ports)
+        exp_vals = ", ".join(str(golden[p.name]) for p in out_ports)
+        fmt = f"TEST,%0d,IN,{in_pipe},EXP,{exp_pipe},OUT,{out_pipe},RESULT,%s"
+        args = ", ".join([str(test_idx), in_wires, exp_vals, out_wires, vlit])
+    else:
+        fmt = f"TEST,%0d,IN,{in_pipe},OUT,{out_pipe},RESULT,%s"
+        args = ", ".join([str(test_idx), in_wires, out_wires, vlit])
+    return f'$display("{fmt}", {args});'
+
+
 def _stimulus_blocks(
     mod: RtlModule,
     cases: list[dict[str, int]],
@@ -253,10 +278,19 @@ def _stimulus_blocks(
 ) -> str:
     lines = []
     use_golden = bool(
-        rtl_source
-        and not mod.is_sequential
-        and can_evaluate_combinational(rtl_source, mod)
+        rtl_source and not mod.is_sequential and can_self_check(rtl_source, mod)
     )
+    if use_golden and rtl_source:
+        for case in cases:
+            try:
+                golden_check = expected_outputs(rtl_source, mod, case)
+                if not golden_check:
+                    use_golden = False
+                    break
+            except Exception:
+                use_golden = False
+                break
+    in_ports = mod.inputs
     for i, case in enumerate(cases):
         assigns = [f"        {k} = {v};" for k, v in case.items()]
         lines.append(f"        // test {i}")
@@ -274,25 +308,15 @@ def _stimulus_blocks(
                 for p in mod.outputs
             ]
             cond = " || ".join(checks)
-            exp_nums = ", ".join(str(golden[p.name]) for p in mod.outputs)
-            got_args = ", ".join(p.name for p in mod.outputs)
-            exp_fmt = " ".join(f"exp_{p.name}=%0d" for p in mod.outputs)
-            got_fmt = " ".join(f"got_{p.name}=%0d" for p in mod.outputs)
-            in_fmt = " ".join(f"{p.name}=%0d" for p in mod.inputs)
-            in_args = ", ".join(p.name for p in mod.inputs)
-            out_fmt = " ".join(f"{p.name}=%0d" for p in mod.outputs)
+            fail_disp = _emit_test_display(mod, i, golden, "FAIL")
+            pass_disp = _emit_test_display(mod, i, golden, "PASS")
             lines.append(
-                f"        if ({cond}) begin fail_cnt = fail_cnt + 1; "
-                f'$display("FAIL t=%0d {exp_fmt} {got_fmt}", '
-                f"$time, {exp_nums}, {got_args}); end "
-                f"else begin pass_cnt = pass_cnt + 1; "
-                f'$display("PASS t=%0d {in_fmt} {out_fmt}", '
-                f"$time, {in_args}, {got_args}); end"
+                f"        if ({cond}) begin fail_cnt = fail_cnt + 1; {fail_disp} end "
+                f"else begin pass_cnt = pass_cnt + 1; {pass_disp} end"
             )
         elif mod.outputs:
-            outs = ", ".join(f"{p.name}=%0d" for p in mod.outputs)
-            args = ", ".join(p.name for p in mod.outputs)
-            lines.append(f'        $display("STIM t=%0d {outs}", $time, {args});')
+            obs_disp = _emit_test_display(mod, i, None, "OBS")
+            lines.append(f"        {obs_disp}")
             lines.append("        pass_cnt = pass_cnt + 1;")
         else:
             lines.append("        pass_cnt = pass_cnt + 1;")

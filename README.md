@@ -79,7 +79,10 @@ Open http://127.0.0.1:8000 (use another port if 8000 is busy, e.g. `--port 8005`
 |------|------|--------|
 | `examples/adder_2bit.v` | Combinational | 2-bit adder (classic demo) |
 | `examples/and_2bit.v`, `or_2bit.v`, `xor_2bit.v` | Combinational | Gate primitives |
-| `examples/alu_4bit.v`, `examples/alu_8bit.v` | Combinational | Wider ops, good for bus expansion in the viewer |
+| `examples/full_adder_4bit.v` | Combinational | Concatenation LHS `{c_out, sum} = a + b + c_in` (carry + sum) |
+| `examples/alu_4bit.v` | Combinational | `always @(*)` + `case` on opcode, multi-output (`result`, `zero`) |
+| `examples/mux_4to1.v` | Combinational | `always @(*)` if/else-if chain (4-to-1 mux) |
+| `examples/alu_8bit.v` | Combinational | Ternary-assign ALU (8-bit) |
 | `examples/traffic_light_fsm.v` | Sequential | Moore FSM with `clk`, `rst_n`, `go` — uses real clock, no `ref_clk` |
 
 ## Languages
@@ -119,6 +122,10 @@ Structured verification plans (`vplan`) model industry-style test planning **bef
 
 The web UI renders the vplan on the Plan step; testbench generation uses the same analyzer and vplan builder logic as the CLI.
 
+## Honest verification (Phase A.11)
+
+Verification mode is **self_checking** when the tool can derive a golden model (assign chains, ternary `assign`, or `always @(*)` case/if). Otherwise runs are **monitor_only** and the UI shows **UNVERIFIED** (amber) — not a green PASS. Per-test rows use structured `TEST,...` log lines with separate IN/OUT fields.
+
 ## Code Coverage
 
 After simulation completes, VerifyRTL computes **code coverage as a post-pass** (no RTL instrumentation, no injected statements). Coverage is derived by combining:
@@ -133,9 +140,33 @@ Metrics reported in `report.txt` and the Coverage screen:
 - **Toggle**: per-bit 0→1 and 1→0 toggles for **DUT ports only** (excludes testbench/results/reference signals so they don’t inflate coverage)
 - **FSM**: sequential-only state-visit and transition-taken coverage (shown as N/A for combinational designs)
 
+## Supported RTL patterns
+
+The interpreter handles these combinational constructs and self-checks designs that use only these:
+
+| Pattern               | Status | Example                                         |
+|-----------------------|--------|-------------------------------------------------|
+| Simple assign         |   ✅   | `assign y = a + b;`                             |
+| Concatenation LHS     |   ✅   | `assign {c, s} = a + b + cin;`                  |
+| N-operand expressions |   ✅   | `y = a + b + c + d;`                            |
+| Case statements       |   ✅   | `case (op) ... endcase`                         |
+| Casez with wildcards  |   ✅   | `casez (p) 4'b1???: ... endcase`                |
+| Casex                 |   ✅   | (same as casez)                                 |
+| If/else chains        |   ✅   | `if (s==0) y=a; else if (s==1) y=b;`            |
+| Ternary               |   ✅   | `assign y = sel ? a : b;`                       |
+| Reductions            |   ✅   | `assign par = ^data;`                           |
+| Signed arithmetic     |   ✅   | `$signed(a) + $signed(b)`                       |
+| Multi-output always   |   ✅   | One block computing multiple outputs            |
+| For loops             |   ❌   | Generator-time unrolling not implemented        |
+| Function calls        |   ❌   | Function bodies not interpreted                 |
+| Generate blocks       |   ❌   | Parameter-driven instantiation not supported    |
+| Submodule hierarchy   |   ❌   | Recursive interpretation not supported          |
+
+When the interpreter encounters an unsupported construct, the tool reports **UNVERIFIED** with the specific construct name and line number in the Full report and UI callout — not a generic “unknown” message.
+
 ## Combinational golden model
 
-For non-sequential RTL, `combinational_model.py` can evaluate `assign`-based expressions (arithmetic and bitwise) to produce expected outputs for self-checking testbenches and the Python **reference** simulator backend. The analyzer still tags common ops (`add`, `and`, `xor`) for reporting; the model extends checking to a broader class of assign-only designs when parsing succeeds.
+Implementation: `combinational_model.py`, `always_model.py`, `verilog_constants.py`, and `unsupported_scan.py`. Inferred operations are descriptive (`add: y = a + b`, `sum_with_carry`, `case_dispatch on opcode → {...}`, `casez_dispatch`, `if_chain`, `conditional`, `reduction_*`, `signed_arithmetic`, `multi_pattern`, or `unverifiable` with reasons).
 
 ## Limitations
 

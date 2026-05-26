@@ -152,17 +152,28 @@ async def verify(
         if "error" in waveform_json_data:
             waveform_json_data = None
 
-    overall_pass = result.success or bool(result.uvm_note)
+    verdict = getattr(result, "verdict", "pass" if result.success else "fail")
+    v_mode = getattr(result, "verification_mode", "monitor_only")
+    v_expl = getattr(result, "verification_mode_explanation", "")
+    overall_pass = verdict == "pass" or bool(result.uvm_note)
     test_results = parse_test_results(
         result.sim_log,
         mod=result.module,
         rtl_source=rtl_source,
         overall_pass=overall_pass,
     )
+    if verdict == "unverified":
+        for row in test_results:
+            if row.get("result") in ("PASS", "RUN"):
+                row["result"] = "OBSERVED"
+            row["expected"] = {}
 
     return {
         "success": result.success,
-        "status": getattr(result, "status", "pass" if result.success else "fail"),
+        "verdict": verdict,
+        "verification_mode": v_mode,
+        "verification_mode_explanation": v_expl,
+        "status": getattr(result, "status", verdict),
         "simulator": getattr(result, "simulator", ""),
         "backend_used": getattr(result, "backend_used", ""),
         "backend_version": getattr(result, "backend_version", ""),

@@ -6,7 +6,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from .analyzer import RtlModule
-from .combinational_model import can_evaluate_combinational, expected_outputs
+from .combinational_model import can_self_check, expected_outputs
 from .generators import verilog_tb as vtb
 
 _FIELD_RE = re.compile(r"(\w+)=(\S+)")
@@ -20,6 +20,73 @@ _FAIL_LINE = re.compile(
 _STIM_LINE = re.compile(r"^STIM\s+t=\d+\s+(.+)$", re.IGNORECASE | re.MULTILINE)
 _SEQ_LINE = re.compile(r"^SEQ\s+t=\d+\s+(.+)$", re.IGNORECASE | re.MULTILINE)
 _SUMMARY_PASS = re.compile(r"PASS=(\d+)", re.IGNORECASE)
+_TEST_LINE = re.compile(r"^TEST,(\d+),", re.IGNORECASE)
+
+
+def _parse_pipe_fields(section: str) -> Dict[str, str]:
+    """Parse a=1|b=2|opcode=3 into dict."""
+    out: Dict[str, str] = {}
+    if not section:
+        return out
+    for part in section.split("|"):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _parse_test_line(trimmed: str) -> Optional[Dict[str, Any]]:
+    if not trimmed.upper().startswith("TEST,"):
+        return None
+    parts = trimmed.split(",")
+    if len(parts) < 5:
+        return None
+    try:
+        test_idx = int(parts[1])
+    except ValueError:
+        return None
+    inputs: Dict[str, str] = {}
+    expected: Dict[str, str] = {}
+    got: Dict[str, str] = {}
+    result = "OBS"
+    i = 2
+    while i < len(parts):
+        tag = parts[i].strip().upper()
+        if tag == "IN" and i + 1 < len(parts):
+            inputs = _parse_pipe_fields(parts[i + 1])
+            i += 2
+            continue
+        if tag in ("EXP", "EXPECTED") and i + 1 < len(parts):
+            expected = _parse_pipe_fields(parts[i + 1])
+            i += 2
+            continue
+        if tag == "OUT" and i + 1 < len(parts):
+            got = _parse_pipe_fields(parts[i + 1])
+            i += 2
+            continue
+        if tag == "RESULT" and i + 1 < len(parts):
+            result = parts[i + 1].strip().upper()
+            if result == "OBS":
+                result = "OBSERVED"
+            i += 2
+            continue
+        i += 1
+    ui_result = result
+    if result == "OBSERVED":
+        ui_result = "OBSERVED"
+    elif result == "PASS":
+        ui_result = "PASS"
+    elif result == "FAIL":
+        ui_result = "FAIL"
+    return {
+        "num": test_idx + 1,
+        "inputs": inputs,
+        "expected": expected,
+        "got": got,
+        "result": ui_result,
+        "detail": trimmed,
+    }
 
 
 def _parse_fields(s: str) -> Dict[str, str]:
@@ -73,6 +140,23 @@ def parse_sim_log(sim_log: str, overall_pass: bool = True) -> List[Dict[str, Any
     for line in sim_log.splitlines():
         trimmed = line.strip()
         if not trimmed or trimmed.startswith("==="):
+            continue
+
+        test_row = _parse_test_line(trimmed)
+        if test_row:
+            rows.append(
+                _row(
+                    test_row["num"],
+                    "Simulation",
+                    "Vector check",
+                    test_row["inputs"],
+                    test_row["expected"],
+                    test_row["got"],
+                    test_row["result"],
+                    test_row["detail"],
+                )
+            )
+            idx = max(idx, test_row["num"])
             continue
 
         m = _PASS_LINE.search(trimmed)
@@ -176,7 +260,7 @@ def _rows_from_tb_cases(
         and bool(mod.inputs)
         and bool(mod.outputs)
         and bool(rtl_source)
-        and can_evaluate_combinational(rtl_source, mod)
+        and can_self_check(rtl_source, mod)
     )
     rows: List[Dict[str, Any]] = []
     for i, case in enumerate(cases):
