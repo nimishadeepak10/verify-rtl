@@ -12,6 +12,14 @@ construct — so it's the reliable choice here.
 This keeps the same output shape whether a property comes from a
 hand-written string (today) or an LLM-generated one later (Phase 2) —
 only the `expr` strings change, the wiring stays the same.
+
+Sequential (clocked) and combinational (clockless) DUTs both work:
+sequential properties are checked every clock edge with a reset
+assumption at time 0; combinational properties are checked on every
+input change via `always @(*)`, since there's no clock and no state to
+assume a reset for. `recommended_formal_config()` picks a matching
+SymbiYosys mode/depth for either case from what the analyzer already
+knows about the design.
 """
 
 from __future__ import annotations
@@ -37,10 +45,6 @@ def generate_formal_wrapper(
     if not properties:
         raise ValueError("Need at least one (name, expression) property")
     clk = clock_port or module.clock_port
-    if not clk:
-        raise ValueError(
-            f"'{module.name}' has no detected clock port; pass clock_port explicitly"
-        )
 
     wrapper_name = f"{module.name}_formal_top"
 
@@ -61,18 +65,31 @@ def generate_formal_wrapper(
     assert_lines = [f"        {name}: assert ({expr});" for name, expr in properties]
     conns_str = ",\n        ".join(conns)
 
-    # Without this, BMC is free to start sequential state in a value the RTL's
-    # own logic never actually produces (registers have no reset value until
-    # the first clock edge applies it) — a classic false counterexample, not
-    # a real bug. Assuming reset is asserted at time 0 rules that out, the
-    # same way simulation always implicitly goes through reset first.
-    reset_assume = ""
-    if module.reset_port:
-        reset_expr = (
-            f"!{module.reset_port}" if module.reset_active_low else module.reset_port
-        )
-        reset_assume = f"""    initial begin
+    if clk:
+        # Without this, BMC is free to start sequential state in a value the
+        # RTL's own logic never actually produces (registers have no reset
+        # value until the first clock edge applies it) — a classic false
+        # counterexample, not a real bug. Assuming reset is asserted at time
+        # 0 rules that out, the same way simulation always implicitly goes
+        # through reset first.
+        reset_assume = ""
+        if module.reset_port:
+            reset_expr = (
+                f"!{module.reset_port}" if module.reset_active_low else module.reset_port
+            )
+            reset_assume = f"""    initial begin
         assume({reset_expr});
+    end
+"""
+        check_block = f"""{reset_assume}    always @(posedge {clk}) begin
+{chr(10).join(assert_lines)}
+    end
+"""
+    else:
+        # No clock, no state — check on every input change instead of every
+        # clock edge. No reset assumption needed: there's nothing to reset.
+        check_block = f"""    always @(*) begin
+{chr(10).join(assert_lines)}
     end
 """
 
@@ -88,9 +105,22 @@ module {wrapper_name} (
     );
 
 `ifdef FORMAL
-{reset_assume}    always @(posedge {clk}) begin
-{chr(10).join(assert_lines)}
-    end
-`endif
+{check_block}`endif
 endmodule
 """
+
+
+def recommended_formal_config(module: RtlModule) -> dict:
+    """Pick a SymbiYosys mode/depth from what the analyzer already knows.
+
+    Combinational designs have no time-varying state, so a single-step
+    check is sufficient — a larger depth would only cost time for no
+    benefit. Sequential designs get a depth scaled to the number of known
+    FSM states (enough cycles to reach any state and take one more
+    transition), with a floor so small or non-FSM sequential designs still
+    get a reasonable bound.
+    """
+    if not module.is_sequential:
+        return {"mode": "bmc", "depth": 1}
+    depth = max(10, len(module.states) * 4) if module.states else 20
+    return {"mode": "bmc", "depth": depth}
