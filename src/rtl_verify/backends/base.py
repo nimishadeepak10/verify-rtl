@@ -22,6 +22,10 @@ class SimulatorBackend(ABC):
     display_name: str = ""
     supports_uvm: bool = False
     supports_systemverilog: bool = True
+    # True for formal (property-checking) backends, as opposed to simulators.
+    # auto_select() must never treat a formal backend as a simulator
+    # fallback — formal is a different question, requested explicitly.
+    supports_formal: bool = False
 
     @abstractmethod
     def is_available(self) -> bool:

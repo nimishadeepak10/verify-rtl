@@ -85,6 +85,7 @@ class SymbiYosysBackend(SimulatorBackend):
     display_name = "SymbiYosys (formal)"
     supports_uvm = False
     supports_systemverilog = True
+    supports_formal = True
 
     def is_available(self) -> bool:
         sby = find_sby()
