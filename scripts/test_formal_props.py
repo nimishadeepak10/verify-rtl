@@ -44,6 +44,7 @@ def run_case(label: str, rtl_path: Path, module_name: str, prop_expr: str, expec
         top=f"{module_name}_formal_top",
         depth=config["depth"],
         mode=config["mode"],
+        engine=config["engine"],
     )
 
     status = "PASS" if result.success else "FAIL"

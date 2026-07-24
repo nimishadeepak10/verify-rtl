@@ -111,16 +111,22 @@ endmodule
 
 
 def recommended_formal_config(module: RtlModule) -> dict:
-    """Pick a SymbiYosys mode/depth from what the analyzer already knows.
+    """Pick a SymbiYosys mode/engine/depth from what the analyzer already knows.
 
-    Combinational designs have no time-varying state, so a single-step
-    check is sufficient — a larger depth would only cost time for no
-    benefit. Sequential designs get a depth scaled to the number of known
-    FSM states (enough cycles to reach any state and take one more
-    transition), with a floor so small or non-FSM sequential designs still
-    get a reasonable bound.
+    Combinational designs have no time-varying state, so a single BMC step
+    already checks every input combination exhaustively via SAT — that's a
+    complete proof already, not a bounded approximation; there's no "later
+    cycle" it could have missed.
+
+    Sequential designs get PDR (`mode prove`, `abc pdr`) — an unbounded
+    proof, not a fixed number of unrolled cycles. This matters concretely:
+    a plain BMC check at a shallow depth can report PASS on a property
+    that's only true for the first N cycles and false afterward, simply
+    because it never looked far enough (see
+    scripts/test_formal_unbounded.py for a worked example). PDR searches
+    for a proof or a genuine counterexample regardless of how far away it
+    is, so `depth` isn't part of this config for sequential designs.
     """
     if not module.is_sequential:
-        return {"mode": "bmc", "depth": 1}
-    depth = max(10, len(module.states) * 4) if module.states else 20
-    return {"mode": "bmc", "depth": depth}
+        return {"mode": "bmc", "engine": "smtbmc", "depth": 1}
+    return {"mode": "prove", "engine": "abc pdr", "depth": 0}

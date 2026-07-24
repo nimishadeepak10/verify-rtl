@@ -1,10 +1,21 @@
-"""SymbiYosys (sby) formal backend — bounded model checking via Yosys.
+"""SymbiYosys (sby) formal backend — model checking via Yosys.
 
 Unlike IcarusBackend/VivadoBackend, this does not run a self-checking
-testbench; it proves (or falsifies) SVA properties bound to the DUT within
-a bounded depth. ``run()`` keeps the same shape as the simulator backends
-so the registry can treat it uniformly, with two differences the caller
-must know about:
+testbench; it proves (or falsifies) SVA properties bound to the DUT.
+Two engines are supported via the ``mode``/``engine`` args, and they give
+genuinely different guarantees, not just different speed:
+
+- ``mode="bmc", engine="smtbmc"`` (the default): bounded — proves no
+  violation exists within ``depth`` steps. A PASS here does NOT mean the
+  property holds forever, only that nothing broke within the checked
+  window. Good for fast bug-hunting.
+- ``mode="prove", engine="abc pdr"``: unbounded (PDR/property-directed
+  reachability) — proves the property for all time, or finds a genuine
+  counterexample regardless of how far away it is. ``depth`` is ignored
+  in this mode (PDR doesn't unroll to a fixed step count).
+
+``run()`` keeps the same shape as the simulator backends so the registry
+can treat it uniformly, with two differences the caller must know about:
 
 - ``tb_path`` is not a driving testbench — it's a file containing the
   ``assert property`` statements (typically guarded by ``` `ifdef FORMAL ```),
@@ -104,6 +115,7 @@ class SymbiYosysBackend(SimulatorBackend):
         top: str = "tb",
         depth: int = 20,
         mode: str = "bmc",
+        engine: str = "smtbmc",
     ) -> BackendResult:
         t0 = time.perf_counter()
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -137,13 +149,19 @@ class SymbiYosysBackend(SimulatorBackend):
         files = [rtl_abs] if tb_abs == rtl_abs else [rtl_abs, tb_abs]
         read_files = " ".join(f'"{f}"' for f in files)
 
+        # "prove" mode (PDR/induction engines) searches for an unbounded proof
+        # or counterexample rather than unrolling to a fixed step count, so a
+        # depth option isn't meaningful there — omit it rather than pass a
+        # number that would silently be ignored.
+        options_lines = [f"mode {mode}"]
+        if mode != "prove":
+            options_lines.append(f"depth {depth}")
+
         sby_config = (
-            f"[options]\n"
-            f"mode {mode}\n"
-            f"depth {depth}\n"
+            f"[options]\n" + "\n".join(options_lines) + "\n"
             f"\n"
             f"[engines]\n"
-            f"smtbmc\n"
+            f"{engine}\n"
             f"\n"
             f"[script]\n"
             f"read -formal {read_files}\n"
