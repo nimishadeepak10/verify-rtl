@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=7" />
 </head>
 <body>
   <header class="top-bar" role="banner">
@@ -38,7 +38,7 @@
           <span class="ctx-value" id="ctxBackendName">—</span>
         </div>
         <div class="ctx-sub" id="ctxBackendVer"></div>
-        <div class="ctx-label">TESTS PLANNED</div>
+        <div class="ctx-label">TB STIMULUS</div>
         <div class="ctx-big" id="ctxTestCount">—</div>
       </div>
     </aside>
@@ -49,7 +49,7 @@
         <div class="screen-inner screen-inner--design-grid">
           <header class="screen-header">
             <h1 class="screen-title">Design</h1>
-            <p class="screen-lead">Load your RTL, choose simulator settings, then use <strong>Analyze</strong> in the top bar to continue.</p>
+            <p class="screen-lead">Load RTL, pick a simulator, then <strong>Analyze</strong> and <strong>Run</strong>. VerifyRTL checks synthesizability (Vivado), writes a testbench, simulates, and shows waveforms.</p>
           </header>
           <div class="workflow-hint" aria-label="Quick start">
             <div class="workflow-hint__step"><span class="workflow-hint__num">1</span> Load RTL</div>
@@ -59,6 +59,32 @@
             <div class="workflow-hint__step"><span class="workflow-hint__num">3</span> Run</div>
             <div class="workflow-hint__arrow" aria-hidden="true">→</div>
             <div class="workflow-hint__step"><span class="workflow-hint__num">4</span> Results</div>
+          </div>
+          <div class="sim-picker-bar">
+            <div class="sim-picker-bar__head">
+              <span class="sim-picker-bar__label">SIMULATOR</span>
+              <span class="sim-picker-bar__status" id="backendStatus" aria-live="polite">Pick the tool installed on your machine</span>
+            </div>
+            <div class="segmented sim-segments" id="backendSegments" role="radiogroup" aria-label="Simulator backend">
+              <label class="segmented__btn sim-opt selected">
+                <input type="radio" name="backend" value="" checked /> Auto
+              </label>
+              <label class="segmented__btn sim-opt" data-backend-id="icarus">
+                <input type="radio" name="backend" value="icarus" />
+                <span class="sim-led sim-led--off" aria-hidden="true"></span>
+                Icarus Verilog <span class="sim-ver" data-ver-for="icarus"></span>
+              </label>
+              <label class="segmented__btn sim-opt" data-backend-id="vivado">
+                <input type="radio" name="backend" value="vivado" />
+                <span class="sim-led sim-led--off" aria-hidden="true"></span>
+                Vivado XSim <span class="sim-ver" data-ver-for="vivado"></span>
+              </label>
+              <label class="segmented__btn sim-opt" data-backend-id="reference">
+                <input type="radio" name="backend" value="reference" />
+                <span class="sim-led sim-led--off" aria-hidden="true"></span>
+                Python reference <span class="sim-ver" data-ver-for="reference"></span>
+              </label>
+            </div>
           </div>
           <div class="panel">
             <div class="panel__header">
@@ -101,13 +127,6 @@
                   <label class="segmented__btn lang-opt selected"><input type="radio" name="language" value="systemverilog" checked /> SystemVerilog</label>
                   <label class="segmented__btn lang-opt"><input type="radio" name="language" value="uvm" /> UVM</label>
                 </div>
-              </div>
-              <div class="config-row">
-                <label class="config-label" for="backendSelect">BACKEND</label>
-                <p class="config-hint">Icarus Verilog for simulation; reference model for combinational-only checks.</p>
-                <select id="backendSelect" class="input-mono">
-                  <option value="">Auto-detect best available</option>
-                </select>
               </div>
               <div class="config-row">
                 <label class="config-label" for="topModule">TOP MODULE</label>
@@ -194,9 +213,10 @@
 
   <div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=8"></script>
   <script src="/static/vplan.js"></script>
   <script src="/static/waveform.js?v=5"></script>
-  <script src="/static/results.js?v=4"></script>
+  <script src="/static/formal.js?v=2"></script>
+  <script src="/static/results.js?v=7"></script>
 </body>
 </html>

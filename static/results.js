@@ -536,34 +536,26 @@
     const vExpl = data.verification_mode_explanation || "";
 
     const pass = verdict === "pass" || data.uvm_note;
-
     const simLog = (data.uvm_note ? data.uvm_note + "\n\n" : "") + (data.sim_log || "");
+    const errors = data.errors || [];
 
-    const rows = resolveResultRows(data, pass);
+    const isWaveformPass = verdict === "pass" && vMode === "waveform";
+    const isNotSynth = verdict === "not_synthesizable" || data.status === "not_synthesizable";
+    const isError = verdict === "error" || data.status === "sim_missing" || data.status === "compile_failed";
 
+    const statsHtml = isWaveformPass
+      ? `<div class="result-stats result-stats--muted">Simulation completed — inspect waveforms</div>`
+      : isNotSynth
+        ? `<div class="result-stats result-stats--muted">Synthesis failed — simulation not run</div>`
+        : isError
+          ? `<div class="result-stats result-stats--muted">${errors.length ? errors.length + " error(s)" : "Run failed"} — see log below</div>`
+          : `<div class="result-stats result-stats--muted">See simulation log</div>`;
 
-
-    const isUnverified = verdict === "unverified";
-
-    const passed = rows.filter((r) => r.result === "PASS").length;
-
-    const failed = rows.filter((r) => r.result === "FAIL").length;
-
-    const observed = rows.filter((r) => r.result === "OBSERVED").length;
-
-    const passCnt = simLog.match(/PASS=(\d+)/);
-
-    const failCnt = simLog.match(/FAIL=(\d+)/);
-
-    const pN = passCnt ? passCnt[1] : passed;
-
-    const fN = failCnt ? failCnt[1] : failed;
-
-    const tN = passCnt && failCnt ? String(+pN + +fN) : String(rows.length || 0);
-
-    const statsHtml = isUnverified
-      ? `<div class="result-stats result-stats--muted">${observed || tN} observed · monitor-only · 0 checks performed</div>`
-      : `<div class="result-stats">${pN} passed · ${fN} failed · ${tN} total</div>`;
+    const synthMeta = [];
+    if (data.synth_synthesizable === true) synthMeta.push("synthesizable");
+    else if (data.synth_synthesizable === false) synthMeta.push("not synthesizable");
+    else if (data.synth_skipped) synthMeta.push("synth check skipped");
+    if (data.detected_language) synthMeta.push(data.detected_language);
 
 
 
@@ -589,66 +581,41 @@
 
       <div class="result-summary">
 
-        <div class="result-badge result-badge--${verdict === "pass" ? "pass" : verdict === "unverified" ? "unverified" : verdict === "error" || data.status === "sim_missing" ? "error" : "fail"}">
-          <span class="led ${verdict === "pass" ? "led-green" : verdict === "unverified" ? "led-amber" : "led-red"}"></span>
-          <span class="mono">${verdict === "pass" ? "PASS" : verdict === "unverified" ? "UNVERIFIED" : verdict === "error" || data.status === "sim_missing" ? (data.status === "sim_missing" ? "NO SIM" : "ERROR") : "FAIL"}</span>
+        <div class="result-badge result-badge--${verdict === "pass" ? "pass" : isNotSynth ? "error" : verdict === "unverified" ? "unverified" : verdict === "error" || data.status === "sim_missing" ? "error" : "fail"}">
+          <span class="led ${verdict === "pass" ? "led-green" : isNotSynth ? "led-red" : verdict === "unverified" ? "led-amber" : "led-red"}"></span>
+          <span class="mono">${verdict === "pass" ? (isWaveformPass ? "SIM OK" : "PASS") : isNotSynth ? "NOT SYNTH" : verdict === "unverified" ? "UNVERIFIED" : verdict === "error" || data.status === "sim_missing" ? (data.status === "sim_missing" ? "NO SIM" : "ERROR") : "FAIL"}</span>
         </div>
 
         ${statsHtml}
 
-        <div class="result-meta">${App.escapeHtml(backendParts.join(" · ") || "—")}</div>
+        <div class="result-meta">${App.escapeHtml([...backendParts, ...synthMeta].join(" · ") || "—")}</div>
 
       </div>
 
-      ${verdict === "unverified" ? `<div class="callout callout-warn callout-unverified">
-        <span class="callout__prefix">MONITOR-ONLY RUN</span> — outputs were observed, not checked
-        <p class="callout-unverified__body">${App.escapeHtml(vExpl)}</p>
-        <p class="callout-unverified__hint">Per-test <strong>OBSERVED</strong> means the simulator ran without errors — not that outputs are correct.</p>
+      ${isNotSynth ? `<div class="callout callout-warn callout-unverified">
+        <span class="callout__prefix">NOT SYNTHESIZABLE</span> — Vivado synthesis failed
+        <p class="callout-unverified__body">${App.escapeHtml(vExpl || "Fix synthesis errors in the Full report.")}</p>
+        ${errors.length ? `<ul class="error-list">${errors.map((e) => `<li class="mono">${App.escapeHtml(e)}</li>`).join("")}</ul>` : ""}
       </div>` : ""}
 
+      ${isError && !isNotSynth ? `<div class="callout callout-warn callout-unverified">
+        <span class="callout__prefix">SIMULATION ERROR</span> — compile or run failed
+        <p class="callout-unverified__body">${App.escapeHtml(vExpl || "See Sim log tab for details.")}</p>
+        ${errors.length ? `<ul class="error-list">${errors.map((e) => `<li class="mono">${App.escapeHtml(e)}</li>`).join("")}</ul>` : ""}
+      </div>` : ""}
 
-
-      <div class="filter-chips" role="toolbar" aria-label="Filter results">
-
-        ${(isUnverified ? ["all", "observed"] : ["all", "passed", "failed"])
-          .concat(["directed", "corner", "negative", "random"])
-          .map((f) => {
-            const label =
-              f === "observed" ? "Observed" : f.charAt(0).toUpperCase() + f.slice(1);
-            return `<button type="button" class="chip${activeFilter === f ? " active" : ""}" data-filter="${f}">${label}</button>`;
-          })
-          .join("")}
-
-      </div>
-
-
+      ${isWaveformPass ? `<div class="callout callout-warn callout-unverified" style="border-left-color: var(--led-green)">
+        <span class="callout__prefix">WAVEFORM VERIFICATION</span> — synthesis ${data.synth_skipped ? "check skipped" : "passed"}, simulation completed
+        <p class="callout-unverified__body">${App.escapeHtml(vExpl)}</p>
+        <p class="callout-unverified__hint">Open the <strong>Waveform</strong> tab to confirm RTL behavior.</p>
+      </div>` : ""}
 
       <div class="panel">
-
-        <div class="panel__header"><h2 class="panel__title">TEST CASE RESULTS</h2></div>
-
-        <div class="panel__body" style="padding:0;overflow-x:auto">
-
-          <table class="data-table" id="resultsTable">
-
-            <thead>
-
-              <tr>
-
-                <th>#</th><th>CATEGORY</th><th>DESCRIPTION</th><th>INPUTS</th>
-
-                <th>EXPECTED</th><th>GOT</th><th>RESULT</th>
-
-              </tr>
-
-            </thead>
-
-            <tbody id="resultsTableBody"></tbody>
-
-          </table>
-
+        <div class="panel__header"><h2 class="panel__title">SIMULATION STATUS</h2></div>
+        <div class="panel__body">
+          <p>${data.has_vcd ? "VCD waveform captured — use the <strong>Waveform</strong> tab." : "No waveform file was produced for this run."}</p>
+          <p class="text-dim">Testbench applies timed input stimulus only (no per-test PASS/FAIL). RTL correctness is judged from waveforms and tool logs.</p>
         </div>
-
       </div>
 
 
@@ -663,6 +630,8 @@
 
         <button type="button" data-panel="panelWave">Waveform</button>
 
+        <button type="button" data-panel="panelFormal">Formal</button>
+
       </div>
 
       <div id="panelReport" class="result-panel active"><pre class="code-block" id="reportPre"></pre></div>
@@ -670,6 +639,8 @@
       <div id="panelTb" class="result-panel"><pre class="code-block" id="tbPre"></pre></div>
 
       <div id="panelLog" class="result-panel"><pre class="code-block" id="logPre"></pre></div>
+
+      <div id="panelFormal" class="result-panel"></div>
 
       <div id="panelWave" class="result-panel">
 
@@ -695,17 +666,9 @@
 
 
 
-    App._resultRows = rows;
-
     App._lastVerifyData = data;
 
     App._resultVerdict = verdict;
-
-    App._resultUnverified = isUnverified;
-
-    renderTableBody(rows);
-
-
 
     $("#reportPre").textContent = data.text_report || "";
 
@@ -751,24 +714,6 @@
 
 
 
-    document.querySelectorAll(".filter-chips .chip").forEach((chip) => {
-
-      chip.addEventListener("click", () => {
-
-        activeFilter = chip.dataset.filter;
-
-        document.querySelectorAll(".filter-chips .chip").forEach((c) => c.classList.remove("active"));
-
-        chip.classList.add("active");
-
-        renderTableBody(App._resultRows || []);
-
-      });
-
-    });
-
-
-
     document.querySelectorAll(".result-tabs button").forEach((btn) => {
 
       btn.addEventListener("click", () => {
@@ -787,6 +732,12 @@
 
         }
 
+        if (btn.dataset.panel === "panelFormal" && window.Formal) {
+
+          Formal.render();
+
+        }
+
       });
 
     });
@@ -797,9 +748,13 @@
 
 
 
-    if (!pass && status !== "sim_missing") {
+    if (!pass && (verdict === "error" || data.status === "sim_missing")) {
 
       document.querySelector('.result-tabs button[data-panel="panelLog"]')?.click();
+
+    } else if (pass && data.has_vcd) {
+
+      document.querySelector('.result-tabs button[data-panel="panelWave"]')?.click();
 
     }
 

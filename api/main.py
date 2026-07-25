@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile
@@ -13,15 +14,19 @@ from fastapi.staticfiles import StaticFiles
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from rtl_verify.backends.registry import backend_info_list  # noqa: E402
+from rtl_verify.backends.registry import backend_info_list, formal_backends  # noqa: E402
 from rtl_verify.generators.base import TbLanguage  # noqa: E402
 from rtl_verify.pipeline import run_verification  # noqa: E402
 from rtl_verify.waveform import load_module_info, vcd_to_json  # noqa: E402
 from rtl_verify.analyzer import analyze_rtl  # noqa: E402
 from rtl_verify.preview import build_test_preview  # noqa: E402
 from rtl_verify.vplan_builder import build_vplan  # noqa: E402
-from rtl_verify.sim_results import parse_test_results  # noqa: E402
 from rtl_verify.coverage import CoverageReport  # noqa: E402
+from rtl_verify.rtl_features import dut_source_extension  # noqa: E402
+from rtl_verify.formal_props import (  # noqa: E402
+    generate_formal_wrapper,
+    recommended_formal_config,
+)
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 STATIC = ROOT / "static"
@@ -156,17 +161,7 @@ async def verify(
     v_mode = getattr(result, "verification_mode", "monitor_only")
     v_expl = getattr(result, "verification_mode_explanation", "")
     overall_pass = verdict == "pass" or bool(result.uvm_note)
-    test_results = parse_test_results(
-        result.sim_log,
-        mod=result.module,
-        rtl_source=rtl_source,
-        overall_pass=overall_pass,
-    )
-    if verdict == "unverified":
-        for row in test_results:
-            if row.get("result") in ("PASS", "RUN"):
-                row["result"] = "OBSERVED"
-            row["expected"] = {}
+    errors = getattr(result, "errors", []) or []
 
     return {
         "success": result.success,
@@ -180,6 +175,11 @@ async def verify(
         "module": result.module.name,
         "inferred_op": result.module.inferred_op,
         "language": result.language.value,
+        "detected_language": getattr(result, "detected_language", result.language.value),
+        "synth_synthesizable": getattr(result, "synth_synthesizable", None),
+        "synth_skipped": getattr(result, "synth_skipped", False),
+        "synth_tool": getattr(result, "synth_tool", ""),
+        "synth_log": getattr(result, "synth_log", ""),
         "testbench": result.testbench,
         "sim_log": result.sim_log,
         "text_report": result.text_report,
@@ -189,8 +189,120 @@ async def verify(
         "has_vcd": result.vcd_path is not None,
         "waveform_json": waveform_json_data,
         "preview": preview,
-        "test_results": test_results,
+        "errors": errors,
+        "test_results": [],
         "coverage": result.coverage.to_dict() if result.coverage else None,
+    }
+
+
+@app.post("/api/formal")
+async def formal_check(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    top_module: str = Form(""),
+    properties: str = Form("[]"),
+):
+    """Check one or more hand-written boolean properties with SymbiYosys.
+
+    `properties` is a JSON list of {"name", "description", "expr"} objects,
+    each using the DUT's own port names, e.g.
+    [{"name": "prop0", "description": "light is never invalid",
+      "expr": "light <= 1"}].
+
+    Independent of /api/verify — this never touches pipeline.py or the
+    simulator backends, only the formal backend from Phase 1.
+    """
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+
+    formal_engines = formal_backends()
+    if not formal_engines:
+        return {
+            "error": (
+                "No formal backend available. Install the OSS CAD Suite "
+                "(SymbiYosys + Yosys): https://github.com/YosysHQ/oss-cad-suite-build"
+            )
+        }
+    engine = formal_engines[0]
+
+    try:
+        props = json.loads(properties) if properties.strip() else []
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON in properties: {e}"}
+    if not isinstance(props, list) or not props:
+        return {"error": "properties must be a non-empty JSON list"}
+
+    try:
+        mod = analyze_rtl(rtl_source, top_module=top_module.strip() or None)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    config = recommended_formal_config(mod)
+    base = Path(tempfile.mkdtemp(prefix="formal_api_"))
+    ext = dut_source_extension(rtl_source, "systemverilog")
+    rtl_path = base / f"dut{ext}"
+    rtl_path.write_text(rtl_source, encoding="utf-8")
+
+    results = []
+    for i, p in enumerate(props):
+        name = str(p.get("name") or f"prop{i}")
+        expr = str(p.get("expr") or "").strip()
+        description = str(p.get("description") or "")
+        if not expr:
+            results.append({
+                "name": name, "description": description, "expr": expr,
+                "success": False, "error": "empty expression",
+            })
+            continue
+        try:
+            wrapper_sv = generate_formal_wrapper(mod, [(name, expr)])
+        except ValueError as e:
+            results.append({
+                "name": name, "description": description, "expr": expr,
+                "success": False, "error": str(e),
+            })
+            continue
+
+        work = base / f"prop_{i}"
+        wrapper_path = work / "wrapper.sv"
+        work.mkdir(parents=True, exist_ok=True)
+        wrapper_path.write_text(wrapper_sv, encoding="utf-8")
+
+        result = engine.run(
+            rtl_path, wrapper_path, work,
+            top=f"{mod.name}_formal_top",
+            depth=config["depth"], mode=config["mode"], engine=config["engine"],
+        )
+
+        waveform_json_data = None
+        if result.vcd_path is not None:
+            waveform_json_data = vcd_to_json(result.vcd_path, module=mod)
+            if "error" in waveform_json_data:
+                waveform_json_data = None
+
+        results.append({
+            "name": name,
+            "description": description,
+            "expr": expr,
+            "success": result.success,
+            "verdict": "PROVEN" if result.success else "FALSIFIED",
+            "config": config,
+            "log": result.log[-4000:],
+            "has_trace": result.vcd_path is not None,
+            "waveform_json": waveform_json_data,
+        })
+
+    return {
+        "module": mod.name,
+        "engine": engine.display_name,
+        "engine_version": engine.version(),
+        "success": all(r.get("success") for r in results),
+        "properties": results,
+        "work_dir": base.as_posix(),
     }
 
 
