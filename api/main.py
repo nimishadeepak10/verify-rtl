@@ -30,6 +30,7 @@ from rtl_verify.formal_props import (  # noqa: E402
 from rtl_verify.property_suggester import suggest_properties  # noqa: E402
 from rtl_verify.property_to_sva import convert_to_sva  # noqa: E402
 from rtl_verify.llm_client import LLMNotConfigured  # noqa: E402
+from rtl_verify import formal_log  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 STATIC = ROOT / "static"
@@ -350,6 +351,19 @@ async def formal_check(
                 "vacuously true (its trigger condition never occurs)."
             )
 
+    verdict_counts: dict[str, int] = {}
+    for r in results:
+        verdict_counts[r.get("verdict", "ERROR")] = verdict_counts.get(r.get("verdict", "ERROR"), 0) + 1
+    formal_log.log_event("run", {
+        "module": mod.name,
+        "engine": engine.display_name,
+        "num_properties": len(results),
+        "num_assumed": len(assumed_constraints),
+        "verdict_counts": verdict_counts,
+        "vacuity_warnings": sum(1 for r in results if r.get("vacuity_warning")),
+        "success": all(r.get("success") for r in results),
+    })
+
     return {
         "module": mod.name,
         "engine": engine.display_name,
@@ -395,9 +409,22 @@ async def formal_suggest(
     try:
         proposals = suggest_properties(mod, rtl_source, spec_text=spec)
     except LLMNotConfigured as e:
+        formal_log.log_event("suggest", {"module": mod.name, "error": str(e)})
         return {"error": str(e)}
     except Exception as e:  # noqa: BLE001 — surface any LLM/API failure to the UI, don't 500
+        formal_log.log_event("suggest", {"module": mod.name, "error": str(e)})
         return {"error": f"Property suggestion failed: {e}"}
+
+    kind_counts: dict[str, int] = {}
+    for p in proposals:
+        kind_counts[p.get("kind", "?")] = kind_counts.get(p.get("kind", "?"), 0) + 1
+    formal_log.log_event("suggest", {
+        "module": mod.name,
+        "rtl_lines": len(rtl_source.splitlines()),
+        "spec_provided": bool(spec.strip()),
+        "num_proposed": len(proposals),
+        "kind_counts": kind_counts,
+    })
 
     return {"module": mod.name, "properties": proposals}
 
@@ -449,7 +476,23 @@ async def formal_convert(
             conv = {"expressible": False, "expr": "", "note": f"Conversion failed: {e}"}
         out.append({**p, **conv})
 
+    formal_log.log_event("convert", {
+        "module": mod.name,
+        "num_properties": len(out),
+        "num_expressible": sum(1 for c in out if c.get("expressible")),
+    })
+
     return {"module": mod.name, "properties": out}
+
+
+@app.get("/api/formal/history")
+async def formal_history(limit: int = 30):
+    """Recent formal-tab attempts (suggest/convert/run), most recent first.
+
+    Persisted to logs/formal_runs.jsonl (see formal_log.py) so this survives
+    across sessions, not just the current browser tab.
+    """
+    return {"events": formal_log.read_recent(limit=limit)}
 
 
 @app.get("/api/waveform/json")

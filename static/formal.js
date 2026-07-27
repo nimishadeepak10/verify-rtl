@@ -109,6 +109,18 @@
         </div>
       </div>
       <div id="formalResults"></div>
+
+      <div class="panel" style="margin-top:var(--s-4)">
+        <div class="panel__header">
+          <h2 class="panel__title">RUN HISTORY</h2>
+        </div>
+        <div class="panel__body">
+          <p class="text-dim">Every suggest/convert/run attempt, logged locally so it survives across
+            sessions — not just this browser tab.</p>
+          <button type="button" class="btn btn-ghost" id="formalHistoryRefresh">Refresh</button>
+          <div id="formalHistory" style="margin-top:var(--s-3)"></div>
+        </div>
+      </div>
     `;
 
     bindDutInputs();
@@ -121,6 +133,56 @@
       renderPropRows();
     });
     $("#formalRunBtn").addEventListener("click", runFormalCheck);
+    $("#formalHistoryRefresh").addEventListener("click", loadHistory);
+    loadHistory();
+  }
+
+  function historySummary(ev) {
+    if (ev.kind === "suggest") {
+      if (ev.error) return `suggest failed — ${ev.error}`;
+      const kc = ev.kind_counts || {};
+      const parts = Object.entries(kc).map(([k, n]) => `${n} ${k}`).join(", ");
+      return `${ev.module}: proposed ${ev.num_proposed} (${parts})${ev.spec_provided ? " · with spec" : ""}`;
+    }
+    if (ev.kind === "convert") {
+      return `${ev.module}: converted ${ev.num_properties}, ${ev.num_expressible} expressible`;
+    }
+    if (ev.kind === "run") {
+      const vc = ev.verdict_counts || {};
+      const parts = Object.entries(vc).map(([k, n]) => `${n} ${k}`).join(", ");
+      const vac = ev.vacuity_warnings ? ` · ${ev.vacuity_warnings} possibly vacuous` : "";
+      return `${ev.module}: ${parts}${vac}`;
+    }
+    return JSON.stringify(ev);
+  }
+
+  async function loadHistory() {
+    const host = $("#formalHistory");
+    if (!host) return;
+    host.innerHTML = '<span class="text-dim mono">Loading…</span>';
+    let data;
+    try {
+      const res = await fetch("/api/formal/history?limit=30");
+      data = await res.json();
+    } catch (err) {
+      host.innerHTML = `<span class="text-dim mono">Could not load history: ${App.escapeHtml(String(err.message || err))}</span>`;
+      return;
+    }
+    const events = data.events || [];
+    if (!events.length) {
+      host.innerHTML = '<span class="text-dim mono">No attempts logged yet.</span>';
+      return;
+    }
+    host.innerHTML = events
+      .map((ev) => {
+        const when = new Date(ev.ts * 1000).toLocaleString();
+        return `<div style="display:flex; gap:var(--s-3); padding:6px 0; border-top:1px solid var(--border-soft, #21262d); font-size:12.5px;">
+          <span class="text-dim mono" style="flex:none; width:150px">${App.escapeHtml(when)}</span>
+          <span class="mono" style="flex:none; width:60px; text-transform:uppercase">${App.escapeHtml(ev.kind)}</span>
+          <span>${App.escapeHtml(historySummary(ev))}</span>
+        </div>`;
+      })
+      .join("");
   }
 
   function bindDutInputs() {
@@ -203,12 +265,14 @@
         <span class="callout__prefix">SUGGESTION FAILED</span>
         <p class="callout-unverified__body">${App.escapeHtml(data.error)}</p>
       </div>`;
+      loadHistory();
       return;
     }
 
     suggestions = (data.properties || []).map((p) => ({ ...p, id: ++rowSeq, included: true }));
     status.textContent = `${suggestions.length} proposed — review, edit, or remove, then add.`;
     renderSuggestions();
+    loadHistory();
   }
 
   function renderSuggestions() {
@@ -324,6 +388,7 @@
     if (data.error) {
       status.textContent = data.error;
       addBtn.disabled = false;
+      loadHistory();
       return;
     }
 
@@ -363,6 +428,7 @@
     renderNotExpressibleNotes(notExpressible);
     renderPropRows();
     addBtn.disabled = false;
+    loadHistory();
   }
 
   function clearNotExpressibleNotes() {
@@ -475,11 +541,13 @@
         <span class="callout__prefix">FORMAL UNAVAILABLE</span>
         <p class="callout-unverified__body">${App.escapeHtml(data.error)}</p>
       </div>`;
+      loadHistory();
       return;
     }
 
     status.textContent = `${data.engine} v${data.engine_version}`;
     renderResults(data);
+    loadHistory();
   }
 
   function renderResults(data) {

@@ -11,6 +11,9 @@ build/
 *.vvp
 *.vcd
 
+# Formal-tab attempt log (local, not shared — see formal_log.py)
+logs/
+
 # IDE / OS
 .idea/
 .vscode/
