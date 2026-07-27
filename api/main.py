@@ -27,6 +27,9 @@ from rtl_verify.formal_props import (  # noqa: E402
     generate_formal_wrapper,
     recommended_formal_config,
 )
+from rtl_verify.property_suggester import suggest_properties  # noqa: E402
+from rtl_verify.property_to_sva import convert_to_sva  # noqa: E402
+from rtl_verify.llm_client import LLMNotConfigured  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 STATIC = ROOT / "static"
@@ -204,10 +207,20 @@ async def formal_check(
 ):
     """Check one or more hand-written boolean properties with SymbiYosys.
 
-    `properties` is a JSON list of {"name", "description", "expr"} objects,
-    each using the DUT's own port names, e.g.
+    `properties` is a JSON list of {"name", "description", "expr", "kind"}
+    objects, each using the DUT's own port names, e.g.
     [{"name": "prop0", "description": "light is never invalid",
-      "expr": "light <= 1"}].
+      "expr": "light <= 1", "kind": "assert"}].
+    `kind` is "assert" (default), "assume", or "cover".
+
+    assume-kind properties never get their own PASS/FAIL run (an assume
+    alone isn't a checkable claim) — they're bundled as extra `assume()`
+    constraints into every assert/cover property's own wrapper instead,
+    and echoed back separately as "assumed_constraints" for transparency.
+    cover-kind properties run under mode="cover" (see formal_props.py —
+    confirmed by testing that mode="prove" silently swallows a cover
+    instead of checking reachability), so their verdict label is
+    REACHED/UNREACHED, not PROVEN/FALSIFIED.
 
     Independent of /api/verify — this never touches pipeline.py or the
     simulator backends, only the formal backend from Phase 1.
@@ -241,32 +254,39 @@ async def formal_check(
     except ValueError as e:
         return {"error": str(e)}
 
-    config = recommended_formal_config(mod)
     base = Path(tempfile.mkdtemp(prefix="formal_api_"))
     ext = dut_source_extension(rtl_source, "systemverilog")
     rtl_path = base / f"dut{ext}"
     rtl_path.write_text(rtl_source, encoding="utf-8")
 
-    results = []
+    assume_props = []
+    assumed_constraints = []
+    target_props = []
     for i, p in enumerate(props):
         name = str(p.get("name") or f"prop{i}")
         expr = str(p.get("expr") or "").strip()
-        description = str(p.get("description") or "")
+        kind = str(p.get("kind") or "assert")
+        entry = {"name": name, "description": str(p.get("description") or ""), "expr": expr, "kind": kind}
+        if kind == "assume":
+            if expr:
+                assume_props.append((name, expr, "assume"))
+            assumed_constraints.append(entry)
+        else:
+            target_props.append((i, entry))
+
+    results = []
+    for i, entry in target_props:
+        name, expr, kind = entry["name"], entry["expr"], entry["kind"]
         if not expr:
-            results.append({
-                "name": name, "description": description, "expr": expr,
-                "success": False, "error": "empty expression",
-            })
+            results.append({**entry, "success": False, "error": "empty expression"})
             continue
         try:
-            wrapper_sv = generate_formal_wrapper(mod, [(name, expr)])
+            wrapper_sv = generate_formal_wrapper(mod, assume_props + [(name, expr, kind)])
         except ValueError as e:
-            results.append({
-                "name": name, "description": description, "expr": expr,
-                "success": False, "error": str(e),
-            })
+            results.append({**entry, "success": False, "error": str(e)})
             continue
 
+        config = recommended_formal_config(mod, kind=kind)
         work = base / f"prop_{i}"
         wrapper_path = work / "wrapper.sv"
         work.mkdir(parents=True, exist_ok=True)
@@ -284,12 +304,15 @@ async def formal_check(
             if "error" in waveform_json_data:
                 waveform_json_data = None
 
+        if kind == "cover":
+            verdict = "REACHED" if result.success else "UNREACHED"
+        else:
+            verdict = "PROVEN" if result.success else "FALSIFIED"
+
         results.append({
-            "name": name,
-            "description": description,
-            "expr": expr,
+            **entry,
             "success": result.success,
-            "verdict": "PROVEN" if result.success else "FALSIFIED",
+            "verdict": verdict,
             "config": config,
             "log": result.log[-4000:],
             "has_trace": result.vcd_path is not None,
@@ -302,8 +325,100 @@ async def formal_check(
         "engine_version": engine.version(),
         "success": all(r.get("success") for r in results),
         "properties": results,
+        "assumed_constraints": assumed_constraints,
         "work_dir": base.as_posix(),
     }
+
+
+@app.post("/api/formal/suggest")
+async def formal_suggest(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    spec_file: UploadFile | None = File(None),
+    spec_text: str = Form(""),
+    top_module: str = Form(""),
+):
+    """LLM-assisted property suggestion — the actual Phase 2 gap: reads
+    RTL (+ optional spec) and proposes properties in plain English, each
+    classified as assert/assume/cover, grounded in
+    docs/formal_property_reference.md. Nothing here compiles to SVA or
+    runs through the solver — that's /api/formal/convert and /api/formal.
+    """
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+
+    if spec_file and spec_file.filename:
+        spec = (await spec_file.read()).decode("utf-8", errors="replace")
+    else:
+        spec = spec_text
+
+    try:
+        mod = analyze_rtl(rtl_source, top_module=top_module.strip() or None)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    try:
+        proposals = suggest_properties(mod, rtl_source, spec_text=spec)
+    except LLMNotConfigured as e:
+        return {"error": str(e)}
+    except Exception as e:  # noqa: BLE001 — surface any LLM/API failure to the UI, don't 500
+        return {"error": f"Property suggestion failed: {e}"}
+
+    return {"module": mod.name, "properties": proposals}
+
+
+@app.post("/api/formal/convert")
+async def formal_convert(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    top_module: str = Form(""),
+    properties: str = Form("[]"),
+):
+    """Convert approved plain-English properties to SVA — the deliberately
+    simpler half of Phase 2. Still returns expressible=false rather than a
+    guessed expression when a property genuinely needs syntax this tool
+    doesn't support yet (see property_to_sva.py).
+
+    `properties` is a JSON list of {"name", "kind", "description", "rationale"}.
+    Returns the same list with "expressible", "expr", "note" added to each.
+    """
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+
+    try:
+        props = json.loads(properties) if properties.strip() else []
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON in properties: {e}"}
+    if not isinstance(props, list) or not props:
+        return {"error": "properties must be a non-empty JSON list"}
+
+    try:
+        mod = analyze_rtl(rtl_source, top_module=top_module.strip() or None)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    out = []
+    for p in props:
+        kind = str(p.get("kind") or "assert")
+        description = str(p.get("description") or "")
+        rationale = str(p.get("rationale") or "")
+        try:
+            conv = convert_to_sva(mod, kind, description, rationale)
+        except LLMNotConfigured as e:
+            return {"error": str(e)}
+        except Exception as e:  # noqa: BLE001
+            conv = {"expressible": False, "expr": "", "note": f"Conversion failed: {e}"}
+        out.append({**p, **conv})
+
+    return {"module": mod.name, "properties": out}
 
 
 @app.get("/api/waveform/json")

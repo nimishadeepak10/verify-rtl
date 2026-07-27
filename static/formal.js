@@ -1,12 +1,25 @@
 /**
- * VerifyRTL — Formal tab: hand-written properties checked with SymbiYosys.
- * Self-contained: reads App.rtlContent / #topModule, posts to /api/formal,
- * renders PROVEN/FALSIFIED per property with the counterexample waveform
- * (reusing WaveformViewer, the same renderer the Waveform tab uses).
+ * VerifyRTL — Formal tab: RTL + spec -> LLM-suggested assert/assume/cover
+ * properties (classified, grounded in docs/formal_property_reference.md) ->
+ * user review -> SVA conversion -> SymbiYosys proof.
+ *
+ * Self-contained: its own RTL/spec inputs (paste or file), independent of
+ * the Design screen — this tab never requires running a simulation first.
+ * Every stage is a separate, explicit user action; nothing auto-advances.
  */
 (function () {
   "use strict";
 
+  let dutRtl = "";
+  let dutFileName = "";
+  let dutTopModule = "";
+  let rtlMode = "paste"; // "file" | "paste"
+
+  let specText = "";
+  let specFileName = "";
+  let specMode = "paste";
+
+  let suggestions = []; // {id, name, kind, pattern, description, signals, rationale, included}
   let propRows = [];
   let rowSeq = 0;
 
@@ -15,23 +28,80 @@
   }
 
   function defaultProps() {
-    return [{ id: ++rowSeq, description: "", expr: "" }];
+    return [{ id: ++rowSeq, description: "", expr: "", kind: "assert" }];
   }
 
   function render() {
     const panel = $("#panelFormal");
     if (!panel) return;
     if (!propRows.length) propRows = defaultProps();
+    if (!dutRtl && App.rtlContent) dutRtl = App.rtlContent; // convenience default, still independent/editable
+    if (!dutTopModule) {
+      const topEl = document.getElementById("topModule");
+      if (topEl && topEl.value.trim()) dutTopModule = topEl.value.trim();
+    }
 
     panel.innerHTML = `
       <div class="panel">
+        <div class="panel__header"><h2 class="panel__title">DESIGN UNDER TEST</h2></div>
+        <div class="panel__body">
+          <p class="text-dim">Independent of the Design step — paste or upload RTL here to go
+            straight to formal, no simulation required.</p>
+          <div class="segmented" role="tablist" aria-label="RTL input mode" id="formalRtlTabs">
+            <button type="button" class="segmented__btn ${rtlMode === "file" ? "active" : ""}" data-mode="file">FILE</button>
+            <button type="button" class="segmented__btn ${rtlMode === "paste" ? "active" : ""}" data-mode="paste">PASTE</button>
+          </div>
+          <div id="formalRtlFileZone" style="${rtlMode === "file" ? "" : "display:none"}; margin-top:var(--s-3)">
+            <input type="file" id="formalRtlFile" accept=".v,.sv">
+            <span class="text-dim mono" id="formalRtlFileName" style="margin-left:var(--s-2)">${App.escapeHtml(dutFileName)}</span>
+          </div>
+          <div id="formalRtlPasteZone" style="${rtlMode === "paste" ? "" : "display:none"}; margin-top:var(--s-3)">
+            <textarea id="formalRtlPaste" class="input-mono" rows="8" style="width:100%"
+              placeholder="module my_dut ( ... );&#10;endmodule">${App.escapeHtml(dutRtl)}</textarea>
+          </div>
+          <label class="config-label" style="margin-top:var(--s-3); display:block">TOP MODULE</label>
+          <input type="text" id="formalTopModule" class="input-mono" placeholder="auto-detect"
+            value="${App.escapeHtml(dutTopModule)}" style="max-width:280px">
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:var(--s-4)">
+        <div class="panel__header"><h2 class="panel__title">SPECIFICATION (OPTIONAL)</h2></div>
+        <div class="panel__body">
+          <p class="text-dim">A written requirement helps the suggestion engine, but isn't required —
+            without one, properties are proposed from the RTL's structure and signal naming alone.</p>
+          <div class="segmented" role="tablist" aria-label="Spec input mode" id="formalSpecTabs">
+            <button type="button" class="segmented__btn ${specMode === "file" ? "active" : ""}" data-mode="file">FILE</button>
+            <button type="button" class="segmented__btn ${specMode === "paste" ? "active" : ""}" data-mode="paste">PASTE</button>
+          </div>
+          <div id="formalSpecFileZone" style="${specMode === "file" ? "" : "display:none"}; margin-top:var(--s-3)">
+            <input type="file" id="formalSpecFile" accept=".md,.txt">
+            <span class="text-dim mono" id="formalSpecFileName" style="margin-left:var(--s-2)">${App.escapeHtml(specFileName)}</span>
+          </div>
+          <div id="formalSpecPasteZone" style="${specMode === "paste" ? "" : "display:none"}; margin-top:var(--s-3)">
+            <textarea id="formalSpecPaste" class="input-mono" rows="5" style="width:100%"
+              placeholder="e.g. output must not assert done before ack...">${App.escapeHtml(specText)}</textarea>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:var(--s-4)">
+        <div class="panel__header"><h2 class="panel__title">SUGGEST PROPERTIES</h2></div>
+        <div class="panel__body">
+          <button type="button" class="btn btn-primary" id="formalSuggestBtn">Suggest Properties</button>
+          <span id="formalSuggestStatus" class="text-dim mono" style="margin-left:var(--s-3)"></span>
+          <div id="formalSuggestions" style="margin-top:var(--s-4)"></div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:var(--s-4)">
         <div class="panel__header"><h2 class="panel__title">FORMAL PROPERTY CHECK</h2></div>
         <div class="panel__body">
-          <p class="text-dim">Write one or more boolean rules about this design using its own port names
-            (e.g. <code>light &lt;= 1</code>). Each is checked with SymbiYosys — PROVEN means true for all
-            time on sequential designs (unbounded proof), not just the inputs tested by simulation.</p>
+          <p class="text-dim">Review the list below (from suggestions above, or written by hand), then run.
+            PROVEN/REACHED means true for all time on sequential designs (unbounded proof), not just the
+            inputs a simulation happened to try.</p>
           <div id="formalPropRows"></div>
-          <button type="button" class="btn btn-ghost" id="formalAddProp">+ Add property</button>
+          <button type="button" class="btn btn-ghost" id="formalAddProp">+ Add property by hand</button>
           <div style="margin-top:var(--s-4)">
             <button type="button" class="btn btn-primary" id="formalRunBtn">Run Formal Check</button>
             <span id="formalStatus" class="text-dim mono" style="margin-left:var(--s-3)"></span>
@@ -41,12 +111,257 @@
       <div id="formalResults"></div>
     `;
 
+    bindDutInputs();
+    bindSpecInputs();
     renderPropRows();
+
+    $("#formalSuggestBtn").addEventListener("click", suggestProperties);
     $("#formalAddProp").addEventListener("click", () => {
-      propRows.push({ id: ++rowSeq, description: "", expr: "" });
+      propRows.push({ id: ++rowSeq, description: "", expr: "", kind: "assert" });
       renderPropRows();
     });
     $("#formalRunBtn").addEventListener("click", runFormalCheck);
+  }
+
+  function bindDutInputs() {
+    $("#formalRtlTabs").querySelectorAll("[data-mode]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        rtlMode = btn.dataset.mode;
+        render();
+      });
+    });
+    const fileInput = $("#formalRtlFile");
+    if (fileInput) {
+      fileInput.addEventListener("change", async () => {
+        const f = fileInput.files[0];
+        if (!f) return;
+        dutRtl = await f.text();
+        dutFileName = f.name;
+        $("#formalRtlFileName").textContent = dutFileName;
+      });
+    }
+    const pasteEl = $("#formalRtlPaste");
+    if (pasteEl) pasteEl.addEventListener("input", () => { dutRtl = pasteEl.value; });
+
+    const topEl = $("#formalTopModule");
+    if (topEl) topEl.addEventListener("input", () => { dutTopModule = topEl.value; });
+  }
+
+  function bindSpecInputs() {
+    $("#formalSpecTabs").querySelectorAll("[data-mode]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        specMode = btn.dataset.mode;
+        render();
+      });
+    });
+    const fileInput = $("#formalSpecFile");
+    if (fileInput) {
+      fileInput.addEventListener("change", async () => {
+        const f = fileInput.files[0];
+        if (!f) return;
+        specText = await f.text();
+        specFileName = f.name;
+        $("#formalSpecFileName").textContent = specFileName;
+      });
+    }
+    const pasteEl = $("#formalSpecPaste");
+    if (pasteEl) pasteEl.addEventListener("input", () => { specText = pasteEl.value; });
+  }
+
+  const KIND_META = {
+    assert: { badge: "led-blue", label: "ASSERT" },
+    assume: { badge: "led-amber", label: "ASSUME" },
+    cover: { badge: "led-green", label: "COVER" },
+  };
+
+  async function suggestProperties() {
+    const status = $("#formalSuggestStatus");
+    const host = $("#formalSuggestions");
+    if (!dutRtl.trim()) {
+      status.textContent = "Add RTL above first.";
+      return;
+    }
+    status.textContent = "Reading RTL" + (specText.trim() ? " + spec" : "") + ", proposing properties…";
+    host.innerHTML = "";
+
+    const fd = new FormData();
+    fd.append("rtl_text", dutRtl);
+    fd.append("spec_text", specText);
+    fd.append("top_module", dutTopModule.trim());
+
+    let data;
+    try {
+      const res = await fetch("/api/formal/suggest", { method: "POST", body: fd });
+      data = await res.json();
+    } catch (err) {
+      status.textContent = "Request failed: " + (err.message || err);
+      return;
+    }
+    if (data.error) {
+      status.textContent = "";
+      host.innerHTML = `<div class="callout callout-error">
+        <span class="callout__prefix">SUGGESTION FAILED</span>
+        <p class="callout-unverified__body">${App.escapeHtml(data.error)}</p>
+      </div>`;
+      return;
+    }
+
+    suggestions = (data.properties || []).map((p) => ({ ...p, id: ++rowSeq, included: true }));
+    status.textContent = `${suggestions.length} proposed — review, edit, or remove, then add.`;
+    renderSuggestions();
+  }
+
+  function renderSuggestions() {
+    const host = $("#formalSuggestions");
+    if (!host) return;
+    if (!suggestions.length) {
+      host.innerHTML = "";
+      return;
+    }
+    host.innerHTML = `
+      ${suggestions
+        .map((s) => {
+          const meta = KIND_META[s.kind] || KIND_META.assert;
+          return `
+        <div class="panel" data-sid="${s.id}" style="margin-bottom:var(--s-3)">
+          <div class="panel__body">
+            <div style="display:flex; gap:var(--s-3); align-items:flex-start;">
+              <input type="checkbox" data-sfield="included" ${s.included ? "checked" : ""} style="margin-top:6px">
+              <div style="flex:1">
+                <div style="display:flex; gap:var(--s-2); align-items:center; margin-bottom:var(--s-2)">
+                  <span class="result-badge"><span class="led ${meta.badge}"></span><span class="mono">${meta.label}</span></span>
+                  <select data-sfield="kind" class="input-mono" style="width:auto">
+                    <option value="assert" ${s.kind === "assert" ? "selected" : ""}>assert</option>
+                    <option value="assume" ${s.kind === "assume" ? "selected" : ""}>assume</option>
+                    <option value="cover" ${s.kind === "cover" ? "selected" : ""}>cover</option>
+                  </select>
+                  <span class="text-dim mono" style="font-size:11px">${App.escapeHtml(s.pattern || "")}</span>
+                </div>
+                <textarea data-sfield="description" class="input-mono" style="width:100%" rows="2">${App.escapeHtml(s.description)}</textarea>
+                <p class="text-dim" style="font-size:12px; margin-top:var(--s-2)">
+                  signals: <span class="mono">${App.escapeHtml((s.signals || []).join(", "))}</span><br>
+                  ${App.escapeHtml(s.rationale || "")}
+                </p>
+              </div>
+              <button type="button" class="btn-ghost" data-sremove="${s.id}" title="Remove">&times;</button>
+            </div>
+          </div>
+        </div>`;
+        })
+        .join("")}
+      <button type="button" class="btn btn-primary" id="formalAddSelected">Add selected to properties below</button>
+    `;
+
+    host.querySelectorAll("[data-sid]").forEach((el) => {
+      const id = Number(el.dataset.sid);
+      const s = suggestions.find((x) => x.id === id);
+      if (!s) return;
+      el.querySelectorAll("[data-sfield]").forEach((field) => {
+        const evt = field.type === "checkbox" ? "change" : "input";
+        field.addEventListener(evt, () => {
+          const key = field.dataset.sfield;
+          s[key] = field.type === "checkbox" ? field.checked : field.value;
+        });
+      });
+    });
+    host.querySelectorAll("[data-sremove]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        suggestions = suggestions.filter((s) => s.id !== Number(btn.dataset.sremove));
+        renderSuggestions();
+      });
+    });
+    $("#formalAddSelected").addEventListener("click", addSelectedSuggestions);
+  }
+
+  async function addSelectedSuggestions() {
+    const status = $("#formalSuggestStatus");
+    const addBtn = $("#formalAddSelected");
+    const chosen = suggestions.filter((s) => s.included);
+    if (!chosen.length) {
+      status.textContent = "Nothing checked.";
+      return;
+    }
+    // Prevent double-submit (e.g. an impatient second click) from converting
+    // and adding the same selection twice — every field it touches gets
+    // rebuilt from scratch below instead of appended to, for the same reason.
+    if (addBtn.disabled) return;
+    addBtn.disabled = true;
+    status.textContent = "Converting selected properties to SVA…";
+    clearNotExpressibleNotes();
+
+    const fd = new FormData();
+    fd.append("rtl_text", dutRtl);
+    fd.append("top_module", dutTopModule.trim());
+    fd.append(
+      "properties",
+      JSON.stringify(chosen.map((s) => ({ name: s.name, kind: s.kind, description: s.description, rationale: s.rationale })))
+    );
+
+    let data;
+    try {
+      const res = await fetch("/api/formal/convert", { method: "POST", body: fd });
+      data = await res.json();
+    } catch (err) {
+      status.textContent = "Request failed: " + (err.message || err);
+      addBtn.disabled = false;
+      return;
+    }
+    if (data.error) {
+      status.textContent = data.error;
+      addBtn.disabled = false;
+      return;
+    }
+
+    let added = 0;
+    const notExpressible = [];
+    data.properties.forEach((c) => {
+      if (c.expressible) {
+        propRows.push({ id: ++rowSeq, description: c.description, expr: c.expr, kind: c.kind });
+        added += 1;
+      } else {
+        notExpressible.push(c);
+      }
+    });
+    // drop the default empty row once real rows exist
+    propRows = propRows.filter((r) => r.description.trim() || r.expr.trim());
+    if (!propRows.length) propRows = defaultProps();
+
+    // Every property in this batch is now accounted for — either it's a row
+    // below, or its explanation is in the "not yet supported" callout.
+    // Remove them from the suggestion list so a second click on "add
+    // selected" can't process the same ones again.
+    const chosenIds = new Set(chosen.map((s) => s.id));
+    suggestions = suggestions.filter((s) => !chosenIds.has(s.id));
+
+    status.textContent = `Added ${added}${notExpressible.length ? `, ${notExpressible.length} not expressible yet (see note below)` : ""}.`;
+    // renderSuggestions() rebuilds #formalSuggestions from scratch (and
+    // clears it entirely once the list is empty) — it must run BEFORE the
+    // notes are appended, or the notes get wiped out immediately.
+    renderSuggestions();
+    renderNotExpressibleNotes(notExpressible);
+    renderPropRows();
+    addBtn.disabled = false;
+  }
+
+  function clearNotExpressibleNotes() {
+    const el = document.getElementById("formalNotExpressible");
+    if (el) el.remove();
+  }
+
+  function renderNotExpressibleNotes(notExpressible) {
+    clearNotExpressibleNotes();
+    if (!notExpressible.length) return;
+    const host = $("#formalSuggestions");
+    const notes = notExpressible
+      .map((c) => `<li><strong>${App.escapeHtml(c.description)}</strong> — ${App.escapeHtml(c.note)}</li>`)
+      .join("");
+    host.insertAdjacentHTML(
+      "beforeend",
+      `<div class="callout callout-warn" id="formalNotExpressible" style="margin-top:var(--s-3)">
+        <span class="callout__prefix">NOT YET SUPPORTED</span>
+        <ul style="margin-top:var(--s-2)">${notes}</ul>
+      </div>`
+    );
   }
 
   function renderPropRows() {
@@ -56,6 +371,11 @@
       .map(
         (r) => `
       <div class="formal-prop-row" data-id="${r.id}" style="display:flex; gap:var(--s-2); margin-bottom:var(--s-2); align-items:center;">
+        <select data-field="kind" class="input-mono" style="width:auto">
+          <option value="assert" ${r.kind === "assert" ? "selected" : ""}>assert</option>
+          <option value="assume" ${r.kind === "assume" ? "selected" : ""}>assume</option>
+          <option value="cover" ${r.kind === "cover" ? "selected" : ""}>cover</option>
+        </select>
         <input type="text" class="input-mono" data-field="description"
           placeholder="plain English, e.g. light is never invalid"
           value="${App.escapeHtml(r.description)}" style="flex:1.4">
@@ -71,7 +391,7 @@
       const id = Number(rowEl.dataset.id);
       const row = propRows.find((r) => r.id === id);
       if (!row) return;
-      rowEl.querySelectorAll("input").forEach((inp) => {
+      rowEl.querySelectorAll("[data-field]").forEach((inp) => {
         inp.addEventListener("input", () => {
           row[inp.dataset.field] = inp.value;
         });
@@ -91,9 +411,8 @@
   async function runFormalCheck() {
     const status = $("#formalStatus");
     const resultsEl = $("#formalResults");
-    const rtl = App.rtlContent || "";
-    if (!rtl.trim()) {
-      status.textContent = "Load RTL on the Design step first.";
+    if (!dutRtl.trim()) {
+      status.textContent = "Add RTL above first.";
       return;
     }
     const props = propRows
@@ -102,6 +421,7 @@
         name: `prop${i}`,
         description: r.description.trim(),
         expr: r.expr.trim(),
+        kind: r.kind || "assert",
       }));
     if (!props.length) {
       status.textContent = "Enter at least one property expression.";
@@ -110,11 +430,10 @@
 
     status.textContent = "Running SymbiYosys…";
     resultsEl.innerHTML = "";
-    const topModuleEl = document.getElementById("topModule");
 
     const fd = new FormData();
-    fd.append("rtl_text", rtl);
-    fd.append("top_module", topModuleEl ? topModuleEl.value.trim() : "");
+    fd.append("rtl_text", dutRtl);
+    fd.append("top_module", dutTopModule.trim());
     fd.append("properties", JSON.stringify(props));
 
     let data;
@@ -141,16 +460,28 @@
 
   function renderResults(data) {
     const resultsEl = $("#formalResults");
-    resultsEl.innerHTML = data.properties
-      .map((p, i) => {
-        const ok = p.success;
-        const badgeCls = p.error ? "error" : ok ? "pass" : "fail";
-        const ledCls = p.error ? "led-red" : ok ? "led-green" : "led-red";
-        const verdict = p.error ? "ERROR" : p.verdict;
-        return `
+    const assumedHtml = (data.assumed_constraints || []).length
+      ? `<div class="callout callout-info" style="margin-top:var(--s-4)">
+          <span class="callout__prefix">ASSUMED (not independently checked)</span>
+          <ul style="margin-top:var(--s-2)">
+            ${data.assumed_constraints.map((a) => `<li class="mono">${App.escapeHtml(a.expr)} — ${App.escapeHtml(a.description)}</li>`).join("")}
+          </ul>
+        </div>`
+      : "";
+
+    resultsEl.innerHTML =
+      assumedHtml +
+      data.properties
+        .map((p, i) => {
+          const ok = p.success;
+          const badgeCls = p.error ? "error" : ok ? "pass" : "fail";
+          const ledCls = p.error ? "led-red" : ok ? "led-green" : "led-red";
+          const verdict = p.error ? "ERROR" : p.verdict;
+          return `
         <div class="panel" style="margin-top:var(--s-4)">
           <div class="panel__header">
             <span class="result-badge ${badgeCls}"><span class="led ${ledCls}"></span><span class="mono">${verdict}</span></span>
+            <span class="text-dim mono" style="margin-left:var(--s-2); font-size:11px">${p.kind}</span>
             <span style="margin-left:var(--s-3)">${App.escapeHtml(p.description || "(no description)")}</span>
           </div>
           <div class="panel__body">
@@ -158,14 +489,14 @@
             ${p.error ? `<p class="callout-unverified__body">${App.escapeHtml(p.error)}</p>` : ""}
             ${
               p.has_trace
-                ? `<p class="text-dim">Falsified — counterexample trace below.</p>
+                ? `<p class="text-dim">${p.kind === "cover" ? "Reached — trace below." : "Falsified — counterexample trace below."}</p>
                    <div id="formalWave${i}" class="wave-visual-panel active" style="min-height:200px"></div>`
                 : ""
             }
           </div>
         </div>`;
-      })
-      .join("");
+        })
+        .join("");
 
     data.properties.forEach((p, i) => {
       if (p.has_trace && p.waveform_json && window.WaveformViewer) {
