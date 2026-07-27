@@ -6,10 +6,11 @@
 
   const STEPS = [
     { id: "design", num: "01", label: "Design" },
-    { id: "plan", num: "02", label: "Plan" },
-    { id: "run", num: "03", label: "Run" },
-    { id: "results", num: "04", label: "Results" },
-    { id: "coverage", num: "05", label: "Coverage" },
+    { id: "formal", num: "02", label: "Formal" },
+    { id: "plan", num: "03", label: "Plan" },
+    { id: "run", num: "04", label: "Run" },
+    { id: "results", num: "05", label: "Results" },
+    { id: "coverage", num: "06", label: "Coverage" },
   ];
 
   const $ = (sel, root) => (root || document).querySelector(sel);
@@ -26,6 +27,7 @@
     currentStep: "design",
     stepState: {
       design: "current",
+      formal: "dim",
       plan: "dim",
       run: "dim",
       results: "dim",
@@ -256,6 +258,9 @@
     }
     if (stepId === "results" && App.currentResult && window.Results && Results.render) {
       Results.render(App.currentResult);
+    }
+    if (stepId === "formal" && window.Formal && Formal.render) {
+      Formal.render();
     }
   }
 

@@ -630,7 +630,7 @@
 
         <button type="button" data-panel="panelWave">Waveform</button>
 
-        <button type="button" data-panel="panelFormal">Formal</button>
+        <button type="button" id="resultsFormalLink">Formal →</button>
 
       </div>
 
@@ -639,8 +639,6 @@
       <div id="panelTb" class="result-panel"><pre class="code-block" id="tbPre"></pre></div>
 
       <div id="panelLog" class="result-panel"><pre class="code-block" id="logPre"></pre></div>
-
-      <div id="panelFormal" class="result-panel"></div>
 
       <div id="panelWave" class="result-panel">
 
@@ -714,11 +712,11 @@
 
 
 
-    document.querySelectorAll(".result-tabs button").forEach((btn) => {
+    document.querySelectorAll(".result-tabs button[data-panel]").forEach((btn) => {
 
       btn.addEventListener("click", () => {
 
-        document.querySelectorAll(".result-tabs button").forEach((b) => b.classList.remove("active"));
+        document.querySelectorAll(".result-tabs button[data-panel]").forEach((b) => b.classList.remove("active"));
 
         document.querySelectorAll(".result-panel").forEach((p) => p.classList.remove("active"));
 
@@ -732,15 +730,17 @@
 
         }
 
-        if (btn.dataset.panel === "panelFormal" && window.Formal) {
-
-          Formal.render();
-
-        }
-
       });
 
     });
+
+    const formalLink = document.getElementById("resultsFormalLink");
+
+    if (formalLink) {
+
+      formalLink.addEventListener("click", () => App.gotoStep("formal"));
+
+    }
 
 
 
