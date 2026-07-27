@@ -151,7 +151,8 @@
       const vc = ev.verdict_counts || {};
       const parts = Object.entries(vc).map(([k, n]) => `${n} ${k}`).join(", ");
       const vac = ev.vacuity_warnings ? ` · ${ev.vacuity_warnings} possibly vacuous` : "";
-      return `${ev.module}: ${parts}${vac}`;
+      const ret = ev.retries ? ` · ${ev.retries} auto-retried` : "";
+      return `${ev.module}: ${parts}${vac}${ret}`;
     }
     return JSON.stringify(ev);
   }
@@ -566,8 +567,9 @@
       data.properties
         .map((p, i) => {
           const ok = p.success;
-          const badgeCls = p.error ? "error" : ok ? "pass" : "fail";
-          const ledCls = p.error ? "led-red" : ok ? "led-green" : "led-red";
+          const isError = p.error || p.verdict === "ERROR";
+          const badgeCls = isError ? "error" : ok ? "pass" : "fail";
+          const ledCls = isError ? "led-red" : ok ? "led-green" : "led-red";
           const verdict = p.error ? "ERROR" : p.verdict;
           return `
         <div class="panel" style="margin-top:var(--s-4)">
@@ -579,6 +581,22 @@
           <div class="panel__body">
             <pre class="code-block" style="max-height:80px">${App.escapeHtml(p.expr)}</pre>
             ${p.error ? `<p class="callout-unverified__body">${App.escapeHtml(p.error)}</p>` : ""}
+            ${
+              p.retry_note
+                ? `<div class="callout ${p.retried && verdict !== "ERROR" ? "callout-info" : "callout-warn"}" style="margin-top:var(--s-2)">
+                     <span class="callout__prefix">${p.retried ? "AUTO-RETRIED" : "RETRY DECLINED"}</span>
+                     <p class="callout-unverified__body">${App.escapeHtml(p.retry_note)}</p>
+                   </div>`
+                : ""
+            }
+            ${
+              verdict === "ERROR"
+                ? `<div class="callout callout-error" style="margin-top:var(--s-2)">
+                     <span class="callout__prefix">TOOL ERROR</span>
+                     <p class="callout-unverified__body">This did not compile against the real solver${p.retried ? ", even after an automatic fix attempt" : ""} — see the log for the raw error, not a proof result.</p>
+                   </div>`
+                : ""
+            }
             ${
               p.vacuity_warning
                 ? `<div class="callout callout-warn" style="margin-top:var(--s-2)">

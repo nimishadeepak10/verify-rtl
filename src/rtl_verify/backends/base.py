@@ -13,6 +13,13 @@ class BackendResult:
     vcd_path: Optional[Path]
     work_dir: Path
     duration_sec: float = 0.0
+    # Raw status word from a formal backend (e.g. SymbiYosys: PASS/FAIL/
+    # ERROR/TIMEOUT/UNKNOWN), when the backend distinguishes one. None for
+    # backends that don't (simulators, or when the status file is missing).
+    # Lets a caller tell "the property was falsified" (FAIL — a legitimate
+    # proof result) apart from "the tool itself failed" (ERROR/TIMEOUT —
+    # worth retrying), which `success` alone collapses into the same False.
+    status: Optional[str] = None
 
 
 class SimulatorBackend(ABC):

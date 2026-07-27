@@ -100,3 +100,36 @@ def convert_to_sva(module: RtlModule, kind: str, description: str, rationale: st
     result = llm_client.complete_structured(_SYSTEM, user, CONVERT_SCHEMA, max_tokens=500)
     result["expr"] = result.get("expr", "").strip()
     return result
+
+
+def build_retry_prompt(
+    module: RtlModule, kind: str, description: str, rationale: str,
+    previous_expr: str, error_log: str,
+) -> str:
+    base = build_user_prompt(module, kind, description, rationale)
+    return (
+        f"{base}\n"
+        f"A previous attempt to express this property failed to compile against the real "
+        f"formal solver:\n"
+        f"Previous expression: {previous_expr}\n"
+        f"Tool error (truncated to the last ~1500 chars):\n{error_log[-1500:]}\n\n"
+        f"Fix the expression given this concrete error, still respecting the supported/"
+        f"unsupported syntax rules above. Common causes: a signal name that doesn't exactly "
+        f"match the DUT's port list, a width mismatch, or invalid operator usage. If you now "
+        f"believe this property genuinely cannot be expressed safely (not just a fixable typo), "
+        f"set expressible=false instead of guessing again."
+    )
+
+
+def convert_to_sva_retry(
+    module: RtlModule, kind: str, description: str, rationale: str,
+    previous_expr: str, error_log: str,
+) -> dict:
+    """One automatic fix attempt after a genuine tool/compile error (not a
+    falsification — that's a legitimate result, never retried). Feeds the
+    concrete solver error back to the model rather than guessing blind.
+    """
+    user = build_retry_prompt(module, kind, description, rationale, previous_expr, error_log)
+    result = llm_client.complete_structured(_SYSTEM, user, CONVERT_SCHEMA, max_tokens=500)
+    result["expr"] = result.get("expr", "").strip()
+    return result

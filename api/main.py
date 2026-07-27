@@ -28,7 +28,7 @@ from rtl_verify.formal_props import (  # noqa: E402
     recommended_formal_config,
 )
 from rtl_verify.property_suggester import suggest_properties  # noqa: E402
-from rtl_verify.property_to_sva import convert_to_sva  # noqa: E402
+from rtl_verify.property_to_sva import convert_to_sva, convert_to_sva_retry  # noqa: E402
 from rtl_verify.llm_client import LLMNotConfigured  # noqa: E402
 from rtl_verify import formal_log  # noqa: E402
 
@@ -273,6 +273,7 @@ async def formal_check(
             "expr": expr,
             "kind": kind,
             "paired_cover": str(p.get("paired_cover") or ""),
+            "rationale": str(p.get("rationale") or ""),
         }
         if kind == "assume":
             if expr:
@@ -281,29 +282,71 @@ async def formal_check(
         else:
             target_props.append((i, entry))
 
+    # Tool-error statuses worth retrying — never "FAIL", which is a
+    # legitimate proof/cover-reachability result (falsification or
+    # unreached-cover), not a failure of the tool itself.
+    _RETRYABLE_STATUSES = {"ERROR", "TIMEOUT", None}
+    MAX_RETRIES = 1
+
+    def _run_once(work: Path, expr_to_run: str):
+        wrapper_sv = generate_formal_wrapper(mod, assume_props + [(name, expr_to_run, kind)])
+        config = recommended_formal_config(mod, kind=kind)
+        wrapper_path = work / "wrapper.sv"
+        work.mkdir(parents=True, exist_ok=True)
+        wrapper_path.write_text(wrapper_sv, encoding="utf-8")
+        result = engine.run(
+            rtl_path, wrapper_path, work,
+            top=f"{mod.name}_formal_top",
+            depth=config["depth"], mode=config["mode"], engine=config["engine"],
+        )
+        return result, config
+
     results = []
     for i, entry in target_props:
         name, expr, kind = entry["name"], entry["expr"], entry["kind"]
         if not expr:
             results.append({**entry, "success": False, "error": "empty expression"})
             continue
+
+        current_expr = expr
+        attempt = 0
+        retry_note = None
         try:
-            wrapper_sv = generate_formal_wrapper(mod, assume_props + [(name, expr, kind)])
+            result, config = _run_once(base / f"prop_{i}", current_expr)
         except ValueError as e:
             results.append({**entry, "success": False, "error": str(e)})
             continue
 
-        config = recommended_formal_config(mod, kind=kind)
-        work = base / f"prop_{i}"
-        wrapper_path = work / "wrapper.sv"
-        work.mkdir(parents=True, exist_ok=True)
-        wrapper_path.write_text(wrapper_sv, encoding="utf-8")
-
-        result = engine.run(
-            rtl_path, wrapper_path, work,
-            top=f"{mod.name}_formal_top",
-            depth=config["depth"], mode=config["mode"], engine=config["engine"],
-        )
+        # A tool-level ERROR/TIMEOUT (bad syntax, not a real proof result)
+        # is worth one automatic fix attempt — feed the concrete error back
+        # to the same conversion model and ask it to correct the
+        # expression, rather than surfacing a raw compiler error to the
+        # user for something the tool could plausibly self-correct.
+        while result.status in _RETRYABLE_STATUSES and attempt < MAX_RETRIES:
+            attempt += 1
+            try:
+                fix = convert_to_sva_retry(
+                    mod, kind, entry["description"], entry.get("rationale", ""),
+                    current_expr, result.log,
+                )
+            except LLMNotConfigured:
+                break
+            except Exception:  # noqa: BLE001 — a failed retry just stops retrying
+                break
+            if not fix.get("expressible") or not fix.get("expr", "").strip():
+                retry_note = fix.get("note") or "Automatic fix attempt declined to retry."
+                break
+            new_expr = fix["expr"].strip()
+            if new_expr == current_expr:
+                retry_note = "Automatic fix attempt returned the same expression — stopping."
+                break
+            current_expr = new_expr
+            try:
+                result, config = _run_once(base / f"prop_{i}_retry{attempt}", current_expr)
+            except ValueError as e:
+                retry_note = f"Retry {attempt} failed to build a wrapper: {e}"
+                break
+            retry_note = f"Auto-fixed after a tool error — retried expression: {current_expr}"
 
         waveform_json_data = None
         if result.vcd_path is not None:
@@ -315,15 +358,20 @@ async def formal_check(
             verdict = "REACHED" if result.success else "UNREACHED"
         else:
             verdict = "PROVEN" if result.success else "FALSIFIED"
+        if result.status in _RETRYABLE_STATUSES:
+            verdict = "ERROR"
 
         results.append({
             **entry,
+            "expr": current_expr,
             "success": result.success,
             "verdict": verdict,
             "config": config,
             "log": result.log[-4000:],
             "has_trace": result.vcd_path is not None,
             "waveform_json": waveform_json_data,
+            "retried": attempt > 0,
+            "retry_note": retry_note,
         })
 
     # Vacuity cross-check: an assert can be PROVEN only because its own
@@ -361,6 +409,7 @@ async def formal_check(
         "num_assumed": len(assumed_constraints),
         "verdict_counts": verdict_counts,
         "vacuity_warnings": sum(1 for r in results if r.get("vacuity_warning")),
+        "retries": sum(1 for r in results if r.get("retried")),
         "success": all(r.get("success") for r in results),
     })
 

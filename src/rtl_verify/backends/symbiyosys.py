@@ -154,6 +154,7 @@ class SymbiYosysBackend(SimulatorBackend):
                 vcd_path=None,
                 work_dir=work_abs,
                 duration_sec=time.perf_counter() - t0,
+                status="ERROR",
             )
         yosys = find_yosys(sby)
         if not yosys:
@@ -163,6 +164,7 @@ class SymbiYosysBackend(SimulatorBackend):
                 vcd_path=None,
                 work_dir=work_abs,
                 duration_sec=time.perf_counter() - t0,
+                status="ERROR",
             )
 
         rtl_abs = rtl_path.resolve()
@@ -221,6 +223,7 @@ class SymbiYosysBackend(SimulatorBackend):
                 vcd_path=None,
                 work_dir=work_abs,
                 duration_sec=time.perf_counter() - t0,
+                status="TIMEOUT",
             )
         except FileNotFoundError as e:
             log_lines.append(f"sby executable missing: {e}")
@@ -230,6 +233,7 @@ class SymbiYosysBackend(SimulatorBackend):
                 vcd_path=None,
                 work_dir=work_abs,
                 duration_sec=time.perf_counter() - t0,
+                status="ERROR",
             )
 
         status_file = job_path / _STATUS_FILENAME
@@ -250,4 +254,5 @@ class SymbiYosysBackend(SimulatorBackend):
             vcd_path=trace,
             work_dir=work_abs,
             duration_sec=time.perf_counter() - t0,
+            status=status_word,
         )
