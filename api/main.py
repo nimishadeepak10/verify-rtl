@@ -266,7 +266,13 @@ async def formal_check(
         name = str(p.get("name") or f"prop{i}")
         expr = str(p.get("expr") or "").strip()
         kind = str(p.get("kind") or "assert")
-        entry = {"name": name, "description": str(p.get("description") or ""), "expr": expr, "kind": kind}
+        entry = {
+            "name": name,
+            "description": str(p.get("description") or ""),
+            "expr": expr,
+            "kind": kind,
+            "paired_cover": str(p.get("paired_cover") or ""),
+        }
         if kind == "assume":
             if expr:
                 assume_props.append((name, expr, "assume"))
@@ -318,6 +324,31 @@ async def formal_check(
             "has_trace": result.vcd_path is not None,
             "waveform_json": waveform_json_data,
         })
+
+    # Vacuity cross-check: an assert can be PROVEN only because its own
+    # triggering condition never occurs, which "proves" nothing useful. If
+    # the property carries a paired_cover naming a cover in this same run,
+    # confirm that cover actually REACHED before trusting the assert.
+    verdict_by_name = {r["name"]: r for r in results}
+    for r in results:
+        if r["kind"] != "assert" or not r.get("paired_cover"):
+            continue
+        cover = verdict_by_name.get(r["paired_cover"])
+        if cover is None:
+            r["vacuity_warning"] = (
+                f"Paired cover \"{r['paired_cover']}\" was not included in this run — "
+                "reachability of this assert's trigger is unconfirmed."
+            )
+        elif cover.get("kind") != "cover":
+            r["vacuity_warning"] = (
+                f"Paired cover \"{r['paired_cover']}\" is not a cover property — "
+                "reachability of this assert's trigger is unconfirmed."
+            )
+        elif cover.get("verdict") != "REACHED":
+            r["vacuity_warning"] = (
+                f"Paired cover \"{r['paired_cover']}\" is UNREACHED — this assert may be "
+                "vacuously true (its trigger condition never occurs)."
+            )
 
     return {
         "module": mod.name,

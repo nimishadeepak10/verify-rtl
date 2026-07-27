@@ -43,8 +43,11 @@ SUGGEST_SCHEMA = {
                     "description": {"type": "string"},
                     "signals": {"type": "array", "items": {"type": "string"}},
                     "rationale": {"type": "string"},
+                    "paired_cover": {"type": "string"},
                 },
-                "required": ["name", "kind", "pattern", "description", "signals", "rationale"],
+                "required": [
+                    "name", "kind", "pattern", "description", "signals", "rationale", "paired_cover",
+                ],
                 "additionalProperties": False,
             },
         }
@@ -77,6 +80,12 @@ outputs is "assert".
 - For any assert whose scenario only applies under specific conditions, also propose a matching \
 cover proving that scenario is reachable at all — an assert with no way to confirm it isn't \
 vacuous is not useful (see the reference's cover/vacuity lesson).
+- Every assert's "paired_cover" field must name exactly which cover property (its "name" field, \
+from this same response) proves the assert's triggering condition is reachable. Set it to the \
+empty string only if the assert genuinely holds unconditionally (true for every reachable state, \
+no triggering scenario to confirm) — never leave it empty just because you forgot to propose the \
+cover; propose the cover first, then link it. Cover and assume-kind properties should set \
+"paired_cover" to "".
 - Tag each property with the closest Dwyer/Avrunin/Corbett pattern name from the reference.
 - Where the design's signal names match a standard OVL checker role (one-hot, handshake/req-ack, \
 fifo, mutex), say so explicitly in the rationale.

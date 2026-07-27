@@ -241,6 +241,13 @@
                 <p class="text-dim" style="font-size:12px; margin-top:var(--s-2)">
                   signals: <span class="mono">${App.escapeHtml((s.signals || []).join(", "))}</span><br>
                   ${App.escapeHtml(s.rationale || "")}
+                  ${
+                    s.kind === "assert"
+                      ? s.paired_cover
+                        ? `<br><span class="mono">pairs with cover: ${App.escapeHtml(s.paired_cover)}</span>`
+                        : `<br><span class="mono" style="color:var(--led-amber,#d29922)">no paired cover — claimed unconditional</span>`
+                      : ""
+                  }
                 </p>
               </div>
               <button type="button" class="btn-ghost" data-sremove="${s.id}" title="Remove">&times;</button>
@@ -294,7 +301,15 @@
     fd.append("top_module", dutTopModule.trim());
     fd.append(
       "properties",
-      JSON.stringify(chosen.map((s) => ({ name: s.name, kind: s.kind, description: s.description, rationale: s.rationale })))
+      JSON.stringify(
+        chosen.map((s) => ({
+          name: s.name,
+          kind: s.kind,
+          description: s.description,
+          rationale: s.rationale,
+          paired_cover: s.paired_cover || "",
+        }))
+      )
     );
 
     let data;
@@ -316,7 +331,14 @@
     const notExpressible = [];
     data.properties.forEach((c) => {
       if (c.expressible) {
-        propRows.push({ id: ++rowSeq, description: c.description, expr: c.expr, kind: c.kind });
+        propRows.push({
+          id: ++rowSeq,
+          name: c.name,
+          description: c.description,
+          expr: c.expr,
+          kind: c.kind,
+          paired_cover: c.paired_cover || "",
+        });
         added += 1;
       } else {
         notExpressible.push(c);
@@ -378,6 +400,7 @@
         </select>
         <input type="text" class="input-mono" data-field="description"
           placeholder="plain English, e.g. light is never invalid"
+          title="${r.paired_cover ? `Pairs with cover: ${App.escapeHtml(r.paired_cover)}` : ""}"
           value="${App.escapeHtml(r.description)}" style="flex:1.4">
         <input type="text" class="input-mono mono" data-field="expr"
           placeholder="light <= 1"
@@ -418,10 +441,11 @@
     const props = propRows
       .filter((r) => r.expr.trim())
       .map((r, i) => ({
-        name: `prop${i}`,
+        name: r.name || `prop${i}`,
         description: r.description.trim(),
         expr: r.expr.trim(),
         kind: r.kind || "assert",
+        paired_cover: r.paired_cover || "",
       }));
     if (!props.length) {
       status.textContent = "Enter at least one property expression.";
@@ -487,6 +511,14 @@
           <div class="panel__body">
             <pre class="code-block" style="max-height:80px">${App.escapeHtml(p.expr)}</pre>
             ${p.error ? `<p class="callout-unverified__body">${App.escapeHtml(p.error)}</p>` : ""}
+            ${
+              p.vacuity_warning
+                ? `<div class="callout callout-warn" style="margin-top:var(--s-2)">
+                     <span class="callout__prefix">POSSIBLY VACUOUS</span>
+                     <p class="callout-unverified__body">${App.escapeHtml(p.vacuity_warning)}</p>
+                   </div>`
+                : ""
+            }
             ${
               p.has_trace
                 ? `<p class="text-dim">${p.kind === "cover" ? "Reached — trace below." : "Falsified — counterexample trace below."}</p>
