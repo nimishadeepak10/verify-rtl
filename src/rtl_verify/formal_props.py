@@ -10,8 +10,13 @@ instantiation has no such gap — it's ordinary Verilog, not a formal-only
 construct — so it's the reliable choice here.
 
 This keeps the same output shape whether a property comes from a
-hand-written string (today) or an LLM-generated one later (Phase 2) —
-only the `expr` strings change, the wiring stays the same.
+hand-written string or an LLM-generated one (Phase 2) — only the `expr`
+strings change, the wiring stays the same. Each property also carries a
+`kind` — assert/assume/cover — since these mean genuinely different
+things to SymbiYosys, not just different keywords: assert/assume run
+together under the existing bmc/prove modes below, but a cover only
+means anything under a separate `mode="cover"` run (see
+recommended_formal_config and backends/symbiyosys.py).
 
 Sequential (clocked) and combinational (clockless) DUTs both work:
 sequential properties are checked every clock edge with a reset
@@ -28,7 +33,13 @@ from typing import Sequence, Tuple
 
 from .analyzer import PortDirection, RtlModule
 
-Property = Tuple[str, str]  # (name, boolean_expression) using the DUT's own port names
+# (name, boolean_expression, kind) using the DUT's own port names.
+# kind is "assert" (design must guarantee), "assume" (environment/input
+# constraint the design may rely on), or "cover" (reachability claim —
+# checked for meaning only under mode="cover"; see backends/symbiyosys.py).
+Property = Tuple[str, str, str]
+
+_KEYWORD = {"assert": "assert", "assume": "assume", "cover": "cover"}
 
 
 def generate_formal_wrapper(
@@ -43,7 +54,10 @@ def generate_formal_wrapper(
     RTL file.
     """
     if not properties:
-        raise ValueError("Need at least one (name, expression) property")
+        raise ValueError("Need at least one (name, expression, kind) property")
+    for name, _expr, kind in properties:
+        if kind not in _KEYWORD:
+            raise ValueError(f"'{name}': kind must be assert/assume/cover, got {kind!r}")
     clk = clock_port or module.clock_port
 
     wrapper_name = f"{module.name}_formal_top"
@@ -62,7 +76,9 @@ def generate_formal_wrapper(
         else:
             output_decls.append(f"    wire {rng_sp}{p.name};")
 
-    assert_lines = [f"        {name}: assert ({expr});" for name, expr in properties]
+    assert_lines = [
+        f"        {name}: {_KEYWORD[kind]} ({expr});" for name, expr, kind in properties
+    ]
     conns_str = ",\n        ".join(conns)
 
     if clk:
@@ -110,8 +126,10 @@ endmodule
 """
 
 
-def recommended_formal_config(module: RtlModule) -> dict:
+def recommended_formal_config(module: RtlModule, kind: str = "assert") -> dict:
     """Pick a SymbiYosys mode/engine/depth from what the analyzer already knows.
+
+    For assert/assume:
 
     Combinational designs have no time-varying state, so a single BMC step
     already checks every input combination exhaustively via SAT — that's a
@@ -126,7 +144,22 @@ def recommended_formal_config(module: RtlModule) -> dict:
     scripts/test_formal_unbounded.py for a worked example). PDR searches
     for a proof or a genuine counterexample regardless of how far away it
     is, so `depth` isn't part of this config for sequential designs.
+
+    For cover: always `mode="cover"` regardless of sequential/combinational
+    — confirmed by running it that `mode="prove"` (PDR) silently folds a
+    `cover` statement into the proof as a constraint instead of actually
+    checking reachability ("the last N outputs are interpreted as
+    constraints" in the ABC log), so a cover only means something under
+    `mode="cover"`. Depth uses the same FSM-state-derived heuristic as the
+    sequential assert case, since reachability can need more steps than a
+    shallow default; combinational cover still only needs depth=1, for the
+    same single-step-is-exhaustive reason asserts do.
     """
+    if kind == "cover":
+        if not module.is_sequential:
+            return {"mode": "cover", "engine": "smtbmc", "depth": 1}
+        depth = max(10, len(module.states) * 4) if module.states else 20
+        return {"mode": "cover", "engine": "smtbmc", "depth": depth}
     if not module.is_sequential:
         return {"mode": "bmc", "engine": "smtbmc", "depth": 1}
     return {"mode": "prove", "engine": "abc pdr", "depth": 0}

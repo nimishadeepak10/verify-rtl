@@ -29,7 +29,7 @@ def run_case(label: str, rtl_path: Path, module_name: str, prop_expr: str, expec
     rtl_source = rtl_path.read_text(encoding="utf-8")
     module = analyze_rtl(rtl_source, top_module=module_name)
 
-    wrapper_sv = generate_formal_wrapper(module, [("prop0", prop_expr)])
+    wrapper_sv = generate_formal_wrapper(module, [("prop0", prop_expr, "assert")])
     config = recommended_formal_config(module)
 
     work = Path(tempfile.mkdtemp(prefix=f"formal_{label}_"))

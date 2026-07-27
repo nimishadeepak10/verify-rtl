@@ -35,7 +35,7 @@ def main() -> None:
     rtl_source = rtl_path.read_text(encoding="utf-8")
     module = analyze_rtl(rtl_source, top_module="free_running_counter")
 
-    wrapper_sv = generate_formal_wrapper(module, [("prop0", "count < 100")])
+    wrapper_sv = generate_formal_wrapper(module, [("prop0", "count < 100", "assert")])
     backend = SymbiYosysBackend()
 
     # 1. Shallow BMC: depth well short of cycle 100 — should (wrongly) PASS.

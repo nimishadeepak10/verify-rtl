@@ -13,6 +13,13 @@ genuinely different guarantees, not just different speed:
   reachability) — proves the property for all time, or finds a genuine
   counterexample regardless of how far away it is. ``depth`` is ignored
   in this mode (PDR doesn't unroll to a fixed step count).
+- ``mode="cover", engine="smtbmc"``: for ``cover`` (not ``assert``)
+  statements — checks reachability, not correctness. ``success=True``
+  means the cover WAS reached (confirmed by running it: PDR silently
+  folds a ``cover`` into its proof as a constraint instead of actually
+  checking reachability — ``mode="cover"`` is required for a cover
+  statement to mean anything). An unreached cover returns
+  ``success=False`` with no trace, since there's nothing to show.
 
 ``run()`` keeps the same shape as the simulator backends so the registry
 can treat it uniformly, with two differences the caller must know about:
@@ -44,8 +51,21 @@ from typing import Optional
 from .base import BackendResult, SimulatorBackend
 
 _STATUS_FILENAME = "status"
-_TRACE_RELPATH = Path("engine_0") / "trace.vcd"
 _LOGFILE = "logfile.txt"
+
+
+def _find_trace(job_path: Path) -> Path | None:
+    """Locate the counterexample/cover trace VCD, whichever naming this mode used.
+
+    bmc/prove name it engine_0/trace.vcd on falsification. cover mode instead
+    numbers it engine_0/trace0.vcd (it can reach several distinct cover
+    points), and produces no trace at all when nothing was reached.
+    """
+    plain = job_path / "engine_0" / "trace.vcd"
+    if plain.is_file():
+        return plain
+    numbered = sorted((job_path / "engine_0").glob("trace*.vcd"))
+    return numbered[0] if numbered else None
 
 
 def find_sby() -> str | None:
@@ -223,11 +243,11 @@ class SymbiYosysBackend(SimulatorBackend):
             log_lines.append("=== " + _LOGFILE + " ===")
             log_lines.append(logfile.read_text(encoding="utf-8", errors="replace"))
 
-        trace = job_path / _TRACE_RELPATH
+        trace = _find_trace(job_path)
         return BackendResult(
             success=status_word == "PASS",
             log="\n".join(log_lines),
-            vcd_path=trace if trace.is_file() else None,
+            vcd_path=trace,
             work_dir=work_abs,
             duration_sec=time.perf_counter() - t0,
         )
