@@ -55,6 +55,26 @@ def log_event(detail: dict[str, Any]) -> None:
         pass
 
 
+def read_recent(limit: int = 30) -> list[dict[str, Any]]:
+    """Most recent logged closure-loop rounds first — survives across
+    sessions the same way formal_log.py's history does.
+    """
+    if not LOG_PATH.is_file():
+        return []
+    try:
+        lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    events = []
+    for line in lines[-limit:]:
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    events.reverse()
+    return events
+
+
 def extract_gaps(cov: CoverageReport) -> dict:
     """Structured gap data — what a run did NOT exercise — as data for an
     LLM prompt, not report text. p3-1.

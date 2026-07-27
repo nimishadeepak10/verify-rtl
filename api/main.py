@@ -31,6 +31,7 @@ from rtl_verify.property_suggester import suggest_properties  # noqa: E402
 from rtl_verify.property_to_sva import convert_to_sva, convert_to_sva_retry  # noqa: E402
 from rtl_verify.llm_client import LLMNotConfigured  # noqa: E402
 from rtl_verify import formal_log  # noqa: E402
+from rtl_verify import coverage_closure  # noqa: E402
 from rtl_verify.coverage_closure import run_closure_loop  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
@@ -622,3 +623,11 @@ async def coverage_close(
     except ValueError as e:
         return {"error": str(e)}
     return result
+
+
+@app.get("/api/coverage/close/history")
+async def coverage_close_history(limit: int = 30):
+    """Recent coverage-closure rounds, most recent first — persisted to
+    logs/coverage_closure.jsonl so it survives across sessions.
+    """
+    return {"events": coverage_closure.read_recent(limit=limit)}

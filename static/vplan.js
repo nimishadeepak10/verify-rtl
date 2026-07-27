@@ -498,12 +498,26 @@
             <button type="button" class="btn btn-primary" id="closureRunBtn">Close Coverage</button>
             <span id="closureStatus" class="text-dim mono"></span>
           </div>
+          <div id="closureChart"></div>
           <div id="closureLog"></div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:var(--s-4)">
+        <div class="panel__header"><h2 class="panel__title">COVERAGE CLOSURE HISTORY</h2></div>
+        <div class="panel__body">
+          <p class="text-dim">Every closure round, logged locally so it survives across sessions —
+            not just this browser tab.</p>
+          <button type="button" class="btn btn-ghost" id="closureHistoryRefresh">Refresh</button>
+          <div id="closureHistory" style="margin-top:var(--s-3)"></div>
         </div>
       </div>
     `;
     renderClosureLog();
+    renderClosureChart();
     $("#closureRunBtn")?.addEventListener("click", runClosureLoop);
+    $("#closureHistoryRefresh")?.addEventListener("click", loadClosureHistory);
+    loadClosureHistory();
 
     // collapsible behavior
     mount.querySelectorAll(".cov-section__head").forEach((btn) => {
@@ -554,6 +568,73 @@
         ${closureStopReason ? `<div class="mono text-dim" style="margin-top:var(--s-2)">Stopped: ${App.escapeHtml(closureStopReason)}</div>` : ""}
       </div>
     `;
+  }
+
+  function renderClosureChart() {
+    const host = $("#closureChart");
+    if (!host) return;
+    if (!closureIterations.length) {
+      host.innerHTML = "";
+      return;
+    }
+    const w = 60;
+    const gap = 12;
+    const chartH = 90;
+    const topPad = 16; // room for the "100%" label above a full-height bar
+    const bottomPad = 20; // room for the "R<n>" round label below the bar
+    const bars = closureIterations
+      .map((it, i) => {
+        const pct = Math.max(0, Math.min(100, it.overall_percent || 0));
+        const h = (pct / 100) * chartH;
+        const x = i * (w + gap);
+        const barY = topPad + (chartH - h);
+        return `
+          <text x="${x + w / 2}" y="${barY - 6}" text-anchor="middle" font-size="11" fill="var(--text-muted)" font-family="var(--font-mono)">${pct.toFixed(0)}%</text>
+          <rect x="${x}" y="${barY}" width="${w}" height="${h}" fill="var(--accent, #f7b955)" rx="2"></rect>
+          <text x="${x + w / 2}" y="${topPad + chartH + 16}" text-anchor="middle" font-size="11" fill="var(--text-dim)" font-family="var(--font-mono)">R${it.iteration}</text>
+        `;
+      })
+      .join("");
+    const totalW = closureIterations.length * (w + gap);
+    const totalH = topPad + chartH + bottomPad;
+    host.innerHTML = `
+      <div style="margin:var(--s-3) 0; overflow-x:auto">
+        <svg width="${totalW}" height="${totalH}" viewBox="0 0 ${totalW} ${totalH}">${bars}</svg>
+      </div>
+    `;
+  }
+
+  function closureHistorySummary(ev) {
+    const delta = typeof ev.delta === "number" ? (ev.delta > 0 ? `+${ev.delta.toFixed(1)}%` : `${ev.delta.toFixed(1)}%`) : "";
+    return `${ev.module || "?"} — round ${ev.iteration}: ${ev.num_new_vectors} new vectors → ${(ev.overall_percent || 0).toFixed(1)}% (${delta})`;
+  }
+
+  async function loadClosureHistory() {
+    const host = $("#closureHistory");
+    if (!host) return;
+    host.innerHTML = '<span class="text-dim mono">Loading…</span>';
+    let data;
+    try {
+      const res = await fetch("/api/coverage/close/history?limit=30");
+      data = await res.json();
+    } catch (err) {
+      host.innerHTML = `<span class="text-dim mono">Could not load history: ${App.escapeHtml(String(err.message || err))}</span>`;
+      return;
+    }
+    const events = data.events || [];
+    if (!events.length) {
+      host.innerHTML = '<span class="text-dim mono">No closure rounds logged yet.</span>';
+      return;
+    }
+    host.innerHTML = events
+      .map((ev) => {
+        const when = new Date(ev.ts * 1000).toLocaleString();
+        return `<div style="display:flex; gap:var(--s-3); padding:6px 0; border-top:1px solid var(--border-soft, #21262d); font-size:12.5px;">
+          <span class="text-dim mono" style="flex:none; width:150px">${App.escapeHtml(when)}</span>
+          <span>${App.escapeHtml(closureHistorySummary(ev))}</span>
+        </div>`;
+      })
+      .join("");
   }
 
   async function runClosureLoop() {
