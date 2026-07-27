@@ -362,12 +362,25 @@ def compute_fsm_coverage(mod: RtlModule, vcd_signals: List[dict]) -> FsmCoverage
 
     all_states = list(mod.states or [])
     total_states = len(all_states) if all_states else len(visited)
-    missed = [s for s in all_states if s not in visited] if all_states else []
+    # `visited`/`states_hit` are only in the same vocabulary as `all_states`
+    # (mod.states' symbolic names) when `decode` actually mapped runtime
+    # int codes to those names. When it's empty — e.g. a state defined via
+    # `localparam S_RED = 2'd0;` outside the case body, which
+    # fsm_value_map never captures a literal->name mapping for — `visited`
+    # holds raw numeric strings instead, and diffing that against symbolic
+    # names would falsely report every actually-visited state as missed
+    # (confirmed by running traffic_light_fsm.v: states_hit=["0","1"] but
+    # states_missed=["S_RED","S_GREEN"] even though both were visited).
+    # state_percent still reads correctly either way (it only compares
+    # counts, not names) — only this missed-name list needs the guard.
+    missed = [s for s in all_states if s not in visited] if (all_states and decode) else []
 
     all_transitions = set(tuple(x) for x in (mod.fsm_transitions or []))
     total_transitions = len(all_transitions)
     transitions_hit = sorted(taken_transitions)
-    transitions_missed = sorted(list(all_transitions - taken_transitions)) if all_transitions else []
+    transitions_missed = (
+        sorted(list(all_transitions - taken_transitions)) if (all_transitions and decode) else []
+    )
 
     return FsmCoverage(
         state_reg=mod.state_reg,

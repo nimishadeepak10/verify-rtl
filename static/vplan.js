@@ -7,6 +7,9 @@
   const CATEGORY_NUMS = ["①", "②", "③", "④", "⑤", "⑥"];
   let toggleDebounce = null;
   let loadToken = 0;
+  let closureRunning = false;
+  let closureIterations = [];
+  let closureStopReason = "";
 
   function $(sel) {
     return document.querySelector(sel);
@@ -478,7 +481,29 @@
           </div>
         </div>
       </div>
+
+      <div class="panel" style="margin-top:var(--s-4)">
+        <div class="panel__header"><h2 class="panel__title">COVERAGE CLOSURE</h2></div>
+        <div class="panel__body">
+          <p class="text-dim">Agentic loop: reads the gaps above, asks an LLM for directed input
+            vectors that target them, reruns with every vector proposed so far, and repeats —
+            until the target is reached or two rounds pass with no improvement.</p>
+          <div style="display:flex; gap:var(--s-3); align-items:center; flex-wrap:wrap; margin:var(--s-3) 0">
+            <label class="text-dim mono" style="font-size:12px">Target %
+              <input type="number" id="closureTarget" class="input-mono" value="95" min="1" max="100" style="width:70px; margin-left:6px">
+            </label>
+            <label class="text-dim mono" style="font-size:12px">Max rounds
+              <input type="number" id="closureMaxIter" class="input-mono" value="5" min="1" max="20" style="width:60px; margin-left:6px">
+            </label>
+            <button type="button" class="btn btn-primary" id="closureRunBtn">Close Coverage</button>
+            <span id="closureStatus" class="text-dim mono"></span>
+          </div>
+          <div id="closureLog"></div>
+        </div>
+      </div>
     `;
+    renderClosureLog();
+    $("#closureRunBtn")?.addEventListener("click", runClosureLoop);
 
     // collapsible behavior
     mount.querySelectorAll(".cov-section__head").forEach((btn) => {
@@ -504,6 +529,96 @@
         if (sig && App.highlightWaveSignal) App.highlightWaveSignal(sig);
       });
     });
+  }
+
+  function renderClosureLog() {
+    const host = $("#closureLog");
+    if (!host) return;
+    if (!closureIterations.length) {
+      host.innerHTML = "";
+      return;
+    }
+    host.innerHTML = `
+      <div style="margin-top:var(--s-3)">
+        ${closureIterations
+          .map((it) => {
+            const deltaTxt = it.delta > 0 ? `+${it.delta.toFixed(1)}%` : `${it.delta.toFixed(1)}%`;
+            const rationales = (it.vector_rationales || []).slice(0, 3);
+            return `<div style="padding:8px 0; border-top:1px solid var(--border-soft, #21262d); font-size:12.5px;">
+              <div class="mono">Round ${it.iteration}: ${it.num_new_vectors} new vectors → ${it.overall_percent.toFixed(1)}% (${deltaTxt})</div>
+              ${rationales.length ? `<ul style="margin:4px 0 0 0; padding-left:18px; color:var(--text-muted)">${rationales.map((r) => `<li>${App.escapeHtml(r)}</li>`).join("")}</ul>` : ""}
+              ${it.error ? `<div class="text-dim">error: ${App.escapeHtml(it.error)}</div>` : ""}
+            </div>`;
+          })
+          .join("")}
+        ${closureStopReason ? `<div class="mono text-dim" style="margin-top:var(--s-2)">Stopped: ${App.escapeHtml(closureStopReason)}</div>` : ""}
+      </div>
+    `;
+  }
+
+  async function runClosureLoop() {
+    const status = $("#closureStatus");
+    const btn = $("#closureRunBtn");
+    if (closureRunning) return;
+    if (!App.rtlContent || !App.rtlContent.trim()) {
+      if (status) status.textContent = "Load RTL on the Design screen first.";
+      return;
+    }
+    const target = parseFloat($("#closureTarget")?.value) || 95;
+    const maxIter = parseInt($("#closureMaxIter")?.value, 10) || 5;
+
+    closureRunning = true;
+    closureIterations = [];
+    closureStopReason = "";
+    if (btn) btn.disabled = true;
+    if (status) status.textContent = "Running coverage-closure loop — this calls the LLM and reruns the simulator each round…";
+    renderClosureLog();
+
+    const fd = new FormData();
+    fd.append("rtl_text", App.rtlContent);
+    const topModule = (App.currentResult && App.currentResult.module) || (App.currentPreview && App.currentPreview.module_name) || "";
+    fd.append("top_module", topModule);
+    fd.append("max_iterations", String(maxIter));
+    fd.append("target_percent", String(target));
+
+    let data;
+    try {
+      const res = await fetch("/api/coverage/close", { method: "POST", body: fd });
+      data = await res.json();
+    } catch (err) {
+      if (status) status.textContent = "Request failed: " + (err.message || err);
+      closureRunning = false;
+      if (btn) btn.disabled = false;
+      return;
+    }
+
+    closureRunning = false;
+    if (btn) btn.disabled = false;
+
+    if (data.error) {
+      if (status) status.textContent = data.error;
+      return;
+    }
+
+    closureIterations = data.iterations || [];
+    closureStopReason = data.stop_reason || "";
+
+    // Fold the closure run's coverage into the existing report so the
+    // sections above (statement/branch/toggle/FSM) reflect it too.
+    if (data.coverage && App.currentResult) {
+      App.currentResult.coverage = data.coverage;
+      App.currentResult.work_dir = data.work_dir || App.currentResult.work_dir;
+      App.currentResult.sim_log = data.sim_log || App.currentResult.sim_log;
+      App.currentResult.testbench = data.testbench || App.currentResult.testbench;
+    }
+    // renderCoverage() rebuilds the whole panel from scratch (including a
+    // fresh, empty #closureStatus span) — the "Done" message must be set
+    // AFTER that rebuild, or it gets wiped out immediately.
+    renderCoverage();
+    const freshStatus = $("#closureStatus");
+    if (freshStatus) {
+      freshStatus.textContent = `Done — ${(data.final_percent || 0).toFixed(1)}% (${data.stop_reason})`;
+    }
   }
 
   window.VPlan = {

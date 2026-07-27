@@ -31,6 +31,7 @@ from rtl_verify.property_suggester import suggest_properties  # noqa: E402
 from rtl_verify.property_to_sva import convert_to_sva, convert_to_sva_retry  # noqa: E402
 from rtl_verify.llm_client import LLMNotConfigured  # noqa: E402
 from rtl_verify import formal_log  # noqa: E402
+from rtl_verify.coverage_closure import run_closure_loop  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 STATIC = ROOT / "static"
@@ -581,3 +582,43 @@ async def coverage(work_dir: str):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         return {"error": f"Failed to read coverage.json: {e}"}
+
+
+@app.post("/api/coverage/close")
+async def coverage_close(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    top_module: str = Form(""),
+    backend: str = Form(""),
+    max_iterations: int = Form(5),
+    target_percent: float = Form(95.0),
+):
+    """Phase 3: agentic coverage-closure loop. Reads coverage gaps left by
+    the previous round (none on round 1), asks an LLM for new directed
+    input vectors targeting them, regenerates a directed testbench with
+    every vector proposed so far, reruns the simulator, and recomputes
+    coverage — repeating until the target is reached, two rounds pass with
+    negligible improvement, or max_iterations is hit.
+
+    Independent of /api/verify — uses its own minimal directed-stimulus
+    testbench generator (coverage_closure.py) rather than the default
+    pipeline's formulaic stimulus.
+    """
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+
+    try:
+        result = run_closure_loop(
+            rtl_source,
+            top_module=top_module.strip() or None,
+            backend_name=backend.strip() or None,
+            max_iterations=max(1, min(20, max_iterations)),
+            target_percent=target_percent,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    return result
