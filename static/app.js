@@ -7,10 +7,11 @@
   const STEPS = [
     { id: "design", num: "01", label: "Design" },
     { id: "formal", num: "02", label: "Formal" },
-    { id: "plan", num: "03", label: "Plan" },
-    { id: "run", num: "04", label: "Run" },
-    { id: "results", num: "05", label: "Results" },
-    { id: "coverage", num: "06", label: "Coverage" },
+    { id: "traceability", num: "03", label: "Traceability" },
+    { id: "plan", num: "04", label: "Plan" },
+    { id: "run", num: "05", label: "Run" },
+    { id: "results", num: "06", label: "Results" },
+    { id: "coverage", num: "07", label: "Coverage" },
   ];
 
   const $ = (sel, root) => (root || document).querySelector(sel);
@@ -28,6 +29,7 @@
     stepState: {
       design: "current",
       formal: "dim",
+      traceability: "dim",
       plan: "dim",
       run: "dim",
       results: "dim",
@@ -261,6 +263,9 @@
     }
     if (stepId === "formal" && window.Formal && Formal.render) {
       Formal.render();
+    }
+    if (stepId === "traceability" && window.Traceability && Traceability.render) {
+      Traceability.render();
     }
   }
 

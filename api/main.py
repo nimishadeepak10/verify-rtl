@@ -33,6 +33,7 @@ from rtl_verify.llm_client import LLMNotConfigured  # noqa: E402
 from rtl_verify import formal_log  # noqa: E402
 from rtl_verify import coverage_closure  # noqa: E402
 from rtl_verify.coverage_closure import run_closure_loop  # noqa: E402
+from rtl_verify.spec_traceability import build_traceability_matrix  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 STATIC = ROOT / "static"
@@ -631,3 +632,52 @@ async def coverage_close_history(limit: int = 30):
     logs/coverage_closure.jsonl so it survives across sessions.
     """
     return {"events": coverage_closure.read_recent(limit=limit)}
+
+
+@app.post("/api/traceability")
+async def traceability(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    spec_file: UploadFile | None = File(None),
+    spec_text: str = Form(""),
+    top_module: str = Form(""),
+    properties_text: str = Form(""),
+):
+    """Phase 4: spec -> verification-plan traceability. Extracts atomic
+    requirements from the spec, then checks each against this design's
+    test-plan cases and any already-verified formal properties (pasted in
+    plain English, one per line) — flagging any requirement with no
+    genuine match instead of a false "covered".
+    """
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+
+    if spec_file and spec_file.filename:
+        spec = (await spec_file.read()).decode("utf-8", errors="replace")
+    else:
+        spec = spec_text
+    if not spec.strip():
+        return {"error": "Provide spec_file or spec_text"}
+
+    try:
+        mod = analyze_rtl(rtl_source, top_module=top_module.strip() or None)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    plan = None
+    try:
+        plan = build_vplan(rtl_source, mod)
+    except Exception:  # noqa: BLE001 — traceability against properties alone still works
+        plan = None
+
+    try:
+        result = build_traceability_matrix(spec, rtl_source, mod, plan, properties_text=properties_text)
+    except LLMNotConfigured as e:
+        return {"error": str(e)}
+    except Exception as e:  # noqa: BLE001 — surface any LLM failure, don't 500
+        return {"error": f"Traceability build failed: {e}"}
+    return result
