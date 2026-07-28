@@ -16,6 +16,10 @@
 
   let waveWorkDirCache = null;
 
+  let chatHistory = [];
+
+  let chatWorkDir = null;
+
 
 
   function $(sel) {
@@ -630,6 +634,8 @@
 
         <button type="button" data-panel="panelWave">Waveform</button>
 
+        <button type="button" data-panel="panelChat">Chat</button>
+
         <button type="button" id="resultsFormalLink">Formal →</button>
 
       </div>
@@ -653,6 +659,27 @@
         <div id="waveVisual" class="wave-visual-panel active"></div>
 
         <div id="waveRaw" class="wave-raw-panel"><pre class="code-block code-block--wave" id="wavePre"></pre></div>
+
+      </div>
+
+      <div id="panelChat" class="result-panel">
+
+        <p class="text-dim">Ask about this run — answers cite the specific RTL line or waveform
+          signal/timestamp, scoped to this run only.</p>
+
+        <div id="chatMessages" style="margin:var(--s-3) 0; max-height:400px; overflow-y:auto"></div>
+
+        <div style="display:flex; gap:var(--s-2)">
+
+          <input type="text" id="chatInput" class="input-mono" style="flex:1"
+
+            placeholder="e.g. Why did sum never toggle bit 2?">
+
+          <button type="button" class="btn btn-primary" id="chatSendBtn">Send</button>
+
+        </div>
+
+        <span id="chatStatus" class="text-dim mono" style="font-size:12px"></span>
 
       </div>
 
@@ -745,6 +772,8 @@
 
 
     bindWaveSubtabs(data);
+
+    bindChat(data);
 
 
 
@@ -884,6 +913,146 @@
         if (sub === "visual") loadWaveformVisual(data);
 
       });
+
+    });
+
+  }
+
+
+
+  function renderChatMessages() {
+
+    const host = $("#chatMessages");
+
+    if (!host) return;
+
+    if (!chatHistory.length) {
+
+      host.innerHTML = '<span class="text-dim mono">No questions yet.</span>';
+
+      return;
+
+    }
+
+    host.innerHTML = chatHistory
+
+      .map(
+
+        (turn) => `
+
+      <div style="margin-bottom:var(--s-3)">
+
+        <div class="mono" style="font-weight:600">Q: ${App.escapeHtml(turn.question)}</div>
+
+        <div style="margin-top:4px; white-space:pre-wrap">${App.escapeHtml(turn.answer)}</div>
+
+      </div>`
+
+      )
+
+      .join("");
+
+    host.scrollTop = host.scrollHeight;
+
+  }
+
+
+
+  function bindChat(data) {
+
+    chatHistory = [];
+
+    chatWorkDir = data.work_dir || null;
+
+    renderChatMessages();
+
+    const sendBtn = $("#chatSendBtn");
+
+    const input = $("#chatInput");
+
+    const status = $("#chatStatus");
+
+    if (!sendBtn || !input) return;
+
+
+
+    const send = async () => {
+
+      const question = input.value.trim();
+
+      if (!question) return;
+
+      if (!chatWorkDir) {
+
+        status.textContent = "No waveform/report available for this run to ask about.";
+
+        return;
+
+      }
+
+      sendBtn.disabled = true;
+
+      status.textContent = "Thinking…";
+
+      input.value = "";
+
+
+
+      const fd = new FormData();
+
+      fd.append("work_dir", chatWorkDir);
+
+      fd.append("question", question);
+
+      fd.append("history", JSON.stringify(chatHistory));
+
+
+
+      let resp;
+
+      try {
+
+        const res = await fetch("/api/chat", { method: "POST", body: fd });
+
+        resp = await res.json();
+
+      } catch (err) {
+
+        status.textContent = "Request failed: " + (err.message || err);
+
+        sendBtn.disabled = false;
+
+        return;
+
+      }
+
+      sendBtn.disabled = false;
+
+      status.textContent = "";
+
+
+
+      if (resp.error) {
+
+        chatHistory.push({ question, answer: "Error: " + resp.error });
+
+      } else {
+
+        chatHistory.push({ question, answer: resp.answer });
+
+      }
+
+      renderChatMessages();
+
+    };
+
+
+
+    sendBtn.addEventListener("click", send);
+
+    input.addEventListener("keydown", (e) => {
+
+      if (e.key === "Enter") send();
 
     });
 

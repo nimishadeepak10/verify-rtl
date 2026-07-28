@@ -26,6 +26,15 @@ def vcd_to_text(vcd_path: Path, max_samples: int = 64) -> str:
     values: Dict[str, str] = {}
     samples: List[Tuple[int, Dict[str, str]]] = []
     current_time = 0
+    pending = False
+
+    def flush() -> None:
+        nonlocal pending
+        if pending and values:
+            samples.append((current_time, dict(values)))
+            if len(samples) > max_samples * 4:
+                del samples[: -(max_samples * 2)]
+            pending = False
 
     for line in lines:
         line = line.strip()
@@ -41,39 +50,48 @@ def vcd_to_text(vcd_path: Path, max_samples: int = 64) -> str:
                 except ValueError:
                     widths[name] = 1
         elif line.startswith("#"):
+            # Commit the *previous* timestamp's fully-updated values before
+            # advancing to the new one. This used to flush a snapshot on
+            # every single value-change line instead, which could capture
+            # one signal's new value alongside another signal's *not yet
+            # updated* value when several signals change at the same VCD
+            # timestamp (a common case for a combinational output whose
+            # change line follows its input's) — confirmed live: a 2-bit
+            # adder's report.txt showed `b` one step ahead of `sum` at the
+            # same displayed timestamp, even though they're both driven at
+            # the same instant.
+            flush()
             try:
                 current_time = int(line[1:].split()[0])
             except ValueError:
                 continue
-        elif line and line[0] in "bBr":
-            # b1010 !  or 1!  or r1.0 x
-            if line[0] == "b":
-                m = re.match(r"b([01xzXZ]+)\s*(\S+)", line)
-                if m:
-                    val, sym = m.group(1), m.group(2)
-                    name = id_to_name.get(sym, sym)
-                    values[name] = f"b{val}"
-            else:
-                m = re.match(r"([01xzXZ]+)\s*(\S+)", line[1:])
-                if m:
-                    val, sym = m.group(1), m.group(2)
-                    name = id_to_name.get(sym, sym)
-                    values[name] = val
-            if values:
-                samples.append((current_time, dict(values)))
-                if len(samples) > max_samples * 4:
-                    samples = samples[-max_samples * 2 :]
+        elif line and line[0] == "b":
+            # Vector value change, e.g. "b1010 !"
+            m = re.match(r"b([01xzXZ]+)\s*(\S+)", line)
+            if m:
+                val, sym = m.group(1), m.group(2)
+                name = id_to_name.get(sym, sym)
+                values[name] = f"b{val}"
+                pending = True
+        elif line and line[0] in "01xzXZ":
+            # Scalar (1-bit) value change has no "b" prefix in VCD, e.g.
+            # "1!" for clk going high — previously unmatched entirely here,
+            # silently dropping every 1-bit signal (clk, reset, single-bit
+            # inputs) from this text rendering.
+            m = re.match(r"([01xzXZ])(\S+)", line)
+            if m:
+                val, sym = m.group(1), m.group(2)
+                name = id_to_name.get(sym, sym)
+                values[name] = val
+                pending = True
+    flush()
 
     if not samples:
         return "VCD parsed but no value changes found."
 
     out = ["=== WAVEFORM (text) ===", f"Signals: {', '.join(sorted(set(id_to_name.values())))}", ""]
-    last_t = -1
     shown = 0
     for t, snap in samples:
-        if t == last_t:
-            continue
-        last_t = t
         parts = [f"t={t}ns"] + [f"{k}={v}" for k, v in sorted(snap.items())]
         out.append("  ".join(parts))
         shown += 1

@@ -34,6 +34,7 @@ from rtl_verify import formal_log  # noqa: E402
 from rtl_verify import coverage_closure  # noqa: E402
 from rtl_verify.coverage_closure import run_closure_loop  # noqa: E402
 from rtl_verify.spec_traceability import build_traceability_matrix  # noqa: E402
+from rtl_verify.failure_triage import answer_question  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 STATIC = ROOT / "static"
@@ -681,3 +682,39 @@ async def traceability(
     except Exception as e:  # noqa: BLE001 — surface any LLM failure, don't 500
         return {"error": f"Traceability build failed: {e}"}
     return result
+
+
+@app.post("/api/chat")
+async def chat(
+    work_dir: str = Form(...),
+    question: str = Form(...),
+    history: str = Form("[]"),
+):
+    """Phase 5: failure triage / waveform chat. Scoped to one run's
+    work_dir — packages that run's RTL, report, and waveform transitions
+    as context and answers a question about it, citing specific RTL
+    lines and/or signal/timestamp pairs rather than answering vaguely.
+
+    `history` is a JSON list of prior {"question","answer"} pairs from
+    this same run's chat, for follow-up questions.
+    """
+    base = Path(work_dir)
+    if not base.is_dir():
+        return {"error": "work_dir not found — this run's files may have been cleaned up"}
+    if not question.strip():
+        return {"error": "Ask a question"}
+
+    try:
+        turns = json.loads(history) if history.strip() else []
+    except json.JSONDecodeError:
+        turns = []
+    if not isinstance(turns, list):
+        turns = []
+
+    try:
+        answer = answer_question(base, question, history=turns)
+    except LLMNotConfigured as e:
+        return {"error": str(e)}
+    except Exception as e:  # noqa: BLE001 — surface any LLM failure, don't 500
+        return {"error": f"Chat failed: {e}"}
+    return {"answer": answer}
