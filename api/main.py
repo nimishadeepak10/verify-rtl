@@ -209,6 +209,8 @@ async def formal_check(
     rtl_text: str = Form(""),
     top_module: str = Form(""),
     properties: str = Form("[]"),
+    timeout_sec: int = Form(300),
+    depth_override: int = Form(0),
 ):
     """Check one or more hand-written boolean properties with SymbiYosys.
 
@@ -226,6 +228,21 @@ async def formal_check(
     confirmed by testing that mode="prove" silently swallows a cover
     instead of checking reachability), so their verdict label is
     REACHED/UNREACHED, not PROVEN/FALSIFIED.
+
+    `timeout_sec` is the wall-clock budget handed to sby itself (not just
+    an external kill) — default 300s, override for harder proofs (a
+    multiplier, a cache tag array) that legitimately need more time.
+    `depth_override` (0 = use the heuristic in recommended_formal_config)
+    lets a user force a specific BMC/cover depth when the auto heuristic
+    isn't enough for a given design.
+
+    A verdict of ERROR means the tool/expression itself broke — worth
+    fixing. TIMEOUT/UNKNOWN mean the solver genuinely could not decide
+    the property in the time/resources given — this is a real, expected
+    outcome for hard designs, not a bug in this pipeline, and must never
+    be shown as if it were PROVEN or FALSIFIED (confirmed against sby's
+    own source that PDR specifically can report UNKNOWN when it can't
+    converge — a real, reachable case, not hypothetical).
 
     Independent of /api/verify — this never touches pipeline.py or the
     simulator backends, only the formal backend from Phase 1.
@@ -286,15 +303,20 @@ async def formal_check(
         else:
             target_props.append((i, entry))
 
-    # Tool-error statuses worth retrying — never "FAIL", which is a
-    # legitimate proof/cover-reachability result (falsification or
-    # unreached-cover), not a failure of the tool itself.
-    _RETRYABLE_STATUSES = {"ERROR", "TIMEOUT", None}
+    # Only ERROR (a genuine tool/compile problem — bad syntax, missing
+    # signal) is worth an LLM-driven expression fix. TIMEOUT/UNKNOWN mean
+    # the solver ran without incident but couldn't reach a verdict in the
+    # time/resources it had — rewriting the expression's syntax can't fix
+    # that, so retrying would just burn another run for nothing.
+    _ERROR_STATUSES = {"ERROR", None}
+    _INCONCLUSIVE_STATUSES = {"TIMEOUT", "UNKNOWN", "CANCELLED"}
     MAX_RETRIES = 1
 
     def _run_once(work: Path, expr_to_run: str):
         wrapper_sv = generate_formal_wrapper(mod, assume_props + [(name, expr_to_run, kind)])
         config = recommended_formal_config(mod, kind=kind)
+        if depth_override > 0 and config["mode"] != "prove":
+            config = {**config, "depth": depth_override}
         wrapper_path = work / "wrapper.sv"
         work.mkdir(parents=True, exist_ok=True)
         wrapper_path.write_text(wrapper_sv, encoding="utf-8")
@@ -302,6 +324,7 @@ async def formal_check(
             rtl_path, wrapper_path, work,
             top=f"{mod.name}_formal_top",
             depth=config["depth"], mode=config["mode"], engine=config["engine"],
+            timeout_sec=timeout_sec,
         )
         return result, config
 
@@ -321,12 +344,15 @@ async def formal_check(
             results.append({**entry, "success": False, "error": str(e)})
             continue
 
-        # A tool-level ERROR/TIMEOUT (bad syntax, not a real proof result)
-        # is worth one automatic fix attempt — feed the concrete error back
-        # to the same conversion model and ask it to correct the
-        # expression, rather than surfacing a raw compiler error to the
-        # user for something the tool could plausibly self-correct.
-        while result.status in _RETRYABLE_STATUSES and attempt < MAX_RETRIES:
+        # A tool-level ERROR (bad syntax, not a real proof result) is worth
+        # one automatic fix attempt — feed the concrete error back to the
+        # same conversion model and ask it to correct the expression,
+        # rather than surfacing a raw compiler error to the user for
+        # something the tool could plausibly self-correct. TIMEOUT/UNKNOWN
+        # are deliberately excluded — no syntax fix resolves "the solver
+        # didn't finish in time" or "the engine gave up," so retrying would
+        # just spend another full run for nothing.
+        while result.status in _ERROR_STATUSES and attempt < MAX_RETRIES:
             attempt += 1
             try:
                 fix = convert_to_sva_retry(
@@ -358,12 +384,19 @@ async def formal_check(
             if "error" in waveform_json_data:
                 waveform_json_data = None
 
-        if kind == "cover":
+        # ERROR/TIMEOUT/UNKNOWN/CANCELLED must never collapse into
+        # PROVEN/FALSIFIED/REACHED/UNREACHED — those are legitimate proof
+        # results; these mean the solver didn't produce one at all, for
+        # three different reasons a user needs to tell apart (a bug in the
+        # expression vs. ran out of time vs. the engine itself gave up).
+        if result.status in _ERROR_STATUSES:
+            verdict = "ERROR"
+        elif result.status in _INCONCLUSIVE_STATUSES:
+            verdict = result.status
+        elif kind == "cover":
             verdict = "REACHED" if result.success else "UNREACHED"
         else:
             verdict = "PROVEN" if result.success else "FALSIFIED"
-        if result.status in _RETRYABLE_STATUSES:
-            verdict = "ERROR"
 
         results.append({
             **entry,
@@ -398,9 +431,14 @@ async def formal_check(
                 "reachability of this assert's trigger is unconfirmed."
             )
         elif cover.get("verdict") != "REACHED":
+            # Report the cover's actual verdict rather than assuming
+            # UNREACHED — it may instead be TIMEOUT/UNKNOWN/ERROR, which
+            # means "we don't know if this is reachable," a different and
+            # weaker claim than "we know it's never reachable."
             r["vacuity_warning"] = (
-                f"Paired cover \"{r['paired_cover']}\" is UNREACHED — this assert may be "
-                "vacuously true (its trigger condition never occurs)."
+                f"Paired cover \"{r['paired_cover']}\" is {cover.get('verdict', 'not resolved')} "
+                "(not REACHED) — this assert's trigger condition is not confirmed reachable, so "
+                "it may be vacuously true."
             )
 
     verdict_counts: dict[str, int] = {}

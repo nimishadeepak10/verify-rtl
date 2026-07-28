@@ -126,6 +126,41 @@ endmodule
 """
 
 
+_MAX_COVER_DEPTH = 200
+
+
+def _sequential_cover_depth(module: RtlModule) -> int:
+    """Best-effort depth for a sequential cover run.
+
+    The previous version of this heuristic only looked at FSM state count
+    (``len(module.states) * 4``), which is a reasonable proxy for a small
+    control FSM but not for designs whose relevant reachability depth is
+    driven by a counter or pointer width instead — a FIFO's write/read
+    pointers wrapping around, or an up-counter reaching a comparison
+    value, can need far more cycles than a 2-3 state FSM would suggest,
+    and the old heuristic would silently under-allocate depth for those,
+    making "UNREACHED" mean "didn't look far enough" rather than "really
+    can't happen." This still can't know which port is actually a
+    state-holding counter vs. an unrelated wide data bus, so it's a rough
+    proxy, not a structural guarantee — capped so a design with one wide,
+    reachability-irrelevant port doesn't blow the depth up pointlessly.
+
+    Confirmed by direct testing this is a real but incomplete improvement,
+    not a fix: on an 8-bit free-running counter, this heuristic yields
+    depth=32, which correctly beats the old flat depth=20, but "count==30"
+    still came back UNREACHED at 32 and only REACHED once depth was raised
+    to 40 by hand. Reaching a specific late numeric value in an N-bit
+    counter can need depth approaching that value itself, not just a small
+    multiple of N — this heuristic narrows that gap, it doesn't close it.
+    The caller-facing depth override exists specifically for cases like
+    this one.
+    """
+    from_states = len(module.states) * 4 if module.states else 0
+    widest_port = max((p.width for p in module.ports), default=1)
+    from_width = widest_port * 4
+    return min(_MAX_COVER_DEPTH, max(10, from_states, from_width))
+
+
 def recommended_formal_config(module: RtlModule, kind: str = "assert") -> dict:
     """Pick a SymbiYosys mode/engine/depth from what the analyzer already knows.
 
@@ -150,16 +185,16 @@ def recommended_formal_config(module: RtlModule, kind: str = "assert") -> dict:
     `cover` statement into the proof as a constraint instead of actually
     checking reachability ("the last N outputs are interpreted as
     constraints" in the ABC log), so a cover only means something under
-    `mode="cover"`. Depth uses the same FSM-state-derived heuristic as the
-    sequential assert case, since reachability can need more steps than a
-    shallow default; combinational cover still only needs depth=1, for the
-    same single-step-is-exhaustive reason asserts do.
+    `mode="cover"`. Depth for sequential designs uses `_sequential_cover_depth`
+    (FSM state count AND port width, whichever wants more), since a shallow
+    default can silently make "UNREACHED" mean "didn't look far enough";
+    combinational cover still only needs depth=1, for the same
+    single-step-is-exhaustive reason asserts do.
     """
     if kind == "cover":
         if not module.is_sequential:
             return {"mode": "cover", "engine": "smtbmc", "depth": 1}
-        depth = max(10, len(module.states) * 4) if module.states else 20
-        return {"mode": "cover", "engine": "smtbmc", "depth": depth}
+        return {"mode": "cover", "engine": "smtbmc", "depth": _sequential_cover_depth(module)}
     if not module.is_sequential:
         return {"mode": "bmc", "engine": "smtbmc", "depth": 1}
     return {"mode": "prove", "engine": "abc pdr", "depth": 0}

@@ -36,6 +36,21 @@ properties held for the configured depth) — never on error/timeout/unknown.
 ``BackendResult.vcd_path`` is the counterexample trace on FAIL, and None on
 PASS (formal proofs don't produce a trace when nothing failed), which maps
 directly onto the existing waveform viewer.
+
+``BackendResult.status`` carries sby's own status word verbatim — confirmed
+by reading sby's actual source (share/yosys/python3/sby_core.py), the full
+vocabulary is ``PASS``, ``FAIL``, ``ERROR``, ``TIMEOUT``, ``UNKNOWN``, and
+``CANCELLED``. The last three are easy to conflate but mean different
+things and callers should not collapse them into one "failed" bucket:
+``ERROR`` is a genuine tool/compile problem (worth retrying with a fixed
+expression); ``TIMEOUT`` means the configured wall-clock budget ran out
+before the solver decided anything; ``UNKNOWN`` means the engine itself
+gave up without a proof or a counterexample (confirmed in
+sby_engine_abc.py — this is a real, reachable outcome for PDR specifically,
+not a hypothetical). Neither TIMEOUT nor UNKNOWN is a syntax problem an LLM
+retry could fix, and neither is a legitimate FALSIFIED/UNREACHED verdict —
+they mean "we don't know," which is a different, honest thing to tell the
+user than "this is false."
 """
 
 from __future__ import annotations
@@ -137,6 +152,7 @@ class SymbiYosysBackend(SimulatorBackend):
         depth: int = 20,
         mode: str = "bmc",
         engine: str = "smtbmc",
+        timeout_sec: int = 300,
     ) -> BackendResult:
         t0 = time.perf_counter()
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -179,6 +195,13 @@ class SymbiYosysBackend(SimulatorBackend):
         options_lines = [f"mode {mode}"]
         if mode != "prove":
             options_lines.append(f"depth {depth}")
+        # sby's own [options] "timeout" (confirmed in sby_core.py: parsed via
+        # handle_int_option("timeout", None)) lets it stop gracefully and
+        # write a proper "TIMEOUT" status + partial log — versus killing the
+        # whole process from outside, which can leave no status file at all.
+        # The outer subprocess timeout below stays as a safety net only, in
+        # case sby itself doesn't respect its own limit.
+        options_lines.append(f"timeout {timeout_sec}")
 
         sby_config = (
             f"[options]\n" + "\n".join(options_lines) + "\n"
@@ -211,12 +234,16 @@ class SymbiYosysBackend(SimulatorBackend):
                 text=True,
                 cwd=str(work_abs),
                 env=env,
-                timeout=300,
+                timeout=timeout_sec + 30,
             )
             log_lines.append(r.stdout or "")
             log_lines.append(r.stderr or "")
         except subprocess.TimeoutExpired:
-            log_lines.append("SymbiYosys timed out.")
+            # Only reachable if sby ignored its own [options] timeout above
+            # (e.g. hung inside a subprocess it doesn't poll) — the normal
+            # path is sby noticing its own timeout first and writing status
+            # "TIMEOUT" itself, which the status-file read below picks up.
+            log_lines.append("SymbiYosys timed out (outer safety-net kill — sby did not exit on its own timeout).")
             return BackendResult(
                 success=False,
                 log="\n".join(log_lines),

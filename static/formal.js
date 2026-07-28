@@ -102,9 +102,15 @@
             inputs a simulation happened to try.</p>
           <div id="formalPropRows"></div>
           <button type="button" class="btn btn-ghost" id="formalAddProp">+ Add property by hand</button>
-          <div style="margin-top:var(--s-4)">
+          <div style="display:flex; gap:var(--s-3); align-items:center; flex-wrap:wrap; margin-top:var(--s-4)">
+            <label class="text-dim mono" style="font-size:12px">Timeout (s)
+              <input type="number" id="formalTimeout" class="input-mono" value="300" min="10" max="7200" style="width:80px; margin-left:6px">
+            </label>
+            <label class="text-dim mono" style="font-size:12px">Depth override (blank = auto)
+              <input type="number" id="formalDepthOverride" class="input-mono" placeholder="auto" min="1" style="width:70px; margin-left:6px">
+            </label>
             <button type="button" class="btn btn-primary" id="formalRunBtn">Run Formal Check</button>
-            <span id="formalStatus" class="text-dim mono" style="margin-left:var(--s-3)"></span>
+            <span id="formalStatus" class="text-dim mono"></span>
           </div>
         </div>
       </div>
@@ -522,10 +528,15 @@
     status.textContent = "Running SymbiYosys…";
     resultsEl.innerHTML = "";
 
+    const timeoutSec = parseInt($("#formalTimeout").value, 10) || 300;
+    const depthOverride = parseInt($("#formalDepthOverride").value, 10) || 0;
+
     const fd = new FormData();
     fd.append("rtl_text", dutRtl);
     fd.append("top_module", dutTopModule.trim());
     fd.append("properties", JSON.stringify(props));
+    fd.append("timeout_sec", String(timeoutSec));
+    fd.append("depth_override", String(depthOverride));
 
     let data;
     try {
@@ -568,8 +579,9 @@
         .map((p, i) => {
           const ok = p.success;
           const isError = p.error || p.verdict === "ERROR";
-          const badgeCls = isError ? "error" : ok ? "pass" : "fail";
-          const ledCls = isError ? "led-red" : ok ? "led-green" : "led-red";
+          const isInconclusive = ["TIMEOUT", "UNKNOWN", "CANCELLED"].includes(p.verdict);
+          const badgeCls = isError ? "error" : isInconclusive ? "unverified" : ok ? "pass" : "fail";
+          const ledCls = isError ? "led-red" : isInconclusive ? "led-amber" : ok ? "led-green" : "led-red";
           const verdict = p.error ? "ERROR" : p.verdict;
           return `
         <div class="panel" style="margin-top:var(--s-4)">
@@ -594,6 +606,24 @@
                 ? `<div class="callout callout-error" style="margin-top:var(--s-2)">
                      <span class="callout__prefix">TOOL ERROR</span>
                      <p class="callout-unverified__body">This did not compile against the real solver${p.retried ? ", even after an automatic fix attempt" : ""} — see the log for the raw error, not a proof result.</p>
+                   </div>`
+                : ""
+            }
+            ${
+              verdict === "TIMEOUT"
+                ? `<div class="callout callout-warn" style="margin-top:var(--s-2)">
+                     <span class="callout__prefix">TIMEOUT</span>
+                     <p class="callout-unverified__body">The solver did not reach a verdict within the configured timeout — this is not a proof of anything either way. Try raising the timeout, or a different depth/engine, for designs this size.</p>
+                   </div>`
+                : verdict === "UNKNOWN"
+                ? `<div class="callout callout-warn" style="margin-top:var(--s-2)">
+                     <span class="callout__prefix">UNKNOWN</span>
+                     <p class="callout-unverified__body">The engine ran to completion but could not find a proof or a counterexample — a real, expected outcome for hard designs, not a tool error. Try a different depth or engine rather than trusting this as PROVEN or FALSIFIED.</p>
+                   </div>`
+                : verdict === "CANCELLED"
+                ? `<div class="callout callout-warn" style="margin-top:var(--s-2)">
+                     <span class="callout__prefix">CANCELLED</span>
+                     <p class="callout-unverified__body">This run was cancelled before producing a verdict.</p>
                    </div>`
                 : ""
             }
