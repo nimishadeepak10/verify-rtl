@@ -64,6 +64,14 @@ def complete_structured(
     Raises LLMNotConfigured if no key is set; raises json.JSONDecodeError only
     if the API itself returns something that fails to parse (shouldn't happen
     under a schema, but never trust that blindly).
+
+    Thinking is explicitly disabled: on a real FIFO prompt this call hit
+    stop_reason="max_tokens" with the entire budget spent on an (unrequested)
+    thinking block and zero text emitted, since Sonnet 5 runs adaptive
+    thinking by default and has no separate budget_tokens knob to cap it
+    (removed API-wide on this model). Every call site here is a bounded,
+    schema-constrained extraction task that gains nothing from reasoning
+    tokens, so disabling thinking is strictly better than budgeting for it.
     """
     _require_configured()
     import json
@@ -76,7 +84,16 @@ def complete_structured(
         max_tokens=max_tokens,
         system=system,
         messages=[{"role": "user", "content": user}],
+        thinking={"type": "disabled"},
         output_config={"format": {"type": "json_schema", "schema": schema}},
     )
-    text = next(block.text for block in resp.content if getattr(block, "type", "") == "text")
+    text = next(
+        (block.text for block in resp.content if getattr(block, "type", "") == "text"),
+        None,
+    )
+    if text is None:
+        raise RuntimeError(
+            f"complete_structured got no text block back (stop_reason={resp.stop_reason!r}, "
+            f"usage={resp.usage!r}) — the model produced no structured output for this prompt."
+        )
     return json.loads(text)
