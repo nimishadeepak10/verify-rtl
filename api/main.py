@@ -26,6 +26,7 @@ from rtl_verify.rtl_features import dut_source_extension  # noqa: E402
 from rtl_verify.formal_props import (  # noqa: E402
     generate_formal_wrapper,
     recommended_formal_config,
+    recommended_engine_chain,
 )
 from rtl_verify.property_suggester import suggest_properties  # noqa: E402
 from rtl_verify.property_to_sva import convert_to_sva, convert_to_sva_retry  # noqa: E402
@@ -312,21 +313,45 @@ async def formal_check(
     _INCONCLUSIVE_STATUSES = {"TIMEOUT", "UNKNOWN", "CANCELLED"}
     MAX_RETRIES = 1
 
-    def _run_once(work: Path, expr_to_run: str):
+    def _run_chain(work: Path, expr_to_run: str, name: str, kind: str):
+        """Walk recommended_engine_chain(), stopping at the first PASS/FAIL.
+
+        Every non-definitive status (ERROR/TIMEOUT/UNKNOWN/CANCELLED) is
+        treated as a reason to try the next engine, not just the "expected"
+        inconclusive ones — a solver-specific ERROR on attempt 1 is often
+        just that, solver-specific, and a different engine may run it fine.
+        Only once the whole chain is exhausted does the final attempt's
+        status get used to decide anything (e.g. whether an LLM syntax-fix
+        retry is worth it).
+
+        timeout_sec is split evenly across the chain's rungs rather than
+        given in full to each attempt — otherwise the documented "wall-clock
+        budget handed to sby" would silently balloon to N times what the
+        caller asked for. Each rung still gets at least 30s.
+        """
         wrapper_sv = generate_formal_wrapper(mod, assume_props + [(name, expr_to_run, kind)])
-        config = recommended_formal_config(mod, kind=kind)
-        if depth_override > 0 and config["mode"] != "prove":
-            config = {**config, "depth": depth_override}
-        wrapper_path = work / "wrapper.sv"
+        chain = recommended_engine_chain(mod, kind=kind, depth_override=depth_override)
+        per_attempt_timeout = max(30, timeout_sec // len(chain))
         work.mkdir(parents=True, exist_ok=True)
+        wrapper_path = work / "wrapper.sv"
         wrapper_path.write_text(wrapper_sv, encoding="utf-8")
-        result = engine.run(
-            rtl_path, wrapper_path, work,
-            top=f"{mod.name}_formal_top",
-            depth=config["depth"], mode=config["mode"], engine=config["engine"],
-            timeout_sec=timeout_sec,
-        )
-        return result, config
+
+        attempts = []
+        result = None
+        config = chain[0]
+        for i, config in enumerate(chain):
+            attempt_dir = work / f"engine_{i}"
+            result = engine.run(
+                rtl_path, wrapper_path, attempt_dir,
+                top=f"{mod.name}_formal_top",
+                depth=config["depth"], mode=config["mode"], engine=config["engine"],
+                timeout_sec=per_attempt_timeout,
+            )
+            attempts.append({"label": config["label"], "mode": config["mode"],
+                              "engine": config["engine"], "status": result.status})
+            if result.status in ("PASS", "FAIL"):
+                break
+        return result, config, attempts
 
     results = []
     for i, entry in target_props:
@@ -338,8 +363,10 @@ async def formal_check(
         current_expr = expr
         attempt = 0
         retry_note = None
+        all_attempts = []
         try:
-            result, config = _run_once(base / f"prop_{i}", current_expr)
+            result, config, chain_attempts = _run_chain(base / f"prop_{i}", current_expr, name, kind)
+            all_attempts.extend(chain_attempts)
         except ValueError as e:
             results.append({**entry, "success": False, "error": str(e)})
             continue
@@ -372,7 +399,10 @@ async def formal_check(
                 break
             current_expr = new_expr
             try:
-                result, config = _run_once(base / f"prop_{i}_retry{attempt}", current_expr)
+                result, config, chain_attempts = _run_chain(
+                    base / f"prop_{i}_retry{attempt}", current_expr, name, kind
+                )
+                all_attempts.extend(chain_attempts)
             except ValueError as e:
                 retry_note = f"Retry {attempt} failed to build a wrapper: {e}"
                 break
@@ -404,6 +434,8 @@ async def formal_check(
             "success": result.success,
             "verdict": verdict,
             "config": config,
+            "engine_label": config.get("label", config.get("engine", "")),
+            "attempts": all_attempts,
             "log": result.log[-4000:],
             "has_trace": result.vcd_path is not None,
             "waveform_json": waveform_json_data,

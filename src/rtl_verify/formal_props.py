@@ -198,3 +198,67 @@ def recommended_formal_config(module: RtlModule, kind: str = "assert") -> dict:
     if not module.is_sequential:
         return {"mode": "bmc", "engine": "smtbmc", "depth": 1}
     return {"mode": "prove", "engine": "abc pdr", "depth": 0}
+
+
+def recommended_engine_chain(module: RtlModule, kind: str = "assert", depth_override: int = 0) -> list[dict]:
+    """Ordered list of {label, mode, engine, depth} attempts for one property.
+
+    ``recommended_formal_config`` above picks a single engine; this picks a
+    *chain* to fall back through when one engine can't produce a definitive
+    PASS/FAIL — genuine engine diversity, not just a different config knob.
+    The first entry is always identical to ``recommended_formal_config``'s
+    choice, so existing single-attempt behavior is a strict prefix of this.
+
+    For sequential assert/assume (mode="prove"), PDR and k-induction are
+    different algorithms with different failure modes, confirmed by reading
+    sby's own engine source (sby_engine_smtbmc.py / sby_engine_abc.py):
+    PDR (abc pdr) searches for an inductive invariant directly and can
+    report UNKNOWN when it doesn't converge; k-induction (plain "smtbmc",
+    no solver name = yices) instead proves a base case plus an induction
+    step, and can succeed on designs where PDR gives up (or vice versa).
+    Confirmed by reading sby_engine_smtbmc.py's exit callback: an
+    induction-step failure alone (base case still holding) leaves the
+    overall status unresolved rather than reporting a false FAIL, so this
+    chain only advancing past non-PASS/FAIL statuses is sound — a FAIL from
+    any engine here is a genuine counterexample, never a k-induction
+    artifact. The chain also varies the underlying SMT solver (yices, then
+    z3) since a solver-specific ERROR on one attempt is often just that —
+    solver-specific, not a real problem with the property.
+
+    For cover/BMC (bounded, same depth across the chain), the algorithm
+    doesn't change between attempts — only the solver does — since a
+    reachability search at a fixed bound should agree across solvers that
+    implement the same SMT semantics; the only thing a different solver
+    can recover from here is an ERROR/TIMEOUT specific to the first one.
+
+    Combinational designs get a single-entry chain: a single BMC/cover step
+    is already exhaustive (see recommended_formal_config's docstring), so
+    there's no different algorithm to fall back to — only decline extra
+    solver attempts to save time, since disagreement there would indicate a
+    bug in this tool, not a legitimately hard property.
+
+    Every (mode, engine) string here was confirmed to actually run on real
+    sby/yosys in this environment (see the Stage 3 probe against
+    examples/sync_fifo.v) — none of this is guessed from sby's --help text.
+    """
+    if kind == "cover":
+        depth = depth_override if depth_override > 0 else (
+            1 if not module.is_sequential else _sequential_cover_depth(module)
+        )
+        if not module.is_sequential:
+            return [{"label": "cover (yices)", "mode": "cover", "engine": "smtbmc", "depth": depth}]
+        return [
+            {"label": "cover (yices)", "mode": "cover", "engine": "smtbmc", "depth": depth},
+            {"label": "cover (z3)", "mode": "cover", "engine": "smtbmc z3", "depth": depth},
+            {"label": "cover (boolector)", "mode": "cover", "engine": "smtbmc boolector", "depth": depth},
+        ]
+
+    if not module.is_sequential:
+        depth = depth_override if depth_override > 0 else 1
+        return [{"label": "BMC (yices)", "mode": "bmc", "engine": "smtbmc", "depth": depth}]
+
+    return [
+        {"label": "PDR", "mode": "prove", "engine": "abc pdr", "depth": 0},
+        {"label": "k-induction (yices)", "mode": "prove", "engine": "smtbmc", "depth": 0},
+        {"label": "k-induction (z3)", "mode": "prove", "engine": "smtbmc z3", "depth": 0},
+    ]

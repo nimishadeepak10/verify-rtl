@@ -592,6 +592,17 @@
           </div>
           <div class="panel__body">
             <pre class="code-block" style="max-height:80px">${App.escapeHtml(p.expr)}</pre>
+            ${
+              p.engine_label
+                ? `<p class="text-dim mono" style="font-size:11px; margin-top:var(--s-2)">
+                     engine: ${App.escapeHtml(p.engine_label)}${
+                       p.attempts && p.attempts.length > 1
+                         ? ` — tried ${p.attempts.map((a) => `${App.escapeHtml(a.label)} (${a.status})`).join(" → ")}`
+                         : ""
+                     }
+                   </p>`
+                : ""
+            }
             ${p.error ? `<p class="callout-unverified__body">${App.escapeHtml(p.error)}</p>` : ""}
             ${
               p.retry_note
