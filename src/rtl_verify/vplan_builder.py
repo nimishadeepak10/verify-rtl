@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .analyzer import Port, PortDirection, RtlModule, _strip_comments
 from .backends.registry import ALL_BACKENDS, auto_select, get_backend
-from .combinational_model import can_evaluate_combinational, expected_outputs
+from .combinational_model import can_self_check, expected_outputs
 from .vplan import (
     CategoryStatus,
     CoverageGoal,
@@ -50,7 +50,7 @@ def build_vplan(
     self_check = (
         not module.is_sequential
         and has_io
-        and can_evaluate_combinational(rtl, module)
+        and can_self_check(rtl, module)
     )
 
     categories: List[TestCategory] = []
@@ -150,7 +150,7 @@ def _expected(
 ) -> Optional[Dict[str, str]]:
     if not module.outputs:
         return None
-    if rtl and not module.is_sequential and can_evaluate_combinational(rtl, module):
+    if rtl and not module.is_sequential and can_self_check(rtl, module):
         try:
             golden = expected_outputs(rtl, module, inputs)
             return {

@@ -1,4 +1,4 @@
-"""Scan RTL for constructs the golden model cannot interpret."""
+"""Scan RTL for constructs the golden model cannot interpret (simulation may still run)."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ class UnsupportedConstruct:
 
     def message(self) -> str:
         if self.detail:
-            return f"unsupported construct — {self.name} at line {self.line_no} ({self.detail})"
-        return f"unsupported construct — {self.name} at line {self.line_no}"
+            return f"golden model limitation — {self.name} at line {self.line_no} ({self.detail})"
+        return f"golden model limitation — {self.name} at line {self.line_no}"
 
 
 @dataclass
@@ -31,11 +31,12 @@ class RtlScanResult:
 
 
 def scan_rtl_for_unsupported(rtl: str) -> RtlScanResult:
-    """Record all unsupported constructs with line numbers (continue scanning)."""
+    """Constructs that block automatic expected-value checking (not HDL simulation)."""
     clean = _strip_comments(rtl)
     lines = clean.splitlines()
     found: List[UnsupportedConstruct] = []
 
+    # Patterns that prevent Python golden-model evaluation — simulators handle these fine.
     patterns = [
         (r"\bfor\s*\(", "for loop"),
         (r"\bwhile\s*\(", "while loop"),
@@ -43,17 +44,10 @@ def scan_rtl_for_unsupported(rtl: str) -> RtlScanResult:
         (r"\bfunction\s+", "function definition"),
         (r"\btask\s+", "task definition"),
         (r"\bgenerate\b", "generate block"),
-        (r"\binitial\b", "initial block"),
-        (r"\balways_ff\b", "always_ff block"),
-        (r"\balways_latch\b", "always_latch block"),
         (r"\binterface\b", "interface"),
         (r"\bpackage\b", "package"),
         (r"\bimport\s+", "import statement"),
-        (r"\btypedef\s+", "typedef"),
-        (r"\bstruct\b", "struct"),
-        (r"\benum\b", "enum"),
-        (r"\$display\s*\(", "system task $display"),
-        (r"\$finish\s*\(", "system task $finish"),
+        (r"\bdpi-c\b", "DPI import"),
     ]
 
     for line_no, raw in enumerate(lines, start=1):
@@ -71,8 +65,7 @@ def scan_rtl_for_unsupported(rtl: str) -> RtlScanResult:
 def format_unsupported_report(items: List[UnsupportedConstruct]) -> str:
     if not items:
         return ""
-    lines = ["Reason: unsupported construct —"]
+    lines = ["Note: automatic checking unavailable (simulation still runs):"]
     for u in items:
-        lines.append(f"        {u.message().replace('unsupported construct — ', '')}")
-    lines.append("Workaround: simplify the RTL or contact tool author to add support.")
+        lines.append(f"        {u.message().replace('golden model limitation — ', '')}")
     return "\n".join(lines)

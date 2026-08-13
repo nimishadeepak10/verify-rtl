@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 _CLOCK_NAMES = frozenset({"clk", "clock", "ck"})
 _RESET_ACTIVE_LOW = frozenset({"rst_n", "resetn", "reset_n", "nrst"})
@@ -25,20 +26,32 @@ class Port:
     direction: PortDirection
     msb: int = 0
     lsb: int = 0
+    extra_ranges: str = ""  # outer packed/unpacked dims, e.g. "[7:0]" before inner [3:0]
 
     @property
     def width(self) -> int:
-        return abs(self.msb - self.lsb) + 1
+        inner = abs(self.msb - self.lsb) + 1
+        if not self.extra_ranges:
+            return inner
+        total = inner
+        for m in re.finditer(r"\[(\d+)\s*:\s*(\d+)\]", self.extra_ranges):
+            total *= abs(int(m.group(1)) - int(m.group(2))) + 1
+        return total
 
     @property
     def is_scalar(self) -> bool:
-        return self.width == 1
+        return not self.extra_ranges and self.msb == self.lsb == 0
+
+    @property
+    def is_unpacked_array(self) -> bool:
+        return bool(self.extra_ranges)
 
     def range_str(self) -> str:
-        if self.is_scalar:
-            return ""
-        hi, lo = max(self.msb, self.lsb), min(self.msb, self.lsb)
-        return f"[{hi}:{lo}]"
+        inner = ""
+        if not self.is_scalar or self.extra_ranges:
+            hi, lo = max(self.msb, self.lsb), min(self.msb, self.lsb)
+            inner = f"[{hi}:{lo}]"
+        return f"{self.extra_ranges}{inner}"
 
 
 @dataclass
@@ -81,6 +94,118 @@ def _parse_width(msb: str, lsb: str) -> tuple[int, int]:
     return int(msb.strip()), int(lsb.strip())
 
 
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    if open_idx >= len(text) or text[open_idx] != "(":
+        raise ValueError("expected '('")
+    depth = 0
+    for i in range(open_idx, len(text)):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    raise ValueError("unbalanced parentheses")
+
+
+def _skip_ws(text: str, idx: int) -> int:
+    while idx < len(text) and text[idx].isspace():
+        idx += 1
+    return idx
+
+
+def _parse_parameter_defaults(param_text: str) -> Dict[str, int]:
+    """Best-effort evaluation of parameter defaults (supports int and $clog2)."""
+    params: Dict[str, int] = {}
+    for m in re.finditer(r"parameter\s+(?:\w+\s+)?(\w+)\s*=", param_text, re.IGNORECASE):
+        name = m.group(1)
+        val_start = m.end()
+        val_text = _read_param_value(param_text, val_start)
+        val = _eval_param_expr(val_text.strip(), params)
+        if val is not None:
+            params[name] = val
+    return params
+
+
+def _read_param_value(text: str, start: int) -> str:
+    """Read a parameter RHS up to the next top-level comma or closing paren."""
+    i = start
+    depth = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            break
+        i += 1
+    return text[start:i].strip()
+
+
+def _eval_param_expr(expr: str, params: Dict[str, int]) -> Optional[int]:
+    expr = expr.strip()
+    if not expr:
+        return None
+    m = re.fullmatch(r"\$clog2\s*\(\s*(\w+)\s*\)", expr)
+    if m:
+        base = params.get(m.group(1))
+        if base is None or base <= 0:
+            return None
+        return int(math.ceil(math.log2(base)))
+    if re.fullmatch(r"-?\d+", expr):
+        return int(expr)
+    if expr in params:
+        return params[expr]
+    m = re.fullmatch(r"(\w+)\s*-\s*(\d+)", expr)
+    if m and m.group(1) in params:
+        return params[m.group(1)] - int(m.group(2))
+    m = re.fullmatch(r"(\w+)\s*\+\s*(\d+)", expr)
+    if m and m.group(1) in params:
+        return params[m.group(1)] + int(m.group(2))
+    return None
+
+
+def _eval_range_bounds(inner: str, params: Dict[str, int]) -> Optional[tuple[int, int]]:
+    inner = inner.strip()
+    m = re.fullmatch(r"(\d+)\s*:\s*(\d+)", inner)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.fullmatch(r"(\w+)\s*-\s*(\d+)\s*:\s*(\d+)", inner)
+    if m and m.group(1) in params:
+        hi = params[m.group(1)] - int(m.group(2))
+        lo = int(m.group(3))
+        return hi, lo
+    m = re.fullmatch(r"(\w+)\s*-\s*(\d+)\s*:\s*(\w+)\s*-\s*(\d+)", inner)
+    if m and m.group(1) in params and m.group(3) in params:
+        hi = params[m.group(1)] - int(m.group(2))
+        lo = params[m.group(3)] - int(m.group(4))
+        return hi, lo
+    return None
+
+
+def _extract_module_interface(
+    clean: str, target_name: str
+) -> tuple[str, Dict[str, int]]:
+    """Return (port-list text, parameter defaults) for a module header."""
+    m = re.search(rf"\bmodule\s+{re.escape(target_name)}\b", clean)
+    if not m:
+        return "", {}
+    idx = _skip_ws(clean, m.end())
+    params: Dict[str, int] = {}
+    if idx < len(clean) and clean[idx] == "#":
+        hash_end = _find_matching_paren(clean, idx + 1)
+        params = _parse_parameter_defaults(clean[idx + 1 : hash_end])
+        idx = _skip_ws(clean, hash_end + 1)
+    if idx >= len(clean) or clean[idx] != "(":
+        return _extract_header_ports(clean, target_name), params
+    port_end = _find_matching_paren(clean, idx)
+    return clean[idx + 1 : port_end], params
+
+
 def _strip_comments(rtl: str) -> str:
     rtl = re.sub(r"//.*?$", "", rtl, flags=re.MULTILINE)
     rtl = re.sub(r"/\*.*?\*/", "", rtl, flags=re.DOTALL)
@@ -98,26 +223,22 @@ def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
     if not target_name:
         target_name = modules[0].group(1)
 
-    mod_match = re.search(
-        rf"\bmodule\s+{re.escape(target_name)}\s*(?:#\s*\([^)]*\)\s*)?\((.*?)\)\s*;",
-        clean,
-        re.DOTALL,
-    )
-    if not mod_match:
-        mod_match = re.search(
-            rf"\bmodule\s+{re.escape(target_name)}\b(.*?)\bendmodule\b",
-            clean,
-            re.DOTALL,
-        )
-        if not mod_match:
-            raise ValueError(f"Module '{target_name}' not found")
-
-    header = mod_match.group(1) if mod_match.lastindex else ""
+    header, param_defaults = _extract_module_interface(clean, target_name)
     if not header.strip():
         header = _extract_header_ports(clean, target_name)
 
     body = _extract_module_body(clean, target_name)
-    ports = _parse_port_list(header)
+    ports = _parse_port_list(header, param_defaults)
+    if not ports and header.strip():
+        ports = _parse_name_only_header(header)
+    body_ports = _parse_body_port_declarations(body, param_defaults)
+    if body_ports:
+        ports = _merge_ports_by_name(ports, body_ports) if ports else body_ports
+    if not ports:
+        raise ValueError(
+            f"Could not extract ports for module '{target_name}'. "
+            "Use ANSI-style port declarations (input/output/inout) in the header or body."
+        )
     clock_port = _detect_clock_port(ports)
     reset_port, reset_active_low = _detect_reset_port(ports)
     is_sequential = _detect_sequential(body)
@@ -128,8 +249,6 @@ def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
     scan = scan_rtl_for_unsupported(rtl)
     unsupported_msgs = [u.message() for u in scan.unsupported_constructs]
     inferred = _infer_operation(clean, ports, body, rtl_source=clean)
-    if unsupported_msgs:
-        inferred = "unverifiable"
 
     return RtlModule(
         name=target_name,
@@ -162,36 +281,117 @@ def _extract_header_ports(clean: str, name: str) -> str:
     m = re.search(rf"\bmodule\s+{re.escape(name)}\b", clean)
     if not m:
         return ""
-    chunk = clean[m.end() : m.end() + 2000]
-    paren = re.search(r"\((.*?)\)\s*;", chunk, re.DOTALL)
-    return paren.group(1) if paren else ""
+    idx = _skip_ws(clean, m.end())
+    if idx < len(clean) and clean[idx] == "#":
+        idx = _skip_ws(clean, _find_matching_paren(clean, idx + 1) + 1)
+    if idx >= len(clean) or clean[idx] != "(":
+        return ""
+    port_end = _find_matching_paren(clean, idx)
+    return clean[idx + 1 : port_end]
 
 
-def _parse_port_list(header: str) -> List[Port]:
+def _parse_port_list(header: str, params: Optional[Dict[str, int]] = None) -> List[Port]:
+    params = params or {}
     ports: List[Port] = []
-    header = header.replace("\n", " ")
+    header = re.sub(r"\s+", " ", header.strip())
     chunks = re.split(r",\s*(?=(?:input|output|inout)\b)", header)
     for chunk in chunks:
-        chunk = chunk.strip()
+        chunk = chunk.strip().rstrip(",").strip()
         if not chunk:
             continue
         m = re.match(
-            r"(input|output|inout)\s+(?:(?:wire|reg|logic|signed|unsigned)\s+)*"
-            r"(?:\[(\d+)\s*:\s*(\d+)\]\s+)?(.+)",
+            r"(input|output|inout)\s+"
+            r"(?:(?:wire|reg|logic|signed|unsigned)\s+)*"
+            r"(.*)",
             chunk,
             re.IGNORECASE,
         )
         if not m:
             continue
         direction = PortDirection(m.group(1).lower())
-        if m.group(2) is not None:
-            msb, lsb = _parse_width(m.group(2), m.group(3))
+        rest = m.group(2).strip().rstrip(",").strip()
+        range_parts: List[str] = []
+        while rest.startswith("["):
+            close = rest.find("]")
+            if close < 0:
+                break
+            range_parts.append(rest[: close + 1])
+            rest = rest[close + 1 :].strip()
+        name_m = re.match(r"([\w\s,]+)\s*$", rest)
+        if not name_m:
+            continue
+        names = [n.strip() for n in name_m.group(1).split(",") if n.strip()]
+        if not names:
+            continue
+        evaluated_ranges: List[str] = []
+        for rp in range_parts:
+            bounds = _eval_range_bounds(rp[1:-1], params)
+            if bounds is not None:
+                hi, lo = bounds
+                evaluated_ranges.append(f"[{hi}:{lo}]")
+            else:
+                evaluated_ranges.append(rp)
+        extra_ranges = ""
+        msb, lsb = 0, 0
+        if len(evaluated_ranges) == 0:
+            pass
+        elif len(evaluated_ranges) == 1:
+            bounds = _eval_range_bounds(evaluated_ranges[0][1:-1], params)
+            if bounds is not None:
+                msb, lsb = bounds
+            else:
+                m_lit = re.search(r"\[(\d+)\s*:\s*(\d+)\]", evaluated_ranges[0])
+                if m_lit:
+                    msb, lsb = int(m_lit.group(1)), int(m_lit.group(2))
         else:
-            msb, lsb = 0, 0
-        names_blob = m.group(4).strip().rstrip(",").strip()
-        for name in re.findall(r"\w+", names_blob):
-            ports.append(Port(name=name, direction=direction, msb=msb, lsb=lsb))
+            inner_bounds = _eval_range_bounds(evaluated_ranges[-1][1:-1], params)
+            if inner_bounds is not None:
+                msb, lsb = inner_bounds
+            extra_ranges = "".join(evaluated_ranges[:-1])
+        for name in names:
+            if not re.fullmatch(r"\w+", name):
+                continue
+            ports.append(
+                Port(
+                    name=name,
+                    direction=direction,
+                    msb=msb,
+                    lsb=lsb,
+                    extra_ranges=extra_ranges,
+                )
+            )
     return ports
+
+
+def _parse_name_only_header(header: str) -> List[Port]:
+    """Non-ANSI header: module foo (a, b, y); — directions come from body."""
+    names = [n.strip() for n in header.split(",") if n.strip()]
+    out: List[Port] = []
+    for name in names:
+        if re.fullmatch(r"\w+", name):
+            out.append(Port(name=name, direction=PortDirection.INOUT))
+    return out
+
+
+def _parse_body_port_declarations(body: str, params: Dict[str, int]) -> List[Port]:
+    """input/output/inout declarations inside the module body."""
+    cut = re.search(r"\b(always|assign|endmodule|generate)\b", body, re.IGNORECASE)
+    region = body[: cut.start()] if cut else body
+    ports: List[Port] = []
+    for stmt in re.split(r";", region):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        if re.match(r"(input|output|inout)\b", stmt, re.IGNORECASE):
+            ports.extend(_parse_port_list(stmt, params))
+    return ports
+
+
+def _merge_ports_by_name(primary: List[Port], overrides: List[Port]) -> List[Port]:
+    by_name: Dict[str, Port] = {p.name: p for p in primary}
+    for p in overrides:
+        by_name[p.name] = p
+    return list(by_name.values())
 
 
 def _detect_clock_port(ports: List[Port]) -> Optional[str]:

@@ -8,8 +8,11 @@ env/
 
 # Simulation / local runs
 build/
+work_verify/
 *.vvp
 *.vcd
+xvlog.log
+xvlog.pb
 
 # Formal-tab attempt log (local, not shared — see formal_log.py)
 logs/
@@ -17,6 +20,7 @@ logs/
 # IDE / OS
 .idea/
 .vscode/
+.claude/
 *.swp
 .DS_Store
 Thumbs.db

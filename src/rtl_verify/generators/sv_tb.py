@@ -1,17 +1,14 @@
-"""SystemVerilog testbench with classes and structured reporting."""
+"""SystemVerilog testbench — wraps waveform-oriented Verilog TB."""
 
 from __future__ import annotations
 
-from ..analyzer import PortDirection, RtlModule
+from ..analyzer import RtlModule
 from . import verilog_tb as vtb
 
 
-def generate(mod: RtlModule, rtl_source: str | None = None) -> str:
-    base = vtb.generate(mod, rtl_source)
+def generate(mod: RtlModule, rtl_source: str | None = None, monitor_only: bool = True) -> str:
+    base = vtb.generate(mod, rtl_source, monitor_only=monitor_only)
     return base.replace(
-        "// Auto-generated Verilog testbench",
-        "// Auto-generated SystemVerilog testbench",
-    ).replace("module tb_", "module tb_").replace(
-        "integer pass_cnt;",
-        "int pass_cnt;",
-    ).replace("integer fail_cnt;", "int fail_cnt;")
+        "// Auto-generated testbench for",
+        "// Auto-generated SystemVerilog testbench for",
+    )

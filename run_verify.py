@@ -33,7 +33,7 @@ def main() -> int:
         "-b",
         "--backend",
         default=None,
-        help="Simulator backend id (icarus, reference); default auto-select",
+        help="Simulator backend id (icarus, vivado, reference); default auto-select",
     )
     parser.add_argument(
         "--vplan",

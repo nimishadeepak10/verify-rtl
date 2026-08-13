@@ -1,49 +1,36 @@
-"""Generate Verilog-2001 directed testbench with self-checking when possible."""
+"""Generate waveform-oriented Verilog/SystemVerilog testbenches (no directed test cases)."""
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from ..analyzer import PortDirection, RtlModule
-from ..combinational_model import (
-    can_self_check,
-    expected_outputs,
-    verilog_literal,
-)
 
 
-def generate(mod: RtlModule, rtl_source: Optional[str] = None) -> str:
-    outputs = mod.outputs
-    data_ins = mod.data_inputs
-    if not data_ins and not mod.is_sequential:
-        if not mod.inputs or not outputs:
-            raise ValueError("Need at least one input and one output port to auto-generate tests")
-    if not outputs:
-        raise ValueError("Need at least one output port to auto-generate tests")
+def generate(mod: RtlModule, rtl_source: Optional[str] = None, monitor_only: bool = True) -> str:
+    if not monitor_only and not mod.is_sequential:
+        from .comb_assert_tb import generate as comb_generate
+
+        return comb_generate(mod, rtl_source)
+    del rtl_source
+    if not mod.outputs:
+        raise ValueError("Need at least one output port to generate a testbench")
 
     if mod.is_sequential and mod.clock_port:
         return _generate_sequential(mod)
-
-    if not mod.inputs:
-        raise ValueError("Need at least one input and one output port to auto-generate tests")
-
-    return _generate_combinational(mod, rtl_source)
+    return _generate_combinational(mod)
 
 
-def _generate_combinational(mod: RtlModule, rtl_source: Optional[str] = None) -> str:
-    cases = _build_cases(mod)
-    stim = _stimulus_blocks(mod, cases, rtl_source)
-
+def _generate_combinational(mod: RtlModule) -> str:
+    stim = _combinational_stimulus(mod)
     return f"""`timescale 1ns/1ps
-// Auto-generated Verilog testbench for {mod.name} (combinational)
+// Auto-generated testbench for {mod.name} (combinational, waveform verification)
 module tb_{mod.name};
 {_dut_port_connections(mod)}
-    // Reference clock: visual time marker (does not drive DUT)
     reg ref_clk;
     initial ref_clk = 0;
     always #5 ref_clk = ~ref_clk;
-    integer pass_cnt;
-    integer fail_cnt;
 
     {mod.name} uut (
 {_instance_ports(mod)}
@@ -55,14 +42,13 @@ module tb_{mod.name};
     end
 
     initial begin
-        pass_cnt = 0;
-        fail_cnt = 0;
+        $display("=== TB: stimulus start (combinational) ===");
+{_default_input_init(mod)}
+{_unpacked_init_block(mod)}
 {stim}
-        #10;
-        $display("=== SUMMARY ===");
-        $display("PASS=%0d FAIL=%0d", pass_cnt, fail_cnt);
-        if (fail_cnt == 0) $display("RESULT: PASS");
-        else $display("RESULT: FAIL");
+        #20;
+        $display("=== SIMULATION COMPLETE ===");
+        $display("RESULT: DONE");
         $finish;
     end
 endmodule
@@ -71,8 +57,7 @@ endmodule
 
 def _generate_sequential(mod: RtlModule) -> str:
     clk = mod.clock_port
-    cases = _build_cases(mod)
-    stim = _sequential_stimulus(mod, cases)
+    stim = _sequential_stimulus(mod)
     reset_block = _reset_sequence(mod, clk)
     clock_block = _clock_generator(mod, clk)
     fsm_note = ""
@@ -80,11 +65,9 @@ def _generate_sequential(mod: RtlModule) -> str:
         fsm_note = f"// FSM: {mod.state_reg} states {{ {', '.join(mod.states)} }}\n"
 
     return f"""`timescale 1ns/1ps
-// Auto-generated Verilog testbench for {mod.name} (sequential)
+// Auto-generated testbench for {mod.name} (sequential, waveform verification)
 {fsm_note}module tb_{mod.name};
 {_dut_port_connections(mod)}
-    integer pass_cnt;
-    integer fail_cnt;
 
     {mod.name} uut (
 {_instance_ports(mod)}
@@ -97,19 +80,57 @@ def _generate_sequential(mod: RtlModule) -> str:
     end
 
     initial begin
-        pass_cnt = 0;
-        fail_cnt = 0;
+        $display("=== TB: stimulus start (sequential) ===");
+{_default_input_init(mod)}
+{_unpacked_init_block(mod)}
 {reset_block}
 {stim}
-        #20;
-        $display("=== SUMMARY ===");
-        $display("PASS=%0d FAIL=%0d", pass_cnt, fail_cnt);
-        if (fail_cnt == 0) $display("RESULT: PASS");
-        else $display("RESULT: FAIL");
+        repeat(5) @(posedge {clk});
+        $display("=== SIMULATION COMPLETE ===");
+        $display("RESULT: DONE");
         $finish;
     end
 endmodule
 """
+
+
+def _default_input_init(mod: RtlModule) -> str:
+    lines: list[str] = []
+    for p in _stim_inputs(mod):
+        lines.append(f"        {p.name} = 0;")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _combinational_stimulus(mod: RtlModule) -> str:
+    ins = _stim_inputs(mod)
+    if not ins:
+        return "        #100; // no data inputs — observe outputs\n"
+
+    lines = ["        // Apply input patterns — verify behavior in waveforms"]
+    steps = min(16, max(8, 2 ** min(4, max(p.width for p in ins))))
+    for step in range(steps):
+        lines.append(f"        // cycle {step}")
+        for i, p in enumerate(ins):
+            mod_val = (step * (i + 3) + 1) % max(1, min((1 << min(p.width, 8)) - 1, 255))
+            lines.append(f"        {p.name} = {mod_val};")
+        lines.append("        #10;")
+    return "\n".join(lines)
+
+
+def _sequential_stimulus(mod: RtlModule) -> str:
+    clk = mod.clock_port or "clk"
+    ins = _stim_inputs(mod)
+    if not ins:
+        return f"        repeat(16) @(posedge {clk});\n"
+
+    lines = ["        // Change data inputs across clock cycles"]
+    for step in range(12):
+        lines.append(f"        // cycle {step}")
+        for i, p in enumerate(ins):
+            val = (step * (i + 5) + 2) % max(1, min((1 << min(p.width, 8)) - 1, 255))
+            lines.append(f"        {p.name} = {val};")
+        lines.append(f"        repeat(2) @(posedge {clk});")
+    return "\n".join(lines)
 
 
 def _clock_generator(mod: RtlModule, clk: str) -> str:
@@ -125,71 +146,23 @@ def _clock_generator(mod: RtlModule, clk: str) -> str:
 
 def _reset_sequence(mod: RtlModule, clk: str) -> str:
     if not mod.reset_port:
-        return f"        // no reset port\n        repeat(2) @(posedge {clk});\n"
+        return f"        repeat(2) @(posedge {clk});\n"
     rst = mod.reset_port
     if mod.reset_active_low:
-        return f"""        // assert reset (active-low)
-        {rst} = 0;
+        return f"""        {rst} = 0;
         repeat(3) @(posedge {clk});
         {rst} = 1;
         repeat(2) @(posedge {clk});
 """
-    return f"""        // assert reset (active-high)
-        {rst} = 1;
+    return f"""        {rst} = 1;
         repeat(3) @(posedge {clk});
         {rst} = 0;
         repeat(2) @(posedge {clk});
 """
-
-
-def _sequential_stimulus(mod: RtlModule, cases: list[dict[str, int]]) -> str:
-    clk = mod.clock_port or "clk"
-    lines: list[str] = []
-    for i, case in enumerate(cases):
-        assigns = [f"        {k} = {v};" for k, v in case.items()]
-        lines.append(f"        // test {i}")
-        lines.extend(assigns)
-        lines.append(f"        repeat(3) @(posedge {clk});")
-        if mod.state_reg:
-            state_out = _find_state_output(mod)
-            if state_out:
-                stim_val = list(case.values())[0] if case else 0
-                lines.append(
-                    f'        $display("SEQ t=%0d {state_out}=%0d", '
-                    f"$time, {state_out});"
-                )
-            else:
-                lines.append(
-                    f'        $display("SEQ t=%0d test={i}", $time);'
-                )
-        else:
-            outs = " ".join(f"{p.name}=%0d" for p in mod.outputs)
-            args = ", ".join(p.name for p in mod.outputs)
-            lines.append(f'        $display("SEQ t=%0d {outs}", $time, {args});')
-        lines.append("        pass_cnt = pass_cnt + 1;")
-    if not cases:
-        lines.append(f'        repeat(5) @(posedge {clk});')
-        lines.append('        $display("SEQ no data inputs — clock/reset exercise only");')
-        lines.append("        pass_cnt = pass_cnt + 1;")
-    return "\n".join(lines)
-
-
-def _find_state_output(mod: RtlModule) -> str | None:
-    if mod.state_reg:
-        for p in mod.outputs:
-            if p.name == mod.state_reg or p.name in ("light", "state", "state_out", "current_state"):
-                return p.name
-    for p in mod.outputs:
-        if "state" in p.name.lower():
-            return p.name
-    return mod.outputs[0].name if mod.outputs else None
 
 
 def _instance_ports(mod: RtlModule) -> str:
-    lines = []
-    for p in mod.ports:
-        lines.append(f"        .{p.name}({p.name})")
-    return ",\n".join(lines)
+    return ",\n".join(f"        .{p.name}({p.name})" for p in mod.ports)
 
 
 def _dut_port_connections(mod: RtlModule) -> str:
@@ -203,121 +176,25 @@ def _dut_port_connections(mod: RtlModule) -> str:
     return "\n".join(decls)
 
 
-def _max_stim_value(width: int) -> int:
-    return min((1 << width) - 1, 255)
-
-
-def _build_cases(mod: RtlModule) -> list[dict[str, int]]:
+def _stim_inputs(mod: RtlModule) -> list:
     ins = mod.data_inputs if mod.is_sequential else mod.inputs
-    if not ins:
-        return [{}]
-    max_vals = [_max_stim_value(p.width) for p in ins]
-    total = 1
-    for v in max_vals:
-        total *= v + 1
-    if total > 512:
-        return _random_cases(ins, 32)
-    cases: list[dict[str, int]] = []
-    limits = [v + 1 for v in max_vals]
-
-    def recurse(idx: int, cur: dict[str, int]) -> None:
-        if idx == len(ins):
-            cases.append(dict(cur))
-            return
-        p = ins[idx]
-        for val in range(limits[idx]):
-            cur[p.name] = val
-            recurse(idx + 1, cur)
-
-    recurse(0, {})
-    return cases
+    return [p for p in ins if not p.is_unpacked_array]
 
 
-def _random_cases(ins, n: int) -> list[dict[str, int]]:
-    import random
-
-    random.seed(42)
-    cases = []
-    for _ in range(n):
-        c = {}
-        for p in ins:
-            c[p.name] = random.randint(0, _max_stim_value(p.width))
-        cases.append(c)
-    return cases
-
-
-def _emit_test_display(
-    mod: RtlModule,
-    test_idx: int,
-    golden: Optional[dict[str, int]],
-    verdict: str,
-) -> str:
-    """Structured TEST line: IN inputs, optional EXP expected, OUT got wires, RESULT verdict."""
-    in_ports = mod.inputs if not mod.is_sequential else mod.data_inputs
-    out_ports = mod.outputs
-    in_pipe = "|".join(f"{p.name}=%0d" for p in in_ports)
-    out_pipe = "|".join(f"{p.name}=%0d" for p in out_ports)
-    in_wires = ", ".join(p.name for p in in_ports)
-    out_wires = ", ".join(p.name for p in out_ports)
-    vlit = f'"{verdict}"'
-    if golden and out_ports:
-        exp_pipe = "|".join(f"{p.name}=%0d" for p in out_ports)
-        exp_vals = ", ".join(str(golden[p.name]) for p in out_ports)
-        fmt = f"TEST,%0d,IN,{in_pipe},EXP,{exp_pipe},OUT,{out_pipe},RESULT,%s"
-        args = ", ".join([str(test_idx), in_wires, exp_vals, out_wires, vlit])
-    else:
-        fmt = f"TEST,%0d,IN,{in_pipe},OUT,{out_pipe},RESULT,%s"
-        args = ", ".join([str(test_idx), in_wires, out_wires, vlit])
-    return f'$display("{fmt}", {args});'
-
-
-def _stimulus_blocks(
-    mod: RtlModule,
-    cases: list[dict[str, int]],
-    rtl_source: Optional[str] = None,
-) -> str:
-    lines = []
-    use_golden = bool(
-        rtl_source and not mod.is_sequential and can_self_check(rtl_source, mod)
-    )
-    if use_golden and rtl_source:
-        for case in cases:
-            try:
-                golden_check = expected_outputs(rtl_source, mod, case)
-                if not golden_check:
-                    use_golden = False
-                    break
-            except Exception:
-                use_golden = False
-                break
-    in_ports = mod.inputs
-    for i, case in enumerate(cases):
-        assigns = [f"        {k} = {v};" for k, v in case.items()]
-        lines.append(f"        // test {i}")
-        lines.extend(assigns)
-        lines.append("        #5;")
-        golden: dict[str, int] | None = None
-        if use_golden and rtl_source:
-            try:
-                golden = expected_outputs(rtl_source, mod, case)
-            except Exception:
-                golden = None
-        if golden and mod.outputs:
-            checks = [
-                f"{p.name} !== {verilog_literal(golden[p.name], p.width)}"
-                for p in mod.outputs
-            ]
-            cond = " || ".join(checks)
-            fail_disp = _emit_test_display(mod, i, golden, "FAIL")
-            pass_disp = _emit_test_display(mod, i, golden, "PASS")
-            lines.append(
-                f"        if ({cond}) begin fail_cnt = fail_cnt + 1; {fail_disp} end "
-                f"else begin pass_cnt = pass_cnt + 1; {pass_disp} end"
-            )
-        elif mod.outputs:
-            obs_disp = _emit_test_display(mod, i, None, "OBS")
-            lines.append(f"        {obs_disp}")
-            lines.append("        pass_cnt = pass_cnt + 1;")
-        else:
-            lines.append("        pass_cnt = pass_cnt + 1;")
+def _unpacked_init_block(mod: RtlModule) -> str:
+    lines: list[str] = []
+    ins = mod.data_inputs if mod.is_sequential else mod.inputs
+    for p in ins:
+        if not p.is_unpacked_array:
+            continue
+        count = 1
+        if p.extra_ranges:
+            m = re.search(r"\[(\d+)\s*:\s*(\d+)\]", p.extra_ranges)
+            if m:
+                count = abs(int(m.group(1)) - int(m.group(2))) + 1
+        lines.append(f"        begin : init_{p.name}")
+        lines.append("            integer _ui;")
+        lines.append(f"            for (_ui = 0; _ui < {count}; _ui = _ui + 1)")
+        lines.append(f"                {p.name}[_ui] = 0;")
+        lines.append("        end")
     return "\n".join(lines)

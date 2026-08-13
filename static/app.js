@@ -79,7 +79,7 @@
   const rtlPaste = $("#rtlPaste");
   const pasteGutter = $("#pasteGutter");
   const topModule = $("#topModule");
-  const backendSelect = $("#backendSelect");
+  const backendSegments = $("#backendSegments");
 
   function getLanguage() {
     const sel = document.querySelector('input[name="language"]:checked');
@@ -96,7 +96,123 @@
   }
 
   function getBackend() {
-    return backendSelect ? backendSelect.value : "";
+    const sel = document.querySelector('input[name="backend"]:checked');
+    return sel && !sel.disabled ? sel.value : "";
+  }
+
+  function setBackend(value) {
+    let matched = false;
+    $$(".sim-opt").forEach((opt) => {
+      const input = opt.querySelector('input[type="radio"]');
+      if (!input) return;
+      const on = input.value === value && !input.disabled;
+      if (on) matched = true;
+      input.checked = on;
+      opt.classList.toggle("selected", on);
+    });
+    if (!matched) {
+      const auto = document.querySelector('input[name="backend"][value=""]');
+      if (auto) {
+        auto.checked = true;
+        auto.closest(".sim-opt")?.classList.add("selected");
+      }
+    }
+  }
+
+  function updateBackendStatus() {
+    const el = $("#backendStatus");
+    if (!el) return;
+    const sel = getBackend();
+    const available = App.backends.filter((b) => b.available);
+    if (!App.backends.length) {
+      el.textContent = "";
+      return;
+    }
+    if (sel === "") {
+      const names = available.map((b) => b.display_name).join(", ");
+      el.textContent = names
+        ? `Auto picks the first available: ${names}.`
+        : "No simulator found — install Icarus Verilog or AMD Vivado.";
+      return;
+    }
+    const b = App.backends.find((x) => x.name === sel);
+    if (!b) {
+      el.textContent = "";
+      return;
+    }
+    if (b.available) {
+      el.textContent = b.version
+        ? `Using ${b.display_name} v${b.version}.`
+        : `Using ${b.display_name}.`;
+    } else {
+      el.textContent = `${b.display_name} is not installed on this machine.`;
+    }
+  }
+
+  function attachBackendListeners() {
+    $$(".sim-opt").forEach((opt) => {
+      if (opt.dataset.simBound === "1") return;
+      opt.dataset.simBound = "1";
+      opt.addEventListener("click", (e) => {
+        const input = opt.querySelector('input[type="radio"]');
+        if (!input || input.disabled) {
+          e.preventDefault();
+          const label = opt.textContent.trim();
+          showToast(`${label} is not installed on this machine.`, "error");
+          return;
+        }
+        $$(".sim-opt").forEach((o) => o.classList.remove("selected"));
+        opt.classList.add("selected");
+        input.checked = true;
+        updateNavContext();
+        updateBackendStatus();
+        if (App.rtlContent.trim()) refreshPreview();
+      });
+    });
+  }
+
+  function renderBackendSegments() {
+    const host = backendSegments;
+    if (!host) return;
+    const prev = getBackend();
+
+    // Update static buttons from API (availability + version)
+    App.backends.forEach((b) => {
+      const opt = host.querySelector(`[data-backend-id="${b.name}"]`);
+      if (!opt) return;
+      const input = opt.querySelector('input[type="radio"]');
+      const led = opt.querySelector(".sim-led");
+      const ver = opt.querySelector(`[data-ver-for="${b.name}"]`);
+      if (input) input.disabled = !b.available;
+      opt.classList.toggle("sim-opt--missing", !b.available);
+      if (led) {
+        led.classList.toggle("sim-led--on", b.available);
+        led.classList.toggle("sim-led--off", !b.available);
+      }
+      if (ver) ver.textContent = b.version ? `v${b.version}` : "";
+      if (!b.available) {
+        opt.title = `${b.display_name} not found — install or add to PATH`;
+      }
+    });
+
+    // Add any API backends not in static HTML
+    App.backends.forEach((b) => {
+      if (host.querySelector(`[data-backend-id="${b.name}"]`)) return;
+      const label = document.createElement("label");
+      label.className = "segmented__btn sim-opt" + (b.available ? "" : " sim-opt--missing");
+      label.dataset.backendId = b.name;
+      const ver = b.version ? `<span class="sim-ver">v${escapeHtml(b.version)}</span>` : "";
+      label.innerHTML =
+        `<input type="radio" name="backend" value="${escapeHtml(b.name)}"` +
+        (b.available ? "" : " disabled") +
+        ` /> <span class="sim-led ${b.available ? "sim-led--on" : "sim-led--off"}"></span>` +
+        `${escapeHtml(b.display_name)}${ver}`;
+      host.appendChild(label);
+    });
+
+    setBackend(prev || "");
+    attachBackendListeners();
+    updateBackendStatus();
   }
 
   async function buildFormData() {
@@ -288,29 +404,22 @@
       verEl.textContent = "";
       ledEl.className = "led led-dim";
     }
-    const n = App.currentVplan ? App.currentVplan.total_planned_cases : App.currentPreview ? App.currentPreview.test_count : "—";
-    countEl.textContent = n === "—" ? "—" : String(n);
+    const n = App.currentPreview ? (App.currentPreview.test_strategy || "waveform") : "—";
+    countEl.textContent = n === "—" ? "—" : String(n).replace(/ waveform stimulus/i, "");
   }
 
   async function loadBackends() {
-    if (!backendSelect) return;
     try {
       const res = await fetch("/api/backends");
       App.backends = await res.json();
-      backendSelect.innerHTML = '<option value="">Auto-detect best available</option>';
-      App.backends.forEach((b) => {
-        const opt = document.createElement("option");
-        opt.value = b.name;
-        const ver = b.version ? ` (${b.version})` : "";
-        const suffix = b.available ? "" : " — not installed";
-        opt.textContent = `${b.available ? "●" : "○"} ${b.display_name}${ver}${suffix}`;
-        opt.className = b.available ? "backend-ok" : "backend-missing";
-        opt.disabled = !b.available;
-        backendSelect.appendChild(opt);
-      });
+      renderBackendSegments();
       updateNavContext();
     } catch (err) {
       console.warn("Could not load backends:", err);
+      attachBackendListeners();
+      if ($("#backendStatus")) {
+        $("#backendStatus").textContent = "Could not detect simulators — choices still work if installed.";
+      }
     }
   }
 
@@ -412,23 +521,29 @@
         updateRunButton();
       }
 
-      const status = data.status || (data.success ? "pass" : "fail");
-      if (status === "pass" || data.uvm_note) {
-        setStepState("run", "done");
-        setStepState("results", "current");
-        if (window.Results && Results.render) Results.render(data);
-        gotoStep("results");
-        showToast(data.uvm_note ? "UVM skeleton generated" : "Verification passed", "success");
-      } else {
+      const verdict = data.verdict || data.status || (data.success ? "pass" : "fail");
+      setStepState("run", "done");
+      setStepState("results", "current");
+      if (window.Results && Results.render) Results.render(data);
+      gotoStep("results");
+      if (data.uvm_note) {
+        showToast("UVM skeleton generated", "success");
+      } else if (verdict === "pass") {
+        showToast("Synthesis + simulation complete — inspect waveforms", "success");
+      } else if (verdict === "not_synthesizable") {
+        showToast("RTL is not synthesizable — see synthesis log", "error");
+      } else if (verdict === "unverified") {
+        showToast("Simulation completed — monitor-only (UNVERIFIED)", "info");
+      } else if (verdict === "fail") {
+        showRunError("Verification failed — see log and Results.");
+        showToast("Verification failed", "error");
+      } else if (verdict === "error" || data.status === "sim_missing") {
         const msg =
-          status === "sim_missing"
+          data.status === "sim_missing"
             ? "Simulator not available. Install Icarus Verilog or choose Auto-detect."
-            : "Verification failed — see log and Results.";
+            : "Verification error — see log and Results.";
         showRunError(msg);
         showToast(msg, "error");
-        if (window.Results && Results.render) Results.render(data);
-        gotoStep("results");
-        setStepState("results", "current");
       }
     } catch (err) {
       $("#runSpinner").classList.add("hidden");
@@ -525,13 +640,6 @@
       });
     });
 
-    if (backendSelect) {
-      backendSelect.addEventListener("change", () => {
-        updateNavContext();
-        if (App.rtlContent.trim()) refreshPreview();
-      });
-    }
-
     $("#loadExample").addEventListener("click", async () => {
       const res = await fetch("/static/example_adder.v");
       App.rtlContent = await res.text();
@@ -574,6 +682,7 @@
 
   initDesign();
   renderNav();
+  attachBackendListeners();
   loadBackends();
   setLanguage("systemverilog");
   updatePasteGutter();

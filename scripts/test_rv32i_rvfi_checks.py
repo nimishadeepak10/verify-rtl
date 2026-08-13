@@ -24,10 +24,16 @@ generate_formal_wrapper() + recommended_engine_chain() infrastructure --
 no new checking framework, just RVFI's real signal names and semantics
 feeding the same pipeline every other stage used.
 
-This first pass covers the ALU-reg, ALU-imm, and LUI/AUIPC groups (21
-instructions) plus a straight-line pc_wdata==pc_rdata+4 check for each,
-since none of them branch. Loads/stores/branches/jumps are a deliberately
-separate follow-up group, not attempted here.
+Covers the full RV32I base integer set: ALU-reg, ALU-imm, LUI/AUIPC
+(rd_wdata correctness + straight-line pc_wdata==pc_rdata+4), the 6
+branches (pc_wdata correctness under both taken/not-taken, plus an
+explicit "branches never write rd" check), JAL/JALR (rd_wdata==return
+address, pc_wdata==target), and loads/stores (mem_addr/mem_rmask/
+mem_wmask/mem_rdata/mem_wdata consistency, plus load rd_wdata sign/zero
+extension). FENCE and ECALL/EBREAK are deliberately out of scope --
+FENCE is a no-op with nothing to check, and ECALL/EBREAK just need
+rvfi_trap==1, arguably better covered by a dedicated trap-behavior check
+than force-fit into this per-instruction-correctness shape.
 """
 
 from __future__ import annotations
@@ -50,8 +56,16 @@ RD_WDATA = "rvfi_rd_wdata"
 RD_ADDR = "rvfi_rd_addr"
 PC_RDATA = "rvfi_pc_rdata"
 PC_WDATA = "rvfi_pc_wdata"
+MEM_ADDR = "rvfi_mem_addr"
+MEM_RMASK = "rvfi_mem_rmask"
+MEM_WMASK = "rvfi_mem_wmask"
+MEM_RDATA = "rvfi_mem_rdata"
+MEM_WDATA = "rvfi_mem_wdata"
 
 IMM_I = f"{{{{20{{{INSN}[31]}}}}, {INSN}[31:20]}}"  # sign-extended 12-bit I-type imm
+IMM_S = f"{{{{20{{{INSN}[31]}}}}, {INSN}[31:25], {INSN}[11:7]}}"  # S-type (store) imm
+IMM_B = f"{{{{19{{{INSN}[31]}}}}, {INSN}[31], {INSN}[7], {INSN}[30:25], {INSN}[11:8], 1'b0}}"  # B-type (branch) imm
+IMM_J = f"{{{{11{{{INSN}[31]}}}}, {INSN}[31], {INSN}[19:12], {INSN}[20], {INSN}[30:21], 1'b0}}"  # J-type (JAL) imm
 
 
 def arith_shift_expr(val, shamt):
@@ -111,6 +125,71 @@ def straight_pc_check(name, opcode, funct3=None, funct7=None):
     return (name, expr)
 
 
+def pc_target_check(name, opcode, target_expr, funct3=None, funct7=None):
+    guard = match(opcode, funct3, funct7)
+    expr = f"!({guard}) || ({PC_WDATA} == ({target_expr}))"
+    return (name, expr)
+
+
+def branch_pc_check(name, funct3, taken_expr):
+    guard = match("1100011", funct3)
+    expr = (
+        f"!({guard}) || ({PC_WDATA} == (({taken_expr}) "
+        f"? ({PC_RDATA} + {IMM_B}) : ({PC_RDATA} + 32'd4)))"
+    )
+    return (name, expr)
+
+
+def mem_addr_check(name, opcode, imm_expr, funct3=None):
+    guard = match(opcode, funct3)
+    expr = f"!({guard}) || ({MEM_ADDR} == ({RS1} + ({imm_expr})))"
+    return (name, expr)
+
+
+def mask_expr(funct3_low2, byte_off_expr):
+    if funct3_low2 == "00":
+        return f"(4'b0001 << ({byte_off_expr}))"
+    if funct3_low2 == "01":
+        return f"(4'b0011 << ({byte_off_expr}))"
+    return "4'b1111"
+
+
+def load_mask_check(name, funct3):
+    guard = match("0000011", funct3)
+    byte_off = f"(({RS1} + {IMM_I})[1:0])"
+    expr = f"!({guard}) || ({MEM_RMASK} == {mask_expr(funct3[1:3], byte_off)})"
+    return (name, expr)
+
+
+def store_mask_check(name, funct3):
+    guard = match("0100011", funct3)
+    byte_off = f"(({RS1} + {IMM_S})[1:0])"
+    expr = f"!({guard}) || ({MEM_WMASK} == {mask_expr(funct3[1:3], byte_off)})"
+    return (name, expr)
+
+
+def store_wdata_check(name, funct3):
+    # dmem_wdata is rs2_rdata shifted into its byte lane -- confirmed from
+    # rv32i_core.v's own assign dmem_wdata = rs2_rdata << (byte_off * 8),
+    # mirrored into rvfi_mem_wdata unchanged for stores.
+    guard = match("0100011", funct3)
+    byte_off = f"(({RS1} + {IMM_S})[1:0])"
+    expr = f"!({guard}) || ({MEM_WDATA} == ({RS2} << (({byte_off}) * 8)))"
+    return (name, expr)
+
+
+def load_rd_formula(funct3, width, signed):
+    byte_off = f"(({RS1} + {IMM_I})[1:0])"
+    shifted = f"({MEM_RDATA} >> (({byte_off}) * 8))"
+    if width == 8:
+        return (f"{{{{24{{{shifted}[7]}}}}, {shifted}[7:0]}}" if signed
+                 else f"{{24'd0, {shifted}[7:0]}}")
+    if width == 16:
+        return (f"{{{{16{{{shifted}[15]}}}}, {shifted}[15:0]}}" if signed
+                 else f"{{16'd0, {shifted}[15:0]}}")
+    return shifted  # width == 32, LW
+
+
 CHECKS = []
 
 # ---- R-type ALU-reg (opcode 0110011) ----
@@ -143,6 +222,46 @@ CHECKS.append(rd_check("insn_lui", "0110111", f"{{{INSN}[31:12], 12'd0}}"))
 CHECKS.append(rd_check("insn_auipc", "0010111", f"{PC_RDATA} + {{{INSN}[31:12], 12'd0}}"))
 CHECKS.append(straight_pc_check("pc_lui", "0110111"))
 CHECKS.append(straight_pc_check("pc_auipc", "0010111"))
+
+# ---- B-type branches (opcode 1100011) ----
+CHECKS.append(branch_pc_check("insn_beq", "000", f"{RS1} == {RS2}"))
+CHECKS.append(branch_pc_check("insn_bne", "001", f"{RS1} != {RS2}"))
+CHECKS.append(branch_pc_check("insn_blt", "100", f"$signed({RS1}) < $signed({RS2})"))
+CHECKS.append(branch_pc_check("insn_bge", "101", f"$signed({RS1}) >= $signed({RS2})"))
+CHECKS.append(branch_pc_check("insn_bltu", "110", f"{RS1} < {RS2}"))
+CHECKS.append(branch_pc_check("insn_bgeu", "111", f"{RS1} >= {RS2}"))
+CHECKS.append(rd_check("branch_no_rd_write", "1100011", "32'd0"))
+
+# ---- Jumps: JAL (opcode 1101111), JALR (opcode 1100111, funct3 000) ----
+CHECKS.append(rd_check("insn_jal_rd", "1101111", f"{PC_RDATA} + 32'd4"))
+CHECKS.append(pc_target_check("insn_jal_pc", "1101111", f"{PC_RDATA} + {IMM_J}"))
+CHECKS.append(rd_check("insn_jalr_rd", "1100111", f"{PC_RDATA} + 32'd4", "000"))
+CHECKS.append(pc_target_check("insn_jalr_pc", "1100111", f"({RS1} + {IMM_I}) & ~32'd1", "000"))
+
+# ---- Loads (opcode 0000011) ----
+CHECKS.append(mem_addr_check("load_addr", "0000011", IMM_I))
+CHECKS.append(load_mask_check("load_mask_lb", "000"))
+CHECKS.append(load_mask_check("load_mask_lh", "001"))
+CHECKS.append(load_mask_check("load_mask_lw", "010"))
+CHECKS.append(load_mask_check("load_mask_lbu", "100"))
+CHECKS.append(load_mask_check("load_mask_lhu", "101"))
+CHECKS.append(rd_check("insn_lb", "0000011", load_rd_formula("000", 8, signed=True), "000"))
+CHECKS.append(rd_check("insn_lh", "0000011", load_rd_formula("001", 16, signed=True), "001"))
+CHECKS.append(rd_check("insn_lw", "0000011", load_rd_formula("010", 32, signed=True), "010"))
+CHECKS.append(rd_check("insn_lbu", "0000011", load_rd_formula("100", 8, signed=False), "100"))
+CHECKS.append(rd_check("insn_lhu", "0000011", load_rd_formula("101", 16, signed=False), "101"))
+CHECKS.append(straight_pc_check("pc_load", "0000011"))
+
+# ---- Stores (opcode 0100011) ----
+CHECKS.append(mem_addr_check("store_addr", "0100011", IMM_S))
+CHECKS.append(store_mask_check("store_mask_sb", "000"))
+CHECKS.append(store_mask_check("store_mask_sh", "001"))
+CHECKS.append(store_mask_check("store_mask_sw", "010"))
+CHECKS.append(store_wdata_check("store_wdata_sb", "000"))
+CHECKS.append(store_wdata_check("store_wdata_sh", "001"))
+CHECKS.append(store_wdata_check("store_wdata_sw", "010"))
+CHECKS.append(rd_check("store_no_rd_write", "0100011", "32'd0"))
+CHECKS.append(straight_pc_check("pc_store", "0100011"))
 
 
 def main() -> None:

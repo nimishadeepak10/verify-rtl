@@ -107,7 +107,10 @@ class IcarusBackend(SimulatorBackend):
                 duration_sec=time.perf_counter() - t0,
             )
 
-        compile_cmd = [iverilog, "-g2012", "-o", str(sim_v), str(rtl_abs), str(tb_abs)]
+        compile_cmd = [iverilog, "-g2012"]
+        if rtl_abs.suffix.lower() == ".sv" or tb_abs.suffix.lower() == ".sv":
+            pass  # -g2012 enables SystemVerilog parsing in modern Icarus
+        compile_cmd.extend(["-o", str(sim_v), str(rtl_abs), str(tb_abs)])
         run_cmd = [vvp, str(sim_v)]
         log_lines: list[str] = []
 

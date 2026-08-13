@@ -7,9 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from .analyzer import PortDirection, RtlModule, analyze_rtl, _strip_comments
 from .backends.registry import ALL_BACKENDS, auto_select, get_backend
-from .combinational_model import can_evaluate_combinational
 from .generators.base import TbLanguage
-from .generators import verilog_tb as vtb
 
 
 def list_modules(rtl: str) -> List[str]:
@@ -39,7 +37,7 @@ def _resolve_simulator_label(
         label = chosen.display_name + (f" ({ver})" if ver else "")
         return label, True
 
-    chosen = auto_select(language.value, is_sequential=mod.is_sequential)
+    chosen = auto_select(language.value, is_sequential=mod.is_sequential, rtl_source=rtl)
     if chosen:
         ver = chosen.version()
         label = chosen.display_name + (f" ({ver})" if ver else "")
@@ -61,23 +59,19 @@ def build_test_preview(
     modules = list_modules(rtl)
 
     try:
-        cases = vtb._build_cases(mod)  # noqa: SLF001
-        test_count = len(cases)
+        stim_ports = mod.data_inputs if mod.is_sequential else mod.inputs
+        stim_ports = [p for p in stim_ports if not getattr(p, "is_unpacked_array", False)]
+        stim_steps = min(16, max(8, len(stim_ports) * 4 or 8))
+        test_count = stim_steps
         if mod.is_sequential:
-            strategy = "sequential clocked (exhaustive data)" if test_count <= 512 else "sequential random data"
+            strategy = "sequential waveform stimulus"
         else:
-            strategy = "exhaustive" if test_count <= 512 else "random-directed"
+            strategy = "combinational waveform stimulus"
     except Exception:
-        cases = []
-        test_count = 0
-        strategy = "manual"
+        test_count = 8
+        strategy = "waveform stimulus"
 
-    self_check = (
-        not mod.is_sequential
-        and mod.inputs
-        and mod.outputs
-        and can_evaluate_combinational(rtl, mod)
-    )
+    self_check = False
     stim_ports = mod.data_inputs if mod.is_sequential else mod.inputs
     stim_space = 1
     for p in stim_ports:
@@ -93,16 +87,16 @@ def build_test_preview(
 
     warnings: List[str] = []
     if not mod.inputs:
-        warnings.append("No input ports — directed stimulus cannot be auto-generated.")
+        warnings.append("No input ports — testbench will observe outputs only.")
     if not mod.outputs:
-        warnings.append("No output ports — results cannot be checked automatically.")
-    if not self_check and not mod.is_sequential:
+        warnings.append("No output ports — cannot generate a useful testbench.")
+    if not mod.is_sequential:
         warnings.append(
-            "Golden model unavailable — simulation will log outputs (monitor mode). "
-            "Use assign-based combinational RTL for automatic checking."
+            "Behavior is verified via synthesis check + waveform simulation "
+            "(no per-test PASS/FAIL — inspect waveforms)."
         )
-    elif not self_check and mod.is_sequential:
-        warnings.append("Sequential designs use monitor-only checks unless a reference model is provided.")
+    elif mod.is_sequential:
+        warnings.append("Sequential designs use clock/reset stimulus — verify behavior in waveforms.")
     if language == TbLanguage.UVM:
         warnings.append("UVM will not run in-browser; download TB and use your UVM simulator.")
     if mod.is_sequential and not mod.clock_port:
@@ -122,7 +116,7 @@ def build_test_preview(
         b = get_backend(backend_name)
         selected_backend = backend_name if b else None
     else:
-        sel = auto_select(language.value)
+        sel = auto_select(language.value, is_sequential=mod.is_sequential, rtl_source=rtl)
         selected_backend = sel.name if sel else None
 
     checklist = [
@@ -130,7 +124,7 @@ def build_test_preview(
         {"id": "ports", "label": "Port list extracted", "ok": len(mod.ports) > 0},
         {"id": "inputs", "label": "Stimulus inputs present", "ok": len(mod.inputs) > 0},
         {"id": "outputs", "label": "Observable outputs present", "ok": len(mod.outputs) > 0},
-        {"id": "golden", "label": "Self-checking reference available", "ok": self_check},
+        {"id": "golden", "label": "Waveform verification (no golden model)", "ok": True},
         {"id": "sim", "label": "Simulator available for selected language", "ok": sim_runs},
         {
             "id": "sequential",
@@ -168,8 +162,8 @@ def build_test_preview(
         "warnings": warnings,
         "checklist": checklist,
         "ready_to_run": len(mod.outputs) > 0
-        and (len(mod.data_inputs) > 0 or mod.is_sequential)
-        and sim_runs,
+        and sim_runs
+        and ((mod.is_sequential and bool(mod.clock_port)) or not mod.is_sequential),
         "is_sequential": mod.is_sequential,
         "clock_port": mod.clock_port,
         "reset_port": mod.reset_port,
@@ -214,7 +208,7 @@ def _summary_lines(
         lines.append(f"FSM: {mod.state_reg} → {', '.join(mod.states)}")
     lines.extend([
         f"Verification: {language.value.upper()}",
-        f"Tests planned: {test_count} ({strategy})",
-        f"Checking: {'self-checking' if self_check else 'monitor-only'}",
+        f"Testbench: {strategy} ({test_count} input patterns)",
+        "Checking: waveform review (no auto PASS/FAIL)",
     ])
     return lines
