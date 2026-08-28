@@ -93,7 +93,12 @@ fifo, mutex), say so explicitly in the rationale.
 signal name that isn't in the port list.
 - Only propose properties you can actually justify from the given RTL structure and/or spec \
 text. Do not propose generic properties unrelated to this specific design.
-- Propose between 3 and 10 properties, prioritizing the most important ones for this design.
+- There is no target property count and no cap. Propose as many properties as this specific \
+design genuinely needs to be meaningfully verified — a simple design may only need a handful; a \
+complex one (multiple interacting state machines, arithmetic with edge cases, wide control logic) \
+may need dozens. Do not stop early to hit some round number, and do not pad the list with \
+generic or redundant properties just to reach one. Every property must earn its place by \
+covering something the others don't.
 - Every field of every property must be fully and specifically written out. Never write \
 placeholder, filler, or generic text (e.g. "placeholder", "TBD", "property description here") —
 if you cannot fully justify a specific property, propose fewer properties instead.
@@ -141,5 +146,11 @@ def suggest_properties(module: RtlModule, rtl_source: str, spec_text: str = "") 
     """Return proposed properties: name, kind, pattern, description, signals, rationale."""
     system = _SYSTEM_TEMPLATE.format(reference=load_reference_doc())
     user = build_user_prompt(module, rtl_source, spec_text)
-    result = llm_client.complete_structured(system, user, SUGGEST_SCHEMA, max_tokens=6000)
+    # No property-count cap (see the system prompt above) means no fixed
+    # token budget either -- a genuinely complex design proposing dozens of
+    # fully-written-out properties needs real headroom, not the old 6000
+    # tokens sized for a 3-10-property target. Thinking stays disabled in
+    # complete_structured() (see llm_client.py), so this budget goes
+    # entirely to the actual JSON output.
+    result = llm_client.complete_structured(system, user, SUGGEST_SCHEMA, max_tokens=16000)
     return result.get("properties", [])

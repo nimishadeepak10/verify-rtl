@@ -34,7 +34,7 @@ def main() -> None:
     for p in proposals:
         print(f"[{p['kind']:6s}] ({p['pattern']}) {p['description']}")
         print(f"         signals={p['signals']} rationale={p['rationale'][:100]}")
-    assert 1 <= len(proposals) <= 15, f"unexpected proposal count: {len(proposals)}"
+    assert len(proposals) >= 1, "expected at least one proposal -- no upper bound, per property_suggester.py's no-cap policy"
     assert all(p["kind"] in ("assert", "assume", "cover") for p in proposals)
 
     print("\n=== Converting each to SVA (LLM call 2) and running through SymbiYosys ===\n")
