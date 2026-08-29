@@ -109,14 +109,17 @@ module rv32i_core (
     // rs1_s (declared above, next to lt_signed) is reused below for the
     // arithmetic-shift ALU cases. Deliberately NOT inlined as
     // $signed(rs1_rdata) at the point of use: confirmed empirically
-    // (isolated Icarus test) that a ternary whose two branches differ in
-    // signedness -- e.g. `cond ? ($signed(x) >>> n) : (x >> n)` -- silently
-    // degrades the WHOLE expression to unsigned per standard Verilog
-    // self-determinism rules for `?:`, turning the arithmetic shift into a
+    // (isolated Icarus test) AND against IEEE 1800-2023 SS11.8.1 ("If any
+    // operand is unsigned, the result is unsigned, regardless of the
+    // operator") that a ternary whose two branches differ in signedness --
+    // e.g. `cond ? ($signed(x) >>> n) : (x >> n)` -- silently degrades the
+    // WHOLE expression to unsigned, turning the arithmetic shift into a
     // logical one even though the cast is textually right there. A plain
     // if/else has no such rule and was confirmed correct in the same test,
     // so SRA/SRAI below use if/else, not a ternary, despite every other ALU
-    // case using one.
+    // case using one. See docs/systemverilog_ieee1800_rules.md SS1 for the
+    // full writeup (this bug, and the near-identical one it caused again in
+    // scripts/test_rv32i_rvfi_checks.py's own hand-written properties).
 
     reg [31:0] alu_result;
     always @* begin

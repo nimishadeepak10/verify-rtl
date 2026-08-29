@@ -65,6 +65,20 @@ against the real solver, not assumed):
   sequence syntax.
 - Anything that requires comparing a signal's value across two different clock cycles (a
   "previous cycle" or "next cycle" claim) — this tool cannot currently express that safely.
+- A signed shift or other signed value-producing sub-expression (`$signed(x) >>> n`,
+  `$signed(x) <<< n`) as one of the two RESULT branches of a ternary (`cond ? A : B`) when the
+  OTHER branch is unsigned. Per IEEE 1800-2023 §11.8.1 ("If any operand is unsigned, the result is
+  unsigned, regardless of the operator"), the whole ternary — including the branch you cast as
+  signed — silently collapses to an unsigned (logical) result. Confirmed by reproduction: a module
+  where a port is LITERALLY defined as `$signed(a) >>> n`, asserting that port equals
+  `$signed(a) >>> n` again (a trivially-true self-check), still fails under this pattern. If a
+  property needs a signed comparison as a 0/1 result, `($signed(x) < $signed(y)) ? 1 : 0` is safe
+  — comparison results are always 1-bit unsigned per the same clause, regardless of what's
+  compared, so no signed value ever reaches the ternary's branches. If a property genuinely needs
+  an arithmetic-shift VALUE (not just a comparison), express it without `$signed()`/`>>>` at all:
+  `(x >> n) | (x[msb] ? ~(all_ones >> n) : 0)` — logical shift, then OR in a sign-extension mask
+  only when the sign bit was set. Prefer declining a property like this if the safe rewrite isn't
+  a clean single expression rather than risking the silent-degrade pattern above.
 
 If the property is about a single, same-cycle relationship between signals (most safety
 properties, range checks, one-hot checks, mutual exclusion, causality between two signals whose

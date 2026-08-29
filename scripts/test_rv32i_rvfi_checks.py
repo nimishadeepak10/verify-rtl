@@ -100,18 +100,26 @@ def rd_check(name, opcode, formula, funct3=None, funct7=None):
     #
     # First fix attempt was a ternary, `(rd_addr==0) ? 32'd0 : (formula)` --
     # still failed for insn_sra/insn_srai specifically. Restructuring into
-    # two separate implications (below) also didn't help, which disproved
-    # the initial hypothesis (a ternary-signedness gotcha like the one
-    # found earlier in the core itself). The real cause, confirmed by an
-    # isolated minimal probe (a module where `r` is LITERALLY defined as
-    # `$signed(a) >>> n`, asserting `r == ($signed(a) >>> n)` -- a
-    # trivially-true self-check): yosys's formal/SMT frontend does not
-    # correctly translate `$signed(...) >>> ...` inside a property
-    # expression at all, even when textually identical to the DUT's own
-    # definition. This is narrow, not a broad $signed() problem --
-    # `$signed(x) < $signed(y)` (used by insn_slt/insn_slti below) works
-    # correctly. Fixed by expressing the arithmetic shift without a signed
-    # cast at all (see arith_shift_expr).
+    # two separate implications (below) also didn't help, which at the time
+    # looked like it disproved the ternary-signedness hypothesis from the
+    # core itself. It didn't -- it's the SAME IEEE 1800-2023 SS11.8.1 rule
+    # ("if any operand is unsigned, the result is unsigned, regardless of
+    # the operator"), just reached through a different operator. Confirmed
+    # by an isolated minimal probe (a module where `r` is LITERALLY defined
+    # as `$signed(a) >>> n`, asserting `r == ($signed(a) >>> n)` -- a
+    # trivially-true self-check) that still failed. `r` itself is an
+    # unsigned wire; SS11.8.2's equality-operator exception says relational/
+    # equality operands "affect each other" to a shared type before
+    # comparing, and per SS11.8.1 that shared type is unsigned the moment
+    # either side is -- so `r`'s unsignedness propagates INTO the signed
+    # shift on the other side of `==`, same degrade as the ternary case, not
+    # a yosys-specific translation bug. Narrow, not a broad $signed()
+    # problem either way -- `$signed(x) < $signed(y)` (used by insn_slt/
+    # insn_slti below) is safe, since comparison results are unsigned
+    # regardless of operands per the same clause, so no signed VALUE ever
+    # needs to survive the comparison. Fixed by expressing the arithmetic
+    # shift without a signed cast at all (see arith_shift_expr). Full
+    # writeup: docs/systemverilog_ieee1800_rules.md SS1.
     expr = (
         f"(!({guard} && {RD_ADDR} == 5'd0) || ({RD_WDATA} == 32'd0)) && "
         f"(!({guard} && {RD_ADDR} != 5'd0) || ({RD_WDATA} == ({formula})))"
