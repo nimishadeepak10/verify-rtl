@@ -64,7 +64,7 @@ Rather than validating this pipeline only against toy designs, it's been deliber
 | `divider8.v` | Genuinely iterative sequential math | Two `FALSIFIED` verdicts turned out to be property-phrasing artifacts (comparing against a live input port instead of an internally-latched value) — confirmed by pulling the actual PDR counterexample trace before trusting either as a real bug. |
 | `multiplier32.v` | Solver difficulty at width, independent of the LLM pipeline | Proved in ~1s even at 32×32 — an honest negative result, not a forced timeout. |
 | `direct_cache.v` | Tag/valid arrays + an external, unconstrained memory interface | Only 1 of 11 suggested properties was expressible — the clearest demonstration yet of the same-cycle-only ceiling, cleanly split into two distinct limitation categories (temporal/liveness claims vs. internal-signal references the wrapper doesn't expose). |
-| `rv32i_core.v` *(in progress)* | A real RV32I core with the actual [RVFI](https://github.com/YosysHQ/riscv-formal) interface | Functional simulation caught two real RTL bugs before any formal run: a classic Verilog gotcha where a ternary's branch signedness silently overrides an explicit `$signed()` cast, and a missing operand-select case for branch instructions. RVFI-based per-instruction correctness properties (hand-written, following riscv-formal's own check pattern) are now proving out too — 25/25 for the ALU-reg, ALU-imm, and LUI/AUIPC groups so far, including two more real bugs found in the *properties themselves* (a missing RVFI write-suppression invariant, and a yosys formal-frontend limitation with `$signed(...) >>> ...`). Branches, jumps, and loads/stores are the remaining in-progress work. |
+| `rv32i_core.v` | A real RV32I core with the actual [RVFI](https://github.com/YosysHQ/riscv-formal) interface | Functional simulation caught two real RTL bugs before any formal run: a classic Verilog gotcha where a ternary's branch signedness silently overrides an explicit `$signed()` cast (root-caused against IEEE 1800-2023 §11.8.1 — see [`docs/systemverilog_ieee1800_rules.md`](docs/systemverilog_ieee1800_rules.md)), and a missing operand-select case for branch instructions. 57 hand-written RVFI properties (following riscv-formal's own check pattern) then covered the full RV32I base ISA — ALU-reg, ALU-imm, LUI/AUIPC, all 6 branches, JAL/JALR, and every load/store width/sign combination — and all **57/57 are PROVEN**. Getting there surfaced three more real bugs, none in the RTL: the same §11.8.1 signedness rule recurring through the equality operator instead of a ternary; branch/jump `pc_wdata` properties that didn't account for the core's correct trap-on-misaligned-target behavior; and a yosys frontend limitation where bit-selecting a parenthesized sub-expression (`(a + b)[1:0]`) is a syntax error, not a semantic one — fixed by expressing byte offsets and sign-extension with masks (`&`) instead of part-selects. |
 
 Every one of these designs was independently verified against real simulation (Icarus) before any formal claim was trusted against it — several of the "findings" above turned out, on inspection, to be testbench bugs rather than RTL bugs, and are reported as such rather than glossed over.
 
@@ -116,7 +116,7 @@ Both paths share the same analyzer and the same pluggable backend registry (`bac
 | `updown_counter.v` | Saturating arithmetic + control FSM |
 | `divider8.v`, `multiplier32.v` | Complex math (iterative and wide-combinational) |
 | `direct_cache.v` | Tag/valid arrays + external memory interface |
-| `rv32i_core.v` | Full RV32I core with a real RVFI interface *(in progress)* |
+| `rv32i_core.v` | Full RV32I core with a real RVFI interface — 57/57 properties PROVEN |
 
 ## Limitations
 
@@ -128,7 +128,6 @@ Both paths share the same analyzer and the same pluggable backend registry (`bac
 ## Roadmap
 
 - Close the internal-signal-exposure gap found in the cache stage (expose selected internal registers to the formal wrapper)
-- Finish the RVFI-based per-instruction correctness checks for `rv32i_core.v`
 - cocotb + Verilator backend
 - FSM transition golden models and coverage
 

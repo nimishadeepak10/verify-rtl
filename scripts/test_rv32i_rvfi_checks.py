@@ -61,6 +61,7 @@ MEM_RMASK = "rvfi_mem_rmask"
 MEM_WMASK = "rvfi_mem_wmask"
 MEM_RDATA = "rvfi_mem_rdata"
 MEM_WDATA = "rvfi_mem_wdata"
+TRAP = "rvfi_trap"
 
 IMM_I = f"{{{{20{{{INSN}[31]}}}}, {INSN}[31:20]}}"  # sign-extended 12-bit I-type imm
 IMM_S = f"{{{{20{{{INSN}[31]}}}}, {INSN}[31:25], {INSN}[11:7]}}"  # S-type (store) imm
@@ -135,14 +136,25 @@ def straight_pc_check(name, opcode, funct3=None, funct7=None):
 
 def pc_target_check(name, opcode, target_expr, funct3=None, funct7=None):
     guard = match(opcode, funct3, funct7)
-    expr = f"!({guard}) || ({PC_WDATA} == ({target_expr}))"
+    # !rvfi_trap guard: confirmed via VCD trace inspection on a real PDR
+    # counterexample (a BEQ taken to a misaligned target) that rv32i_core.v
+    # correctly freezes pc_next = pc (does NOT jump) when a branch/jump
+    # target is misaligned and the core traps instead. Without this guard
+    # every jump/branch pc_wdata check is falsified by that (correct) trap
+    # path, not by a real core bug -- the RVFI spec itself only constrains
+    # pc_wdata for the non-trapping case; a trapping instruction's next-PC
+    # is the trap handler's business, out of scope for this per-instruction
+    # correctness check.
+    expr = f"!({guard} && !{TRAP}) || ({PC_WDATA} == ({target_expr}))"
     return (name, expr)
 
 
 def branch_pc_check(name, funct3, taken_expr):
     guard = match("1100011", funct3)
+    # See pc_target_check's comment: same trap-freeze behavior applies to
+    # taken branches with a misaligned target.
     expr = (
-        f"!({guard}) || ({PC_WDATA} == (({taken_expr}) "
+        f"!({guard} && !{TRAP}) || ({PC_WDATA} == (({taken_expr}) "
         f"? ({PC_RDATA} + {IMM_B}) : ({PC_RDATA} + 32'd4)))"
     )
     return (name, expr)
@@ -162,16 +174,28 @@ def mask_expr(funct3_low2, byte_off_expr):
     return "4'b1111"
 
 
+def byte_off_expr(base_imm_expr):
+    # Yosys's Verilog frontend only accepts a bit-/part-select ([1:0]) on an
+    # identifier or net expression, not on an arbitrary parenthesized
+    # sub-expression -- (a + b)[1:0] is a real "unexpected '['" syntax error
+    # there (confirmed: every load/store check using this pattern failed
+    # identically at the same wrapper.sv column, across all 3 engines, while
+    # every word-sized (LW/SW) check -- the only ones NOT needing a byte
+    # offset -- passed). A bitwise mask expresses the same "lowest 2 bits"
+    # value without ever bit-selecting a non-lvalue expression.
+    return f"(({base_imm_expr}) & 32'd3)"
+
+
 def load_mask_check(name, funct3):
     guard = match("0000011", funct3)
-    byte_off = f"(({RS1} + {IMM_I})[1:0])"
+    byte_off = byte_off_expr(f"{RS1} + {IMM_I}")
     expr = f"!({guard}) || ({MEM_RMASK} == {mask_expr(funct3[1:3], byte_off)})"
     return (name, expr)
 
 
 def store_mask_check(name, funct3):
     guard = match("0100011", funct3)
-    byte_off = f"(({RS1} + {IMM_S})[1:0])"
+    byte_off = byte_off_expr(f"{RS1} + {IMM_S}")
     expr = f"!({guard}) || ({MEM_WMASK} == {mask_expr(funct3[1:3], byte_off)})"
     return (name, expr)
 
@@ -181,20 +205,35 @@ def store_wdata_check(name, funct3):
     # rv32i_core.v's own assign dmem_wdata = rs2_rdata << (byte_off * 8),
     # mirrored into rvfi_mem_wdata unchanged for stores.
     guard = match("0100011", funct3)
-    byte_off = f"(({RS1} + {IMM_S})[1:0])"
+    byte_off = byte_off_expr(f"{RS1} + {IMM_S}")
     expr = f"!({guard}) || ({MEM_WDATA} == ({RS2} << (({byte_off}) * 8)))"
     return (name, expr)
 
 
 def load_rd_formula(funct3, width, signed):
-    byte_off = f"(({RS1} + {IMM_I})[1:0])"
+    byte_off = byte_off_expr(f"{RS1} + {IMM_I}")
     shifted = f"({MEM_RDATA} >> (({byte_off}) * 8))"
+    # Same "no bit-select on a parenthesized expression" limitation as
+    # byte_off_expr above -- `shifted` is itself a computed sub-expression,
+    # not an identifier, so `shifted[7]`/`shifted[7:0]` hit the identical
+    # "unexpected '['" syntax error (confirmed: this was the one remaining
+    # ERROR class left after fixing the mask checks -- LB/LH/LBU/LHU, i.e.
+    # every load that isn't the full-word LW). Fixed the same way: express
+    # "low N bits" and "bit K" with `&`/comparison instead of a part-/bit-
+    # select, then build the sign-extended (or zero-extended) result with
+    # plain bitwise OR instead of a `{replication, slice}` concatenation.
     if width == 8:
-        return (f"{{{{24{{{shifted}[7]}}}}, {shifted}[7:0]}}" if signed
-                 else f"{{24'd0, {shifted}[7:0]}}")
+        low = f"({shifted} & 32'hFF)"
+        if not signed:
+            return low
+        sign_set = f"(({shifted} & 32'h80) != 32'd0)"
+        return f"({sign_set} ? (32'hFFFFFF00 | {low}) : {low})"
     if width == 16:
-        return (f"{{{{16{{{shifted}[15]}}}}, {shifted}[15:0]}}" if signed
-                 else f"{{16'd0, {shifted}[15:0]}}")
+        low = f"({shifted} & 32'hFFFF)"
+        if not signed:
+            return low
+        sign_set = f"(({shifted} & 32'h8000) != 32'd0)"
+        return f"({sign_set} ? (32'hFFFF0000 | {low}) : {low})"
     return shifted  # width == 32, LW
 
 
