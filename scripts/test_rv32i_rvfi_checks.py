@@ -28,12 +28,13 @@ Covers the full RV32I base integer set: ALU-reg, ALU-imm, LUI/AUIPC
 (rd_wdata correctness + straight-line pc_wdata==pc_rdata+4), the 6
 branches (pc_wdata correctness under both taken/not-taken, plus an
 explicit "branches never write rd" check), JAL/JALR (rd_wdata==return
-address, pc_wdata==target), and loads/stores (mem_addr/mem_rmask/
+address, pc_wdata==target), loads/stores (mem_addr/mem_rmask/
 mem_wmask/mem_rdata/mem_wdata consistency, plus load rd_wdata sign/zero
-extension). FENCE and ECALL/EBREAK are deliberately out of scope --
-FENCE is a no-op with nothing to check, and ECALL/EBREAK just need
-rvfi_trap==1, arguably better covered by a dedicated trap-behavior check
-than force-fit into this per-instruction-correctness shape.
+extension), and FENCE/SYSTEM (ECALL/EBREAK) trap behavior -- this core
+has no CSR file or privileged mode, so FENCE's and SYSTEM's entire
+per-instruction contract collapses to same-cycle rvfi_trap/pc_wdata/
+rd_wdata facts, which is exactly the shape this whole file already
+checks everything else in.
 """
 
 from __future__ import annotations
@@ -131,6 +132,29 @@ def rd_check(name, opcode, formula, funct3=None, funct7=None):
 def straight_pc_check(name, opcode, funct3=None, funct7=None):
     guard = match(opcode, funct3, funct7)
     expr = f"!({guard}) || ({PC_WDATA} == ({PC_RDATA} + 32'd4))"
+    return (name, expr)
+
+
+def trap_check(name, opcode, expect_trap, funct3=None, funct7=None):
+    """FENCE (never traps) and SYSTEM/ECALL/EBREAK (always traps, per this
+    core's documented no-CSR/no-privileged-mode design) are the two RV32I
+    encodings whose entire per-instruction contract IS their trap value --
+    confirmed against rv32i_core.v's own trap_w equation (`is_system` is
+    OR'd in unconditionally; `is_fence` is not), so this is a same-cycle,
+    formally-checkable fact, not a simulation-only claim."""
+    guard = match(opcode, funct3, funct7)
+    bit = "1'b1" if expect_trap else "1'b0"
+    expr = f"!({guard}) || ({TRAP} == {bit})"
+    return (name, expr)
+
+
+def pc_frozen_check(name, opcode, funct3=None, funct7=None):
+    """On trap, rv32i_core.v holds pc_next == pc (halts in place, no trap
+    handler modeled -- see the module header comment). For SYSTEM, which
+    always traps, that makes pc_wdata == pc_rdata itself a same-cycle
+    formal property, not just an implication of trap_check above."""
+    guard = match(opcode, funct3, funct7)
+    expr = f"!({guard}) || ({PC_WDATA} == {PC_RDATA})"
     return (name, expr)
 
 
@@ -309,6 +333,20 @@ CHECKS.append(store_wdata_check("store_wdata_sh", "001"))
 CHECKS.append(store_wdata_check("store_wdata_sw", "010"))
 CHECKS.append(rd_check("store_no_rd_write", "0100011", "32'd0"))
 CHECKS.append(straight_pc_check("pc_store", "0100011"))
+
+# ---- FENCE (opcode 0001111): known no-op, never traps, never writes rd ----
+CHECKS.append(trap_check("fence_no_trap", "0001111", expect_trap=False))
+CHECKS.append(rd_check("fence_no_rd_write", "0001111", "32'd0"))
+CHECKS.append(straight_pc_check("pc_fence", "0001111"))
+
+# ---- SYSTEM (opcode 1110011): ECALL/EBREAK -- this core has no CSR file or
+# privileged mode, so every SYSTEM encoding is treated as an unconditional
+# trap (confirmed: `is_system` is OR'd into trap_w with no further
+# qualification in rv32i_core.v) rather than distinguishing ECALL from
+# EBREAK from an illegal CSR op. ----
+CHECKS.append(trap_check("system_always_traps", "1110011", expect_trap=True))
+CHECKS.append(rd_check("system_no_rd_write", "1110011", "32'd0"))
+CHECKS.append(pc_frozen_check("system_pc_frozen", "1110011"))
 
 
 def main() -> None:
