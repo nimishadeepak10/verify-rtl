@@ -17,6 +17,14 @@ xvlog.pb
 # Formal-tab attempt log (local, not shared — see formal_log.py)
 logs/
 
+# SymbiYosys run-output workdirs (rebuildable from the .sby configs + RTL --
+# model dumps, SMT2, solver logs, VCD/.yw traces, status.sqlite). Keep the
+# .sby configs and source RTL, not the run output.
+MESI_Formal/mesi_line/
+MESI_Formal/mesi_line_cover/
+MESI_Formal/mesi_multi_cache/
+MESI_Formal/mesi_multi_cache_cover/
+
 # IDE / OS
 .idea/
 .vscode/

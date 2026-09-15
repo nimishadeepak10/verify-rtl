@@ -1,0 +1,14 @@
+[options]
+mode cover
+depth 30
+expect pass
+
+[engines]
+smtbmc
+
+[script]
+read -formal mesi_line.v
+prep -top mesi_line
+
+[files]
+../examples/mesi_line.v

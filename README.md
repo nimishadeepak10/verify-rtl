@@ -68,6 +68,14 @@ Rather than validating this pipeline only against toy designs, it's been deliber
 
 Every one of these designs was independently verified against real simulation (Icarus) before any formal claim was trusted against it — several of the "findings" above turned out, on inspection, to be testbench bugs rather than RTL bugs, and are reported as such rather than glossed over.
 
+## Formal deep-dive: MESI cache coherence protocol
+
+A separate, hand-built formal project (`examples/mesi_multi_cache.v` + `examples/mesi_cache_core.v`, `MESI_Formal/`) — SymbiYosys and hand-written SVA directly, not routed through VerifyRTL's LLM-assisted pipeline above, since proving cross-cache coherence invariants needs a genuinely multi-instance formal model (N=3 caches sharing one line over a snooping bus), not a single-DUT wrapper. Full test plan through sign-off: [`docs/verification_plan_mesi.md`](docs/verification_plan_mesi.md).
+
+**Proved by k-induction (unbounded, not a bounded sample):** mutual exclusion of the Modified state across all 3 caches; the general single-writer invariant (E/M implies sole ownership — no stale-Shared cache can coexist with a Modified one); correct read-miss classification (Exclusive vs. Shared depending on whether another cache already holds the line); unconditional invalidation on a remote write; and the "silent upgrade" (E→M with no bus transaction) optimization. 25/25 safety and functional-correctness properties PROVEN; 8/8 coverage goals reached, including a full ownership-transfer transaction confirmed by hand from the raw VCD trace, not just the solver's summary label.
+
+Two real yosys-frontend limitations were found and worked around while building this: bare concurrent SVA (`assert property (@(posedge clk) ...)`) isn't accepted by this project's yosys build at all (confirmed with an isolated probe, independent of this design) — substituted with `$past()`-based immediate assertions; and a static assert/cover label repeated across `generate for` iterations collides on cell naming — per-instance checks are left unlabeled, with SymbiYosys still identifying the failing cache via its hierarchical instance path. Both are documented in the plan, not silently patched around.
+
 ## Quick start
 
 ```powershell
@@ -117,6 +125,7 @@ Both paths share the same analyzer and the same pluggable backend registry (`bac
 | `divider8.v`, `multiplier32.v` | Complex math (iterative and wide-combinational) |
 | `direct_cache.v` | Tag/valid arrays + external memory interface |
 | `rv32i_core.v` | Full RV32I core with a real RVFI interface — 63/63 properties PROVEN ([verification plan](docs/verification_plan_rv32i.md)) |
+| `mesi_line.v`, `mesi_cache_core.v`, `mesi_multi_cache.v` | MESI cache coherence protocol, single- and multi-cache — 25/25 properties PROVEN, 8/8 covers reached ([verification plan](docs/verification_plan_mesi.md)) |
 
 ## Limitations
 
