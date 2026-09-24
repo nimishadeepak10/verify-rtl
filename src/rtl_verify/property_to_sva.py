@@ -53,18 +53,44 @@ Supported syntax (confirmed working by actually running it against a real formal
 - For "if A then B" / implication, write it as `!A || B` — NOT as `A -> B` or `A |-> B` (both
   confirmed broken: yosys's frontend rejects bare `->` too, not just `|->` — "syntax error,
   unexpected '>'" — even though `->` is valid standard SystemVerilog elsewhere).
+- `$past(EXPR)` — the value EXPR had one clock cycle ago. Use this for a "previous cycle" /
+  "next cycle" claim (e.g. "X must equal one more than X was last cycle" is
+  `X == $past(X) + 1`). The wrapper automatically guards every $past()-using property so it's
+  only checked once a genuinely valid previous cycle exists (never the very first evaluated
+  cycle, and never immediately after a reset pulse) — write the property's actual logical claim
+  and nothing else; do not add your own reset/first-cycle guard, the tool already does this for
+  you. Confirmed correct with an unbounded (PDR) proof on an isolated probe, and independently
+  confirmed via VCD trace inspection on several real hand-written properties (a cache-line
+  fill-then-read check, an ownership-transfer check in a multi-cache coherence model) before
+  being enabled here — not assumed safe. **Keep the condition and the comparison at the SAME time
+  offset from each other, consistently.** A "condition this cycle implies a change by next cycle"
+  claim must be checked as `!$past(CONDITION) || (VALUE == f($past(VALUE)))` — the condition
+  sampled from LAST cycle, compared against THIS cycle's value versus LAST cycle's value — not
+  `!CONDITION || (VALUE == f($past(VALUE)))` with the condition read from THIS cycle. That second,
+  wrong form was a real, confirmed mistake this feature caught in its own end-to-end test (three
+  otherwise-reasonable FIFO properties — "no read when empty implies count unchanged", "no write
+  when full implies count unchanged", "simultaneous read+write nets to zero change" — all written
+  with a current-cycle condition against `$past(count)`, and all three were correctly FALSIFIED by
+  the solver with a real counterexample, because they were checking the wrong pair of cycles, not
+  because the underlying design or the invariant itself was wrong). When in doubt, match the
+  working pattern already confirmed twice: sample the condition with `$past(...)`, compare the
+  quantity's current value against `$past(quantity)`.
 
 NOT supported — do not use, even though it looks like it should work (each tested directly
 against the real solver, not assumed):
 - `A -> B` or `A |-> B` or `A |=> B` — confirmed broken, yosys's parser rejects the arrow syntax
-  entirely in this context. Use `!A || B` instead (logically identical, and confirmed working).
-- `$past(...)` or any other sampled-value function — confirmed unreliable: it produced a wrong
-  verdict on a case independently confirmed correct by direct RTL inspection, likely an
-  interaction with async-reset modeling that isn't understood well enough to trust yet.
-- `@(posedge ...)` clocking events, `##` delay operators, or any other concurrent-assertion /
-  sequence syntax.
-- Anything that requires comparing a signal's value across two different clock cycles (a
-  "previous cycle" or "next cycle" claim) — this tool cannot currently express that safely.
+  entirely in this context. Use `!A || B` for same-cycle implication, or `!$past(A) || B` for a
+  "if A held last cycle, B must hold now" claim (logically identical to `A |=> B`, and confirmed
+  working through this tool's $past() support).
+- `@(posedge ...)` clocking events, `##` delay operators, or any other full concurrent-assertion /
+  sequence syntax (`assert property (...)`) — confirmed broken: this yosys build's frontend
+  rejects the entire `assert property (@(...) ...)` grammar production outright, not just specific
+  operators within it (tested directly, including on a newer yosys/oss-cad-suite release — same
+  result). `$past()` inside a plain `assert(...)` is the supported substitute.
+- A claim spanning more than one cycle back/forward (e.g. "eventually", "within N cycles",
+  "always after this point") — `$past()` reaches exactly one cycle back; nesting it arbitrarily
+  deep or expressing unbounded/liveness claims is not something this tool has validated and
+  should still be declined.
 - A signed shift or other signed value-producing sub-expression (`$signed(x) >>> n`,
   `$signed(x) <<< n`) as one of the two RESULT branches of a ternary (`cond ? A : B`) when the
   OTHER branch is unsigned. Per IEEE 1800-2023 §11.8.1 ("If any operand is unsigned, the result is
@@ -91,12 +117,18 @@ If the property is about a single, same-cycle relationship between signals (most
 properties, range checks, one-hot checks, mutual exclusion, causality between two signals whose
 truth is decided in the same cycle), set "expressible": true and give the boolean expression.
 
-If the property genuinely requires referencing a different clock cycle than the one it's
-evaluated in (words like "next cycle", "previous cycle", "eventually", "one cycle after"), set
-"expressible": false, leave "expr" as an empty string, and explain why in "note". Do NOT invent a
-same-cycle approximation for a genuinely multi-cycle claim — a same-cycle check of a next-cycle
-property checks a different, false claim and produces a misleading result, which is worse than
-declining to convert it at all.
+If the property is a "previous cycle" / "next cycle" claim reaching back exactly ONE clock edge
+(e.g. "X becomes Y one cycle after condition C" is `!$past(C) || (X == Y)`; "X only ever changes
+by at most 1 per cycle" is `(X == $past(X)) || (X == $past(X)+1) || (X == $past(X)-1)`), set
+"expressible": true and use `$past()` — see the supported-syntax section above. Do not write your
+own reset/first-cycle guard; the wrapper adds it automatically.
+
+If the property genuinely requires referencing MORE than one cycle back/forward, or is an
+unbounded/liveness claim (words like "eventually", "within N cycles", "always from this point
+on"), set "expressible": false, leave "expr" as an empty string, and explain why in "note". Do NOT
+invent a same-cycle approximation for a genuinely multi-cycle claim, and do not chain `$past()`
+calls speculatively for claims spanning more than one cycle — a wrong same-cycle or wrongly-nested
+check produces a misleading result, which is worse than declining to convert it at all.
 """
 
 

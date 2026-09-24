@@ -42,6 +42,52 @@ Property = Tuple[str, str, str]
 _KEYWORD = {"assert": "assert", "assume": "assume", "cover": "cover"}
 
 
+def _past_history_guard(module: RtlModule) -> str:
+    """Condition under which $past() reflects a genuinely valid prior
+    cycle: not the very first evaluated step (`$initstate()` -- true only
+    then, regardless of whether the design has a reset at all), and, for
+    designs that do have a reset, not immediately after any LATER reset
+    pulse either (reset legitimately breaks whatever "normal operation"
+    invariant a $past()-based property is checking -- excluding every
+    reset transition, not just the first cycle, is deliberate).
+
+    `$initstate()` alone was confirmed to work as a general first-cycle
+    guard on a reset-less free-running counter (PDR PASS, no false
+    counterexample); the `reset && $past(reset)` half was confirmed
+    separately (and repeatedly: RVFI, MESI, the direct_cache internal-
+    signal property) on designs that do have one. Combined here rather
+    than assumed to compose correctly on faith.
+    """
+    guard = "!$initstate()"
+    if module.reset_port:
+        if module.reset_active_low:
+            guard += f" && {module.reset_port} && $past({module.reset_port})"
+        else:
+            guard += f" && !{module.reset_port} && !$past({module.reset_port})"
+    return guard
+
+
+def _property_line(name: str, expr: str, kind: str, module: RtlModule) -> str:
+    """One property's line(s) inside the wrapper's always block.
+
+    A property referencing $past() gets automatically wrapped in
+    _past_history_guard() -- structurally, not left to the caller (human,
+    LLM, or hand-written script) to remember correctly every time. This
+    was a real, confirmed-necessary distinction: an UNGUARDED $past()
+    claim genuinely does fail on the very first evaluated cycle (there is
+    no valid "previous cycle" to compare against yet) -- expected and
+    correct, not a defect, but exactly the kind of mistake worth
+    eliminating by construction rather than by documentation once it's
+    understood. Same-cycle properties (no $past()) are emitted exactly as
+    before -- unguarded, checked from the first cycle, unchanged behavior.
+    """
+    line = f"{name}: {_KEYWORD[kind]} ({expr});"
+    if "$past(" not in expr:
+        return f"        {line}"
+    guard = _past_history_guard(module)
+    return f"        if ({guard}) begin\n            {line}\n        end"
+
+
 def generate_formal_wrapper(
     module: RtlModule,
     properties: Sequence[Property],
@@ -76,9 +122,7 @@ def generate_formal_wrapper(
         else:
             output_decls.append(f"    wire {rng_sp}{p.name};")
 
-    assert_lines = [
-        f"        {name}: {_KEYWORD[kind]} ({expr});" for name, expr, kind in properties
-    ]
+    assert_lines = [_property_line(name, expr, kind, module) for name, expr, kind in properties]
     conns_str = ",\n        ".join(conns)
 
     if clk:

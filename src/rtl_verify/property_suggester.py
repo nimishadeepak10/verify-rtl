@@ -98,12 +98,19 @@ an ordinary signal of the DUT for property purposes. If it's paired with a port 
 `__dbgsel_<signal>`, `<signal>` is an internal ARRAY (e.g. a tag/valid table): `__dbgsel_<signal>` \
 is an index input selecting which array element `__dbg_<signal>` currently reads. Left \
 unconstrained, the solver is free to pick any index every cycle — which is a genuine, useful \
-"for every entry" check, not a limitation — but a property comparing that array's value ACROSS \
-TWO CYCLES (e.g. with a "previous cycle" claim) must also require the index stayed the SAME \
-across those cycles, or it will silently compare two different array entries. Only propose a \
-multi-cycle claim over a `__dbg_*` array at all if you are also given explicit prior confirmation \
-that this pipeline's conversion step supports multi-cycle/sampled-value expressions — same-cycle \
-claims over `__dbg_*` signals are always safe to propose.
+"for every entry" check, not a limitation.
+- One-cycle "previous cycle" / "next cycle" claims (using `$past()`) ARE supported by this \
+pipeline's conversion step now — propose them when the design genuinely needs one (a value that \
+only changes by a bounded amount per cycle, a state that must update exactly one cycle after a \
+trigger, and so on). One real correctness requirement when the claim is about a `__dbg_*` ARRAY \
+specifically: a property comparing that array's value ACROSS TWO CYCLES must also require the \
+`__dbgsel_<signal>` index stayed the SAME across those cycles (e.g. include \
+`$past(__dbgsel_x) == __dbgsel_x` in the condition), or the claim silently compares two different \
+array entries instead of the same line's value over time — a real bug found and fixed this way \
+during this feature's own development, not a hypothetical. Claims reaching back more than one \
+cycle, or unbounded/liveness claims ("eventually", "within N cycles"), are still not supported — \
+propose those as-is and let the conversion step correctly decline them, rather than not proposing \
+a genuinely-needed property just because it might be declined.
 - Only propose properties you can actually justify from the given RTL structure and/or spec \
 text. Do not propose generic properties unrelated to this specific design.
 - There is no target property count and no cap. Propose as many properties as this specific \
