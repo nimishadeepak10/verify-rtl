@@ -55,6 +55,37 @@ class Port:
 
 
 @dataclass
+class InternalSignal:
+    """A `reg`/`logic` declared inside the module body, not a port -- real
+    persistent state (tags, valid bits, FSM/control regs, latched values)
+    that formal properties otherwise have no way to reference, since the
+    wrapper only wires up ports. See dut_probe.py, which turns a chosen
+    subset of these into real debug ports on an instrumented RTL copy."""
+
+    name: str
+    msb: int = 0
+    lsb: int = 0
+    is_array: bool = False
+    array_lo: int = 0
+    array_hi: int = 0
+
+    @property
+    def width(self) -> int:
+        return abs(self.msb - self.lsb) + 1
+
+    @property
+    def depth(self) -> int:
+        return abs(self.array_hi - self.array_lo) + 1 if self.is_array else 1
+
+    @property
+    def index_width(self) -> int:
+        """Bits needed for a debug-select input spanning this array's depth."""
+        if not self.is_array:
+            return 0
+        return max(1, math.ceil(math.log2(max(self.depth, 1))))
+
+
+@dataclass
 class RtlModule:
     name: str
     ports: List[Port] = field(default_factory=list)
@@ -70,6 +101,7 @@ class RtlModule:
     fsm_value_map: dict[str, str] = field(default_factory=dict)  # literal -> state name
     fsm_transitions: list[tuple[str, str]] = field(default_factory=list)  # (from,to) pairs (best-effort)
     combinational_blocks: List[str] = field(default_factory=list)  # always @(*) bodies
+    internal_signals: List[InternalSignal] = field(default_factory=list)
 
     @property
     def inputs(self) -> List[Port]:
@@ -244,6 +276,7 @@ def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
     is_sequential = _detect_sequential(body)
     state_reg, states, fsm_value_map, fsm_transitions = _detect_fsm(body, clock_port)
     comb_blocks = _detect_combinational_blocks(body)
+    internal_signals = _parse_internal_signals(body, {p.name for p in ports}, param_defaults)
     from .unsupported_scan import scan_rtl_for_unsupported
 
     scan = scan_rtl_for_unsupported(rtl)
@@ -265,6 +298,7 @@ def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
         fsm_value_map=fsm_value_map,
         fsm_transitions=fsm_transitions,
         combinational_blocks=comb_blocks,
+        internal_signals=internal_signals,
     )
 
 
@@ -385,6 +419,77 @@ def _parse_body_port_declarations(body: str, params: Dict[str, int]) -> List[Por
         if re.match(r"(input|output|inout)\b", stmt, re.IGNORECASE):
             ports.extend(_parse_port_list(stmt, params))
     return ports
+
+
+def _parse_internal_signals(
+    body: str, port_names: Set[str], params: Dict[str, int]
+) -> List[InternalSignal]:
+    """`reg`/`logic` declarations in the module body that aren't ports --
+    real persistent state. Deliberately excludes plain `wire` (usually a
+    same-cycle function of ports/other signals a property can just
+    recompute directly) and `integer` (loop counters, not design state) --
+    scoped to the actual gap this exists to close: registers a property
+    has no other way to reach.
+
+    Looks only at declarations before the first always/generate/assign,
+    which is where declarations conventionally live -- consistent with
+    _parse_body_port_declarations' same cutoff for the same reason.
+    """
+    cut = re.search(r"\b(always|generate|assign)\b", body, re.IGNORECASE)
+    region = body[: cut.start()] if cut else body
+
+    signals: List[InternalSignal] = []
+    for stmt in re.split(r";", region):
+        stmt = stmt.strip()
+        m = re.match(r"(?:reg|logic)\s+(.*)", stmt, re.IGNORECASE | re.DOTALL)
+        if not m:
+            continue
+        rest = re.sub(r"\s+", " ", m.group(1).strip())
+
+        # Leading packed range(s) -- reg [5:0] name; -- keep the last one
+        # seen as the per-element width (multi-dim packed ranges are rare
+        # enough here not to warrant full modeling).
+        elem_range = ""
+        while rest.startswith("["):
+            close = rest.find("]")
+            if close < 0:
+                break
+            elem_range = rest[: close + 1]
+            rest = rest[close + 1 :].strip()
+
+        for decl in rest.split(","):
+            decl = decl.strip()
+            if not decl:
+                continue
+            name_m = re.match(r"(\w+)\s*(\[[^\]]+\])?\s*(?:=.*)?$", decl)
+            if not name_m:
+                continue
+            name = name_m.group(1)
+            if name in port_names or name in params or name in _CASE_KEYWORDS:
+                continue
+
+            msb, lsb = 0, 0
+            if elem_range:
+                bounds = _eval_range_bounds(elem_range[1:-1], params)
+                if bounds is not None:
+                    msb, lsb = bounds
+
+            is_array = False
+            array_lo, array_hi = 0, 0
+            arr_dim = name_m.group(2)
+            if arr_dim:
+                bounds = _eval_range_bounds(arr_dim[1:-1], params)
+                if bounds is not None:
+                    is_array = True
+                    array_hi, array_lo = bounds
+
+            signals.append(
+                InternalSignal(
+                    name=name, msb=msb, lsb=lsb,
+                    is_array=is_array, array_lo=array_lo, array_hi=array_hi,
+                )
+            )
+    return signals
 
 
 def _merge_ports_by_name(primary: List[Port], overrides: List[Port]) -> List[Port]:

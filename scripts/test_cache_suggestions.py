@@ -13,6 +13,16 @@ real testbench race condition in the process (blocking-assignment
 stimulus racing the DUT's own posedge sampling), fixed and re-confirmed
 before trusting any formal result against the design.
 
+Originally found only 1 of 11 suggested properties expressible, because
+the wrapper only ever wired up the DUT's own ports -- the tag/valid
+arrays that make this design interesting are internal registers, with no
+port a property could reference. dut_probe.py closes that gap: this
+script now instruments the RTL (a generated COPY -- the file on disk is
+never touched) to expose every internal register as a real debug port
+before suggesting/converting/running, exactly the way api/main.py's
+formal endpoints now always do. Compare this run's expressible count
+against the "1 of 11" figure in the README to see the gap actually close.
+
 Real LLM calls, real SymbiYosys runs -- not mocked.
 """
 
@@ -27,6 +37,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from rtl_verify.analyzer import analyze_rtl  # noqa: E402
 from rtl_verify.backends.symbiyosys import SymbiYosysBackend  # noqa: E402
+from rtl_verify.dut_probe import generate_probed_rtl  # noqa: E402
 from rtl_verify.formal_props import generate_formal_wrapper, recommended_engine_chain  # noqa: E402
 from rtl_verify.property_suggester import suggest_properties  # noqa: E402
 from rtl_verify.property_to_sva import convert_to_sva  # noqa: E402
@@ -59,17 +70,37 @@ manual comparison against the suggestions below):
        target ("hit==1"), multi-cycle to actually reach, same shape as
        the FIFO's "full" cover in Stage 2)
     7. mem_req is reachable (trivial, any miss triggers it)
+
+  INTERNAL-SIGNAL, SAME-CYCLE (newly expressible via dut_probe.py --
+  these were previously impossible to even STATE, since tag_arr/
+  valid_arr/data_arr/cstate have no port; not a multi-cycle limitation,
+  a visibility one):
+    8. every tag_arr entry fits its declared 6-bit field regardless of
+       valid_arr (structural, holds even on garbage/reset entries)
+    9. cstate only ever encodes IDLE (0) or FILL (1) -- never an
+       out-of-range value on a 1-bit reg, but worth stating explicitly
+       for a wider control register in a bigger design
 """
 
 
 def main() -> None:
     rtl_path = ROOT / "examples" / "direct_cache.v"
-    rtl_source = rtl_path.read_text(encoding="utf-8")
-    module = analyze_rtl(rtl_source, top_module="direct_cache")
+    original_source = rtl_path.read_text(encoding="utf-8")
+    base_module = analyze_rtl(original_source, top_module="direct_cache")
+
+    # Instrument: expose every internal register (tag_arr, valid_arr,
+    # data_arr, cstate, r_index, r_tag, r_we, r_hit) as a real debug port
+    # on a generated copy -- rtl_path itself is never touched.
+    probed_source, module, probed = generate_probed_rtl(original_source, base_module)
+    work_root = Path(tempfile.mkdtemp(prefix="cache_e2e_probed_src_"))
+    rtl_path = work_root / "direct_cache_probed.v"
+    rtl_path.write_text(probed_source, encoding="utf-8")
+    print(f"Instrumented {len(probed)} internal registers as debug ports: "
+          f"{[p.source.name for p in probed]}\n")
 
     print(GROUND_TRUTH)
     print("=== Suggesting properties (LLM call 1) ===")
-    proposals = suggest_properties(module, rtl_source, spec_text="")
+    proposals = suggest_properties(module, probed_source, spec_text="")
     print(f"Got {len(proposals)} proposals:\n")
     for p in proposals:
         print(f"[{p['kind']:6s}] ({p['pattern']}) {p['description']}")

@@ -80,6 +80,13 @@ against the real solver, not assumed):
   only when the sign bit was set. Prefer declining a property like this if the safe rewrite isn't
   a clean single expression rather than risking the silent-degrade pattern above.
 
+A DUT port named `__dbg_<signal>` is a debug port: read-only visibility into an internal register
+that has no port of its own otherwise. Use it exactly like any other port. If it's paired with a
+port `__dbgsel_<signal>`, that internal signal is an array, and `__dbgsel_<signal>` is an index
+input selecting which element `__dbg_<signal>` reads — left as a free signal in the expression
+(not pinned to a literal), this is a genuine "for every array entry" check, which is normal and
+fine for a same-cycle property.
+
 If the property is about a single, same-cycle relationship between signals (most safety
 properties, range checks, one-hot checks, mutual exclusion, causality between two signals whose
 truth is decided in the same cycle), set "expressible": true and give the boolean expression.

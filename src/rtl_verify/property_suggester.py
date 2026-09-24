@@ -91,6 +91,19 @@ cover; propose the cover first, then link it. Cover and assume-kind properties s
 fifo, mutex), say so explicitly in the rationale.
 - Every expression must use the DUT's own port names exactly as given below — never invent a \
 signal name that isn't in the port list.
+- A port named `__dbg_<signal>` is a DEBUG PORT: read-only visibility into an internal register \
+called `<signal>` that has no real port of its own (added automatically so properties can \
+reference internal state — tags, valid bits, FSM/control registers — not just I/O). Treat it as \
+an ordinary signal of the DUT for property purposes. If it's paired with a port named \
+`__dbgsel_<signal>`, `<signal>` is an internal ARRAY (e.g. a tag/valid table): `__dbgsel_<signal>` \
+is an index input selecting which array element `__dbg_<signal>` currently reads. Left \
+unconstrained, the solver is free to pick any index every cycle — which is a genuine, useful \
+"for every entry" check, not a limitation — but a property comparing that array's value ACROSS \
+TWO CYCLES (e.g. with a "previous cycle" claim) must also require the index stayed the SAME \
+across those cycles, or it will silently compare two different array entries. Only propose a \
+multi-cycle claim over a `__dbg_*` array at all if you are also given explicit prior confirmation \
+that this pipeline's conversion step supports multi-cycle/sampled-value expressions — same-cycle \
+claims over `__dbg_*` signals are always safe to propose.
 - Only propose properties you can actually justify from the given RTL structure and/or spec \
 text. Do not propose generic properties unrelated to this specific design.
 - There is no target property count and no cap. Propose as many properties as this specific \

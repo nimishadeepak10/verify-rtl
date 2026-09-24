@@ -36,8 +36,30 @@ from rtl_verify import coverage_closure  # noqa: E402
 from rtl_verify.coverage_closure import run_closure_loop  # noqa: E402
 from rtl_verify.spec_traceability import build_traceability_matrix  # noqa: E402
 from rtl_verify.failure_triage import answer_question  # noqa: E402
+from rtl_verify.dut_probe import generate_probed_rtl  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
+
+
+def _analyze_and_probe(rtl_source: str, top_module: str):
+    """analyze_rtl() + generate_probed_rtl() as one step, for every formal
+    endpoint (suggest/convert/check). Internal registers -- tags, valid
+    bits, FSM state, anything with no port -- are otherwise invisible to a
+    property, which is exactly the gap the direct_cache.v stress-test
+    finding in the README documented (1 of 11 suggested properties was
+    expressible). Instrumenting here, once, means property_suggester.py
+    and property_to_sva.py need no changes at all: they already just list
+    `module.ports` in their prompts, and the debug ports this adds are, by
+    construction, ordinary ports by the time they see them.
+
+    A design with no internal registers (most of the simple combinational
+    examples) gets back its own rtl_source completely unchanged --
+    generate_probed_rtl() is a no-op when there's nothing to expose, so
+    this is safe to always call, not just for designs known to need it.
+    """
+    mod = analyze_rtl(rtl_source, top_module=top_module.strip() or None)
+    probed_source, probed_mod, _ = generate_probed_rtl(rtl_source, mod)
+    return probed_source, probed_mod
 STATIC = ROOT / "static"
 if STATIC.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
@@ -273,14 +295,19 @@ async def formal_check(
         return {"error": "properties must be a non-empty JSON list"}
 
     try:
-        mod = analyze_rtl(rtl_source, top_module=top_module.strip() or None)
+        probed_source, mod = _analyze_and_probe(rtl_source, top_module)
     except ValueError as e:
         return {"error": str(e)}
 
     base = Path(tempfile.mkdtemp(prefix="formal_api_"))
     ext = dut_source_extension(rtl_source, "systemverilog")
     rtl_path = base / f"dut{ext}"
-    rtl_path.write_text(rtl_source, encoding="utf-8")
+    # Write the INSTRUMENTED copy, not the original rtl_source -- mod.ports
+    # (and therefore the wrapper generated below) already expects the debug
+    # ports _analyze_and_probe() added; the file on disk has to match, or
+    # the wrapper's instantiation would fail to find those ports at all.
+    # The user's own original RTL is never written to or modified anywhere.
+    rtl_path.write_text(probed_source, encoding="utf-8")
 
     assume_props = []
     assumed_constraints = []
@@ -525,12 +552,15 @@ async def formal_suggest(
         spec = spec_text
 
     try:
-        mod = analyze_rtl(rtl_source, top_module=top_module.strip() or None)
+        probed_source, mod = _analyze_and_probe(rtl_source, top_module)
     except ValueError as e:
         return {"error": str(e)}
 
     try:
-        proposals = suggest_properties(mod, rtl_source, spec_text=spec)
+        # Show the LLM the instrumented source, not the original -- the
+        # `assign __dbg_x = x;` lines it adds are self-explanatory context
+        # for what the extra ports mean, without needing separate prose.
+        proposals = suggest_properties(mod, probed_source, spec_text=spec)
     except LLMNotConfigured as e:
         formal_log.log_event("suggest", {"module": mod.name, "error": str(e)})
         return {"error": str(e)}
@@ -582,7 +612,7 @@ async def formal_convert(
         return {"error": "properties must be a non-empty JSON list"}
 
     try:
-        mod = analyze_rtl(rtl_source, top_module=top_module.strip() or None)
+        _probed_source, mod = _analyze_and_probe(rtl_source, top_module)
     except ValueError as e:
         return {"error": str(e)}
 
