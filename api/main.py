@@ -38,6 +38,7 @@ from rtl_verify.spec_traceability import build_traceability_matrix  # noqa: E402
 from rtl_verify.failure_triage import answer_question  # noqa: E402
 from rtl_verify.dut_probe import generate_probed_rtl  # noqa: E402
 from rtl_verify.vacuity import run_vacuity_check  # noqa: E402
+from rtl_verify.cross_check import cross_check_property  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 
@@ -235,6 +236,7 @@ async def formal_check(
     properties: str = Form("[]"),
     timeout_sec: int = Form(300),
     depth_override: int = Form(0),
+    cross_check: bool = Form(True),
 ):
     """Check one or more hand-written boolean properties with SymbiYosys.
 
@@ -267,6 +269,16 @@ async def formal_check(
     be shown as if it were PROVEN or FALSIFIED (confirmed against sby's
     own source that PDR specifically can report UNKNOWN when it can't
     converge — a real, reachable case, not hypothetical).
+
+    `cross_check` (default True): after a definitive PASS/FAIL, re-run the
+    same property against an independent second engine (a genuinely
+    different algorithm/solver from `recommended_engine_chain()` — PDR,
+    k-induction/yices, k-induction/z3 are all independent implementations)
+    and compare. Agreement is real evidence the verdict isn't specific to
+    one tool's own bugs (this project found two, in one session, in
+    yosys's own SystemVerilog frontend); a disagreement is surfaced as its
+    own field, never silently resolved by trusting either side. Roughly
+    doubles solver time per property — set False to skip for speed.
 
     Independent of /api/verify — this never touches pipeline.py or the
     simulator backends, only the formal backend from Phase 1.
@@ -456,7 +468,7 @@ async def formal_check(
         else:
             verdict = "PROVEN" if result.success else "FALSIFIED"
 
-        results.append({
+        entry_out = {
             **entry,
             "expr": current_expr,
             "success": result.success,
@@ -469,7 +481,29 @@ async def formal_check(
             "waveform_json": waveform_json_data,
             "retried": attempt > 0,
             "retry_note": retry_note,
-        })
+        }
+
+        # Independent second-engine cross-check: only meaningful once a
+        # definitive verdict exists (never for ERROR/TIMEOUT/UNKNOWN, which
+        # already say the primary run itself didn't produce an answer).
+        if cross_check and result.status in ("PASS", "FAIL"):
+            cc = cross_check_property(
+                mod, rtl_path, engine, name, current_expr, kind,
+                primary_success=result.success,
+                primary_engine_label=entry_out["engine_label"],
+                timeout_sec=max(60, timeout_sec // max(1, len(target_props))),
+                depth_override=depth_override,
+                work_root=base / f"prop_{i}_crosscheck",
+            )
+            entry_out["cross_check"] = {
+                "performed": cc.performed,
+                "engine_label": cc.engine_label,
+                "status": cc.status,
+                "agrees": cc.agrees,
+                "note": cc.note,
+            }
+
+        results.append(entry_out)
 
     # Vacuity confidence: an assert can be PROVEN only because its own
     # triggering condition never occurs, which "proves" nothing useful.
@@ -540,6 +574,8 @@ async def formal_check(
         "verdict_counts": verdict_counts,
         "vacuity_warnings": sum(1 for r in results if r.get("vacuity_warning")),
         "vacuous_properties": sum(1 for r in results if r.get("confidence", {}).get("status") == "VACUOUS"),
+        "cross_checks_performed": sum(1 for r in results if r.get("cross_check", {}).get("performed")),
+        "cross_check_disagreements": sum(1 for r in results if r.get("cross_check", {}).get("agrees") is False),
         "retries": sum(1 for r in results if r.get("retried")),
         "success": all(r.get("success") for r in results),
     })
