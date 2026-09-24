@@ -37,6 +37,7 @@ from rtl_verify.coverage_closure import run_closure_loop  # noqa: E402
 from rtl_verify.spec_traceability import build_traceability_matrix  # noqa: E402
 from rtl_verify.failure_triage import answer_question  # noqa: E402
 from rtl_verify.dut_probe import generate_probed_rtl  # noqa: E402
+from rtl_verify.vacuity import run_vacuity_check  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 
@@ -470,35 +471,63 @@ async def formal_check(
             "retry_note": retry_note,
         })
 
-    # Vacuity cross-check: an assert can be PROVEN only because its own
-    # triggering condition never occurs, which "proves" nothing useful. If
-    # the property carries a paired_cover naming a cover in this same run,
-    # confirm that cover actually REACHED before trusting the assert.
+    # Vacuity confidence: an assert can be PROVEN only because its own
+    # triggering condition never occurs, which "proves" nothing useful.
+    # Every PROVEN assert gets a "confidence" verdict here — not just the
+    # LLM-suggested ones that happen to carry a hand-written paired_cover
+    # (property_suggester.py). Two tiers, cheapest first:
+    #  1. If a paired_cover was supplied AND already REACHED in this same
+    #     run, that's real evidence — use it, no extra solver call needed.
+    #  2. Otherwise, fall back to vacuity.py's automatic check: extract the
+    #     guard from the property's own !(guard) || (...) shape (this
+    #     project's standard form — see formal_props.py's helpers and
+    #     property_to_sva.py's own "write if-then as !A || B" convention)
+    #     and run a REAL cover(guard) through the solver. Every PROVEN
+    #     assert gets a definite confidence field either way: NON_VACUOUS,
+    #     VACUOUS, UNKNOWN (solver couldn't decide), or NOT_APPLICABLE
+    #     (the property isn't in the recognized shape) — never silently
+    #     skipped.
     verdict_by_name = {r["name"]: r for r in results}
-    for r in results:
-        if r["kind"] != "assert" or not r.get("paired_cover"):
+    for i, r in enumerate(results):
+        if r["kind"] != "assert" or r.get("verdict") != "PROVEN":
             continue
-        cover = verdict_by_name.get(r["paired_cover"])
-        if cover is None:
-            r["vacuity_warning"] = (
-                f"Paired cover \"{r['paired_cover']}\" was not included in this run — "
-                "reachability of this assert's trigger is unconfirmed."
-            )
-        elif cover.get("kind") != "cover":
-            r["vacuity_warning"] = (
-                f"Paired cover \"{r['paired_cover']}\" is not a cover property — "
-                "reachability of this assert's trigger is unconfirmed."
-            )
-        elif cover.get("verdict") != "REACHED":
-            # Report the cover's actual verdict rather than assuming
-            # UNREACHED — it may instead be TIMEOUT/UNKNOWN/ERROR, which
-            # means "we don't know if this is reachable," a different and
-            # weaker claim than "we know it's never reachable."
+
+        cover = verdict_by_name.get(r.get("paired_cover")) if r.get("paired_cover") else None
+        if cover is not None and cover.get("kind") == "cover" and cover.get("verdict") == "REACHED":
+            r["confidence"] = {
+                "checked": True,
+                "method": "paired_cover",
+                "guard_expr": None,
+                "status": "NON_VACUOUS",
+                "note": f"Confirmed via paired cover \"{r['paired_cover']}\", which REACHED.",
+            }
+            continue
+
+        if cover is not None and cover.get("kind") == "cover" and cover.get("verdict") != "REACHED":
             r["vacuity_warning"] = (
                 f"Paired cover \"{r['paired_cover']}\" is {cover.get('verdict', 'not resolved')} "
-                "(not REACHED) — this assert's trigger condition is not confirmed reachable, so "
-                "it may be vacuously true."
+                "(not REACHED) — falling back to the automatic guard-reachability check."
             )
+
+        try:
+            vac = run_vacuity_check(
+                mod, rtl_path, engine, r["name"], r["expr"],
+                timeout_sec=max(60, timeout_sec // max(1, len(target_props))),
+                depth_override=depth_override,
+                work_root=base / f"prop_{i}_vacuity",
+            )
+            r["confidence"] = {
+                "checked": vac.checked,
+                "method": vac.method,
+                "guard_expr": vac.guard_expr,
+                "status": vac.status,
+                "note": vac.note,
+            }
+        except Exception as e:  # noqa: BLE001 — a failed vacuity check must not break the main result
+            r["confidence"] = {
+                "checked": False, "method": None, "guard_expr": None,
+                "status": "ERROR", "note": f"Vacuity check itself failed: {e}",
+            }
 
     verdict_counts: dict[str, int] = {}
     for r in results:
@@ -510,6 +539,7 @@ async def formal_check(
         "num_assumed": len(assumed_constraints),
         "verdict_counts": verdict_counts,
         "vacuity_warnings": sum(1 for r in results if r.get("vacuity_warning")),
+        "vacuous_properties": sum(1 for r in results if r.get("confidence", {}).get("status") == "VACUOUS"),
         "retries": sum(1 for r in results if r.get("retried")),
         "success": all(r.get("success") for r in results),
     })

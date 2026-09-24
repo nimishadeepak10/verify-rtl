@@ -53,6 +53,8 @@ The wall-clock budget the caller sets is **split across the chain's rungs, never
 
 `TIMEOUT` / `UNKNOWN` / `CANCELLED` are surfaced as their own honest verdicts, distinct from both a real proof and a real counterexample — confirmed against SymbiYosys's source that `UNKNOWN` is a real, reachable PDR outcome, not a hypothetical edge case.
 
+**PROVEN isn't the last word, either.** A property can be technically PROVEN for a hollow reason — its own triggering condition never actually happens, so the "proof" says nothing about whatever it was meant to guarantee (`assert(a -> b)` where `a` is never true is trivially true and useless). Every PROVEN assert now gets an automatic **vacuity check** (`src/rtl_verify/vacuity.py`), not just the LLM-suggested properties that happen to carry a hand-written paired cover: it extracts the guard from this project's standard `!(guard) || (conclusion)` property shape and runs a real `cover(guard)` through the solver. The result — `NON_VACUOUS`, `VACUOUS`, `UNKNOWN`, or `NOT_APPLICABLE` (property isn't in that shape) — travels alongside every PROVEN verdict as a `confidence` field, so "PROVEN" is never shown without also saying how much that proof is actually worth.
+
 ## Stress-testing against increasing complexity
 
 Rather than validating this pipeline only against toy designs, it's been deliberately run against a sequence of harder RTL — each one chosen to test a *different* axis of difficulty, with results reported honestly, including the failures:
