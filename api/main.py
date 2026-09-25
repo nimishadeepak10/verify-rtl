@@ -41,6 +41,7 @@ from rtl_verify.vacuity import run_vacuity_check  # noqa: E402
 from rtl_verify.cross_check import cross_check_property  # noqa: E402
 from rtl_verify import regression  # noqa: E402
 from rtl_verify.regression import BaselineProperty  # noqa: E402
+from rtl_verify.blackbox import generate_blackboxed_rtl  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 
@@ -239,6 +240,7 @@ async def formal_check(
     timeout_sec: int = Form(300),
     depth_override: int = Form(0),
     cross_check: bool = Form(True),
+    blackbox_modules: str = Form(""),
 ):
     """Check one or more hand-written boolean properties with SymbiYosys.
 
@@ -282,6 +284,16 @@ async def formal_check(
     own field, never silently resolved by trusting either side. Roughly
     doubles solver time per property — set False to skip for speed.
 
+    `blackbox_modules` (default "", comma-separated module names): for
+    design-size reduction on real, larger designs — a named submodule's
+    entire body is replaced by a stub of the same name/ports/parameters
+    whose outputs are left genuinely undriven, so the solver treats them
+    as free rather than reasoning about that submodule's actual internal
+    logic at all (see src/rtl_verify/blackbox.py for why this matters and
+    what was tried and rejected first). Only black-box a submodule whose
+    internal computation the property genuinely doesn't depend on — its
+    OUTPUTS becoming free can change or break a property that does.
+
     Independent of /api/verify — this never touches pipeline.py or the
     simulator backends, only the formal backend from Phase 1.
     """
@@ -314,14 +326,25 @@ async def formal_check(
     except ValueError as e:
         return {"error": str(e)}
 
+    blackbox_names = [n.strip() for n in blackbox_modules.split(",") if n.strip()]
+    if blackbox_names:
+        try:
+            probed_source = generate_blackboxed_rtl(probed_source, blackbox_names)
+        except ValueError as e:
+            return {"error": f"Could not black-box {blackbox_names}: {e}"}
+
     base = Path(tempfile.mkdtemp(prefix="formal_api_"))
     ext = dut_source_extension(rtl_source, "systemverilog")
     rtl_path = base / f"dut{ext}"
-    # Write the INSTRUMENTED copy, not the original rtl_source -- mod.ports
-    # (and therefore the wrapper generated below) already expects the debug
-    # ports _analyze_and_probe() added; the file on disk has to match, or
-    # the wrapper's instantiation would fail to find those ports at all.
-    # The user's own original RTL is never written to or modified anywhere.
+    # Write the INSTRUMENTED (and, if requested, black-boxed) copy, not the
+    # original rtl_source -- mod.ports (and therefore the wrapper generated
+    # below) already expects the debug ports _analyze_and_probe() added,
+    # the file on disk has to match, or the wrapper's instantiation would
+    # fail to find those ports at all. The user's own original RTL is
+    # never written to or modified anywhere. Black-boxing only replaces a
+    # named SUBMODULE's own body with an undriven-output stub -- mod
+    # (describing the TOP module's own ports) is unaffected by it, so no
+    # separate re-analysis is needed here.
     rtl_path.write_text(probed_source, encoding="utf-8")
 
     assume_props = []
