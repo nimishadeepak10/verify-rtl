@@ -72,6 +72,77 @@ module comb_reset (
 endmodule
 """
 
+# `always @(posedge clk) if (rst) x <= 0; else x <= y;` -- an if/else
+# with no top-level begin/end where each arm is itself a bare statement.
+# A naive "stop at the first semicolon" scan truncates this at the `if`
+# arm and never sees the `else` arm at all -- exactly the real miss found
+# in ZipCPU's afifo.v, where the else arm was the actual synchronizer
+# capture.
+IFELSE_NO_BEGIN = """
+module ifelse_no_begin (
+    input  wire clk_a,
+    input  wire clk_b,
+    input  wire rst,
+    input  wire d,
+    output reg  q
+);
+    reg d_reg;
+    always @(posedge clk_a) d_reg <= d;
+
+    reg stage1;
+    always @(posedge clk_b)
+        if (rst) stage1 <= 1'b0;
+        else     stage1 <= d_reg;
+
+    always @(posedge clk_b)
+        if (rst) q <= 1'b0;
+        else     q <= stage1;
+endmodule
+"""
+
+# A concatenation-target shift-register synchronizer -- the idiom real
+# ZipCPU-style gray-code pointer synchronizers use, packing several
+# cross-domain flop stages into one line: `{a, b} <= {b, source};`.
+CONCAT_SHIFT_SYNC = """
+module concat_shift_sync (
+    input  wire clk_a,
+    input  wire clk_b,
+    input  wire [3:0] ptr_a,
+    output wire [3:0] ptr_b_sync
+);
+    reg [3:0] ptr_a_reg;
+    always @(posedge clk_a) ptr_a_reg <= ptr_a;
+
+    reg [3:0] ptr_b_reg, ptr_cross;
+    always @(posedge clk_b)
+        { ptr_b_reg, ptr_cross } <= { ptr_cross, ptr_a_reg };
+
+    assign ptr_b_sync = ptr_b_reg;
+endmodule
+"""
+
+# A design with an `ifdef FORMAL`-only "global clock" abstraction --
+# ZipCPU's own `(* gclk *) reg gbl_clk;` proof-only trick, real, common
+# convention in SymbiYosys/riscv-formal-style RTL. It must not be mistaken
+# for a genuine second clock domain: it doesn't exist in synthesized
+# hardware at all.
+IFDEF_FORMAL_SCAFFOLD = """
+module ifdef_formal_scaffold (
+    input  wire clk,
+    input  wire d,
+    output reg  q
+);
+    always @(posedge clk) q <= d;
+
+`ifdef FORMAL
+    reg gbl_clk;
+    reg past_q;
+    always @(posedge gbl_clk)
+        past_q <= q;
+`endif
+endmodule
+"""
+
 
 def main() -> None:
     print("=== Synthetic: proper 2+ stage synchronizer -> expect LIKELY_OK ===")
@@ -99,6 +170,33 @@ def main() -> None:
     r = report3.reset_signals[0]
     print(f"  {r.name}: kind={r.kind} verdict={r.verdict}")
     assert r.kind == "combinational" and r.verdict == "RISKY", r
+    print("OK\n")
+
+    print("=== Synthetic: if/else with no begin/end, capture in the else arm -> expect LIKELY_OK ===")
+    mod4 = analyze_rtl(IFELSE_NO_BEGIN, top_module="ifelse_no_begin")
+    report4 = analyze_cdc(mod4, IFELSE_NO_BEGIN)
+    crossing_sigs = {c.signal for c in report4.crossings}
+    print(f"  crossings found: {[(c.signal, c.sync_depth, c.verdict) for c in report4.crossings]}")
+    assert "d_reg" in crossing_sigs, "the else-arm capture chain must not be truncated away"
+    d_reg_crossing = next(c for c in report4.crossings if c.signal == "d_reg")
+    assert d_reg_crossing.verdict == "LIKELY_OK" and d_reg_crossing.sync_depth >= 2, d_reg_crossing
+    print("OK\n")
+
+    print("=== Synthetic: concatenation-target shift-register synchronizer -> expect LIKELY_OK depth=2 ===")
+    mod5 = analyze_rtl(CONCAT_SHIFT_SYNC, top_module="concat_shift_sync")
+    report5 = analyze_cdc(mod5, CONCAT_SHIFT_SYNC)
+    assert len(report5.crossings) == 1, report5.crossings
+    c5 = report5.crossings[0]
+    print(f"  {c5.signal}: depth={c5.sync_depth} verdict={c5.verdict}")
+    assert c5.signal == "ptr_a_reg" and c5.verdict == "LIKELY_OK" and c5.sync_depth == 2, c5
+    print("OK\n")
+
+    print("=== Synthetic: `ifdef FORMAL`-only clock abstraction -> must not appear as a real domain ===")
+    mod6 = analyze_rtl(IFDEF_FORMAL_SCAFFOLD, top_module="ifdef_formal_scaffold")
+    report6 = analyze_cdc(mod6, IFDEF_FORMAL_SCAFFOLD)
+    print(f"  domains={list(report6.domains.keys())} crossings={len(report6.crossings)}")
+    assert list(report6.domains.keys()) == ["clk"], "gbl_clk is formal-only scaffolding, not a real clock domain"
+    assert len(report6.crossings) == 0
     print("OK\n")
 
     print("=== Sanity: single-clock design (rv32i_core.v) -> expect zero crossings ===")

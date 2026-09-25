@@ -263,6 +263,41 @@ def _strip_comments(rtl: str) -> str:
     return rtl
 
 
+def strip_ifdef_blocks(text: str, exclude_macros: Set[str]) -> str:
+    """Blank out the branch of an `` `ifdef``/`` `ifndef`` guarded by a macro
+    in ``exclude_macros`` (e.g. ``FORMAL``), line-for-line so line numbers
+    stay stable. A directive for a macro not in ``exclude_macros`` is left
+    untouched -- this is a targeted strip for known verification-only
+    scaffolding (the `` `ifdef FORMAL`` convention used throughout SymbiYosys/
+    riscv-formal/ZipCPU-style RTL for assumptions, cover statements, and
+    proof-only clock abstractions like ZipCPU's ``(* gclk *)`` trick), not a
+    general Verilog preprocessor. Nesting is handled via a stack; an
+    `` `else`` under an excluded branch is kept (it's the real, synthesized
+    path when the macro isn't defined).
+    """
+    lines = text.split("\n")
+    stack: List[bool] = []
+    out_lines: List[str] = []
+    for line in lines:
+        m = re.match(r"^\s*`(ifdef|ifndef)\s+(\w+)", line)
+        if m:
+            directive, macro = m.group(1), m.group(2)
+            exclude_branch = (macro in exclude_macros) if directive == "ifdef" else False
+            stack.append(exclude_branch)
+            out_lines.append("")
+            continue
+        if stack and re.match(r"^\s*`else\b", line):
+            stack[-1] = not stack[-1]
+            out_lines.append("")
+            continue
+        if stack and re.match(r"^\s*`endif\b", line):
+            stack.pop()
+            out_lines.append("")
+            continue
+        out_lines.append("" if any(stack) else line)
+    return "\n".join(out_lines)
+
+
 def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
     """Extract the first (or named) module and its ports from RTL text."""
     clean = _strip_comments(rtl)

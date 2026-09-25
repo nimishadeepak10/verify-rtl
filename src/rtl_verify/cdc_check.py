@@ -36,13 +36,22 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
-from .analyzer import Port, PortDirection, RtlModule, _strip_comments
+from .analyzer import Port, PortDirection, RtlModule, _strip_comments, strip_ifdef_blocks
+
+# Verification-only scaffolding macros (SymbiYosys/riscv-formal/ZipCPU
+# convention) whose guarded branch must be excluded from this structural
+# scan -- e.g. ZipCPU's `(* gclk *) reg gbl_clk;` proof-only clock
+# abstraction, which doesn't exist in synthesized hardware and would
+# otherwise be mistaken for a genuine third clock domain.
+_VERIFICATION_ONLY_MACROS = {"FORMAL"}
 from .always_model import _extract_balanced_block
 
 _ALWAYS_HEADER = re.compile(
     r"always(?:_ff)?\s*@\s*\(([^)]*)\)\s*(begin)?", re.IGNORECASE
 )
 _LHS_NONBLOCKING = re.compile(r"(\w+)\s*(?:\[[^\]]*\])?\s*<=")
+_CONCAT_LHS_NONBLOCKING = re.compile(r"\{([^{}]+)\}\s*<=")
+_CONCAT_SHIFT_ASSIGN = re.compile(r"\{([^{}]+)\}\s*<=\s*\{([^{}]+)\}\s*;")
 _EDGE_TRIGGER = re.compile(r"\b(posedge|negedge)\s+(\w+)", re.IGNORECASE)
 
 
@@ -51,6 +60,63 @@ class AlwaysBlock:
     clock_signal: Optional[str]  # first posedge/negedge trigger, if any
     edge_signals: List[str]  # every posedge/negedge-triggered signal (clock + async reset)
     body: str
+
+
+def _consume_stmt_end(text: str, i: int) -> int:
+    """Index just past the end of the single Verilog statement starting at
+    `i` (leading whitespace skipped): a `begin ... end` block, an
+    `if (...) stmt [else stmt]` chain (each arm itself a nested statement,
+    recursively), or a plain `...;`-terminated statement.
+
+    Needed because an `always` block with no *top-level* `begin`/`end` can
+    still be a compound `if/else` whose arms individually have no
+    `begin`/`end` either -- naively stopping at the first `;` truncates
+    the `else` arm entirely. Confirmed a real, not hypothetical, miss:
+    a real async-FIFO gray-pointer synchronizer capture written exactly
+    this way (`if (!rst) x <= 0; else x <= y;`) had its `else` branch --
+    the actual capture -- silently dropped before this was added,
+    reporting a real, correctly-synchronized crossing as never
+    referenced at all.
+    """
+    n = len(text)
+    j = i
+    while j < n and text[j].isspace():
+        j += 1
+
+    def _word_at(pos: int, word: str) -> bool:
+        end = pos + len(word)
+        if text[pos:end] != word:
+            return False
+        return end == n or not (text[end].isalnum() or text[end] == "_")
+
+    if _word_at(j, "begin"):
+        _, end = _extract_balanced_block(text, j + 5)
+        return end
+    if _word_at(j, "if"):
+        paren = text.find("(", j)
+        if paren < 0:
+            semi = text.find(";", j)
+            return (semi + 1) if semi >= 0 else n
+        depth = 0
+        k = paren
+        while k < n:
+            if text[k] == "(":
+                depth += 1
+            elif text[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    k += 1
+                    break
+            k += 1
+        then_end = _consume_stmt_end(text, k)
+        m = then_end
+        while m < n and text[m].isspace():
+            m += 1
+        if _word_at(m, "else"):
+            return _consume_stmt_end(text, m + 4)
+        return then_end
+    semi = text.find(";", j)
+    return (semi + 1) if semi >= 0 else n
 
 
 def _find_always_blocks(clean_body: str) -> List[AlwaysBlock]:
@@ -73,16 +139,43 @@ def _find_always_blocks(clean_body: str) -> List[AlwaysBlock]:
         if has_begin:
             body, _ = _extract_balanced_block(clean_body, m.end())
         else:
-            semi = clean_body.find(";", m.end())
-            if semi < 0:
-                continue
-            body = clean_body[m.end():semi + 1]
+            end = _consume_stmt_end(clean_body, m.end())
+            body = clean_body[m.end():end]
         blocks.append(AlwaysBlock(clock_signal=clock_signal, edge_signals=edges, body=body))
     return blocks
 
 
 def _registers_driven(block_body: str) -> Set[str]:
-    return {m.group(1) for m in _LHS_NONBLOCKING.finditer(block_body)}
+    regs = {m.group(1) for m in _LHS_NONBLOCKING.finditer(block_body)}
+    for m in _CONCAT_LHS_NONBLOCKING.finditer(block_body):
+        regs |= {t.strip() for t in m.group(1).split(",") if re.fullmatch(r"\w+", t.strip())}
+    return regs
+
+
+def _concat_shift_advance(dest_body: str, current: str) -> Optional[tuple[str, int]]:
+    """Detect the common shift-register-via-concatenation synchronizer
+    idiom: `{ stageN, ..., stage1 } <= { stageN-1, ..., stage1, source };`
+    -- every clock, the whole bit vector shifts one register-width to the
+    left and `source` is captured in at the tail. This is a real, common
+    way to write a multi-flop synchronizer (seen in ZipCPU-style RTL,
+    e.g. gray-code pointer synchronizers packing several cross-domain
+    flops into one concatenated shift register) that a plain single-
+    identifier `reg <= reg;` scan can't see at all -- confirmed missed
+    entirely before this was added, silently reporting a real,
+    correctly-synchronized crossing as unsynchronized.
+
+    Returns (new_current, stages_advanced) if `current` is the RHS's
+    last (innermost/newest) term and the rest of the RHS matches the
+    LHS shifted by one position, else None.
+    """
+    for m in _CONCAT_SHIFT_ASSIGN.finditer(dest_body):
+        lhs_terms = [t.strip() for t in m.group(1).split(",")]
+        rhs_terms = [t.strip() for t in m.group(2).split(",")]
+        if len(lhs_terms) < 2 or len(lhs_terms) != len(rhs_terms):
+            continue
+        if rhs_terms[-1] == current and lhs_terms[1:] == rhs_terms[:-1]:
+            return lhs_terms[0], len(lhs_terms)
+    return None
 
 
 def _identifiers_referenced(text: str) -> Set[str]:
@@ -142,6 +235,17 @@ def _sync_depth_for_crossing(signal: str, dest_body: str, dest_registers: Set[st
     current = signal
     seen: Set[str] = set()
     while True:
+        concat_hit = _concat_shift_advance(dest_body, current)
+        if concat_hit is not None:
+            target, stages = concat_hit
+            if target in seen:
+                return depth, "capture chain loops back on itself"
+            seen.add(target)
+            depth += stages
+            current = target
+            if depth >= 4:
+                return depth, "capture chain traced 4+ stages deep (capped)"
+            continue
         # Every assignment whose RHS references `current` at all.
         refs = [
             m for m in re.finditer(rf"(\w+)\s*(?:\[[^\]]*\])?\s*<=\s*([^;]+);", dest_body)
@@ -179,7 +283,7 @@ def analyze_cdc(module: RtlModule, rtl_source: str) -> CDCReport:
     """Build a CDCReport: clock domains, every cross-domain signal
     reference, and every async-reset signal's provenance.
     """
-    clean = _strip_comments(rtl_source)
+    clean = strip_ifdef_blocks(_strip_comments(rtl_source), _VERIFICATION_ONLY_MACROS)
     blocks = _find_always_blocks(clean)
 
     domains: Dict[str, ClockDomain] = {}
