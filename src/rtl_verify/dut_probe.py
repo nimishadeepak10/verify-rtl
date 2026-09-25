@@ -109,7 +109,7 @@ def _insert_before_module_close_paren(rtl_source: str, module_name: str, extra_p
     before its closing `)`. Reuses analyzer's own paren-matching so this
     handles parameterized headers (`module foo #(...) (...)`) the same
     way analyze_rtl does."""
-    from .analyzer import _find_matching_paren, _skip_ws  # same-package helper reuse
+    from .analyzer import find_hash_paren_close, _find_matching_paren, _skip_ws  # same-package helper reuse
     import re
 
     m = re.search(rf"\bmodule\s+{re.escape(module_name)}\b", rtl_source)
@@ -117,7 +117,7 @@ def _insert_before_module_close_paren(rtl_source: str, module_name: str, extra_p
         raise ValueError(f"Could not find 'module {module_name}' in RTL source")
     idx = _skip_ws(rtl_source, m.end())
     if idx < len(rtl_source) and rtl_source[idx] == "#":
-        idx = _skip_ws(rtl_source, _find_matching_paren(rtl_source, idx + 1) + 1)
+        idx = _skip_ws(rtl_source, find_hash_paren_close(rtl_source, idx) + 1)
     if idx >= len(rtl_source) or rtl_source[idx] != "(":
         raise ValueError(f"Could not find module '{module_name}''s port list")
     close = _find_matching_paren(rtl_source, idx)

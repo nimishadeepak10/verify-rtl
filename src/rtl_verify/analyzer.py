@@ -126,6 +126,23 @@ def _parse_width(msb: str, lsb: str) -> tuple[int, int]:
     return int(msb.strip()), int(lsb.strip())
 
 
+def find_hash_paren_close(text: str, hash_idx: int) -> int:
+    """Given the index of a `#` introducing a parameter port list, return
+    the index of the matching closing `)`.
+
+    `#` and its parameter list's own `(` are not always adjacent --
+    `module foo #\\n(\\n    parameter ...\\n)` (the `#` on its own line) is
+    common real-world style. This exact gap independently caused a real
+    parse failure in three separate call sites in this codebase
+    (_extract_module_interface here, dut_probe.py, blackbox.py) against a
+    real, widely-used open-source module (585-star repo) before being
+    found and fixed -- consolidated into one shared helper afterward so a
+    fourth copy of the same bug isn't a matter of time.
+    """
+    paren_idx = _skip_ws(text, hash_idx + 1)
+    return _find_matching_paren(text, paren_idx)
+
+
 def _find_matching_paren(text: str, open_idx: int) -> int:
     if open_idx >= len(text) or text[open_idx] != "(":
         raise ValueError("expected '('")
@@ -229,8 +246,9 @@ def _extract_module_interface(
     idx = _skip_ws(clean, m.end())
     params: Dict[str, int] = {}
     if idx < len(clean) and clean[idx] == "#":
-        hash_end = _find_matching_paren(clean, idx + 1)
-        params = _parse_parameter_defaults(clean[idx + 1 : hash_end])
+        hash_end = find_hash_paren_close(clean, idx)
+        param_start = _skip_ws(clean, idx + 1) + 1
+        params = _parse_parameter_defaults(clean[param_start:hash_end])
         idx = _skip_ws(clean, hash_end + 1)
     if idx >= len(clean) or clean[idx] != "(":
         return _extract_header_ports(clean, target_name), params

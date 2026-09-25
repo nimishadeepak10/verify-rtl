@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import re
 
-from .analyzer import PortDirection, RtlModule, _find_matching_paren, _skip_ws, analyze_rtl
+from .analyzer import PortDirection, RtlModule, find_hash_paren_close, _skip_ws, analyze_rtl
 
 
 def _find_module_span(rtl_source: str, module_name: str) -> tuple[int, int]:
@@ -88,7 +88,7 @@ def _extract_param_header(original_module_text: str, module_name: str) -> str:
     idx = _skip_ws(original_module_text, m.end())
     if idx >= len(original_module_text) or original_module_text[idx] != "#":
         return ""
-    close = _find_matching_paren(original_module_text, idx + 1)
+    close = find_hash_paren_close(original_module_text, idx)
     return original_module_text[idx: close + 1]
 
 
