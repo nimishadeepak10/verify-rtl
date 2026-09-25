@@ -78,7 +78,7 @@ Rather than validating this pipeline only against toy designs, it's been deliber
 
 Every one of these designs was independently verified against real simulation (Icarus) before any formal claim was trusted against it — several of the "findings" above turned out, on inspection, to be testbench bugs rather than RTL bugs, and are reported as such rather than glossed over.
 
-Adding internal-signal visibility touches shared pipeline code (`analyzer.py`, the formal wrapper path), so after it shipped, every prior sign-off was re-run end to end rather than assumed safe: RV32I's 63/63 RVFI properties and MESI's 25/25 safety/correctness properties + 8/8 coverage goals all re-confirmed with zero regressions.
+Adding internal-signal visibility touches shared pipeline code (`analyzer.py`, the formal wrapper path), so after it shipped, every prior sign-off was re-run end to end rather than assumed safe: RV32I's 63/63 RVFI properties and MESI's 25/25 safety/correctness properties + 8/8 coverage goals all re-confirmed with zero regressions. Re-confirmed again after adding `cvc5`/`bitwuzla` to the engine chain and fixing the process-tree timeout-kill bug in `backends/symbiyosys.py` — both touch shared formal-backend code — with the same zero-regression result.
 
 ## Formal deep-dive: MESI cache coherence protocol
 
