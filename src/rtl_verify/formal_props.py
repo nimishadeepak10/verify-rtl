@@ -105,6 +105,29 @@ def generate_formal_wrapper(
         if kind not in _KEYWORD:
             raise ValueError(f"'{name}': kind must be assert/assume/cover, got {kind!r}")
     clk = clock_port or module.clock_port
+    if module.is_sequential and not clk:
+        # Building the combinational-style `always @(*)` check block below
+        # for a design that's actually sequential would be silently wrong,
+        # not just incomplete -- confirmed real, not hypothetical, by
+        # testing this project against a real dual-clock async FIFO: this
+        # exact path used to build that check block anyway, while
+        # recommended_formal_config() independently picked PDR/"prove"
+        # mode (meant only for genuinely clocked designs) for the same
+        # module, an inconsistency neither function alone could see. Fail
+        # loudly and specifically here instead.
+        if module.has_multiple_clocks:
+            raise ValueError(
+                f"'{module.name}' has more than one clock-driven always block with "
+                "different clock signals (a genuine multi-clock/CDC design, e.g. an "
+                "async FIFO's wr_clk/rd_clk) -- this pipeline only models a single "
+                "clock domain and cannot safely build a formal check block for it. "
+                "Pass an explicit clock_port only if you specifically want to check "
+                "one clock domain in isolation, understanding the other is unmodeled."
+            )
+        raise ValueError(
+            f"'{module.name}' is sequential (has posedge/negedge-triggered logic) but no "
+            "clock port could be identified -- pass clock_port explicitly."
+        )
 
     wrapper_name = f"{module.name}_formal_top"
 

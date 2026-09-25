@@ -256,9 +256,7 @@ class SymbiYosysBackend(SimulatorBackend):
 
         log_lines: list[str] = ["=== SYMBIYOSYS ===", " ".join(run_cmd)]
         popen_kwargs: dict = {}
-        if platform.system() == "Windows":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
+        if platform.system() != "Windows":
             popen_kwargs["start_new_session"] = True  # own process group, for killpg on timeout
         try:
             proc = subprocess.Popen(

@@ -102,6 +102,7 @@ class RtlModule:
     fsm_transitions: list[tuple[str, str]] = field(default_factory=list)  # (from,to) pairs (best-effort)
     combinational_blocks: List[str] = field(default_factory=list)  # always @(*) bodies
     internal_signals: List[InternalSignal] = field(default_factory=list)
+    has_multiple_clocks: bool = False
 
     @property
     def inputs(self) -> List[Port]:
@@ -289,7 +290,7 @@ def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
             f"Could not extract ports for module '{target_name}'. "
             "Use ANSI-style port declarations (input/output/inout) in the header or body."
         )
-    clock_port = _detect_clock_port(ports)
+    clock_port, has_multiple_clocks = _detect_clock_port(ports, body)
     reset_port, reset_active_low = _detect_reset_port(ports)
     is_sequential = _detect_sequential(body)
     state_reg, states, fsm_value_map, fsm_transitions = _detect_fsm(body, clock_port)
@@ -317,6 +318,7 @@ def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
         fsm_transitions=fsm_transitions,
         combinational_blocks=comb_blocks,
         internal_signals=internal_signals,
+        has_multiple_clocks=has_multiple_clocks,
     )
 
 
@@ -517,11 +519,63 @@ def _merge_ports_by_name(primary: List[Port], overrides: List[Port]) -> List[Por
     return list(by_name.values())
 
 
-def _detect_clock_port(ports: List[Port]) -> Optional[str]:
+def _find_posedge_clock_candidates(body: str, port_names: Set[str]) -> List[str]:
+    """Distinct port names appearing as the clock in an
+    `always @(posedge <name> ...)` sensitivity list, in order of first
+    appearance. Deliberately matches only the FIRST edge in the
+    sensitivity list (`@(` immediately followed by `posedge <name>`), not
+    every `posedge` in it -- an async reset is conventionally the SECOND
+    trigger (`always @(posedge clk or posedge rst)`,
+    `always @(posedge clk or negedge rst_n)`), and matching every
+    `posedge` indiscriminately mistook such a reset for a second clock in
+    an early version of this function (caught by testing the positive
+    case, a real single-clock design with an active-high async reset, not
+    just the negative multi-clock case this was written for). Only ports
+    (not internal regs) are considered, so this can't mistake an internal
+    counter for a clock either.
+    """
+    seen: List[str] = []
+    for m in re.finditer(r"@\s*\(\s*posedge\s+(\w+)", body):
+        name = m.group(1)
+        if name in port_names and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def _detect_clock_port(ports: List[Port], body: str = "") -> Tuple[Optional[str], bool]:
+    """Returns (clock_port_name_or_None, has_multiple_clocks).
+
+    First tries the well-known-name heuristic (clk/clock/ck). If that
+    doesn't hit, falls back to a structural scan for `posedge <port>`
+    occurrences: exactly one distinct port used this way is a single
+    clock that's just unusually named (e.g. `clk_i`, `sys_clk`) -- a real
+    gap this closes, not a hypothetical one, found by testing this
+    project against real third-party RTL. More than one distinct
+    posedge-driven port is a genuine multi-clock design (e.g. an async
+    FIFO's `wr_clk`/`rd_clk`) -- correctly reported as "no single clock",
+    not guessed at, with `has_multiple_clocks=True` so callers (see
+    formal_props.py's generate_formal_wrapper) can raise a specific,
+    actionable error instead of silently misbehaving. That silent
+    misbehavior was real, not theoretical, before this fix:
+    generate_formal_wrapper() built a combinational `always @(*)` check
+    block (since `clock_port` was None) for a design
+    `recommended_formal_config()` had separately, independently decided
+    to run through PDR/"prove" mode -- meant only for genuinely clocked
+    designs -- a real inconsistency between two functions that each only
+    looked at one of `clock_port` / `is_sequential`.
+    """
     for p in ports:
         if p.direction == PortDirection.INPUT and p.name.lower() in _CLOCK_NAMES:
-            return p.name
-    return None
+            return p.name, False
+    if not body:
+        return None, False
+    port_names = {p.name for p in ports if p.direction == PortDirection.INPUT}
+    candidates = _find_posedge_clock_candidates(body, port_names)
+    if len(candidates) == 1:
+        return candidates[0], False
+    if len(candidates) > 1:
+        return None, True
+    return None, False
 
 
 def _detect_reset_port(ports: List[Port]) -> Tuple[Optional[str], bool]:
