@@ -42,6 +42,7 @@ from rtl_verify.cross_check import cross_check_property  # noqa: E402
 from rtl_verify import regression  # noqa: E402
 from rtl_verify.regression import BaselineProperty  # noqa: E402
 from rtl_verify.blackbox import generate_blackboxed_rtl  # noqa: E402
+from rtl_verify.cdc_check import analyze_cdc  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 
@@ -942,6 +943,60 @@ async def traceability(
     except Exception as e:  # noqa: BLE001 — surface any LLM failure, don't 500
         return {"error": f"Traceability build failed: {e}"}
     return result
+
+
+@app.post("/api/cdc")
+async def cdc_check(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    top_module: str = Form(""),
+):
+    """Clock-domain-crossing (CDC) and reset-domain-crossing (RDC) check --
+    a static structural scan, not a formal proof (see cdc_check.py's own
+    docstring for exactly what that does and doesn't claim). Runs no
+    solver, so this is fast and needs no formal backend.
+
+    Returns: `domains` (clock signal -> register count), `crossings`
+    (every signal referenced across a clock-domain boundary, with a
+    best-effort synchronizer-depth verdict: NON_VACUOUS-style
+    UNSYNCHRONIZED / WEAK / LIKELY_OK), and `reset_signals` (every
+    async-reset trigger, classified as a primary input, a registered/
+    synchronized signal, or risky combinational logic). A single-clock
+    design correctly reports zero crossings — that's not a limitation,
+    it's the honest answer when there's nothing to cross.
+    """
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+
+    try:
+        mod = analyze_rtl(rtl_source, top_module=top_module.strip() or None)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    report = analyze_cdc(mod, rtl_source)
+    return {
+        "module": mod.name,
+        "domains": {
+            name: {"clock_signal": dom.clock_signal, "register_count": len(dom.registers)}
+            for name, dom in report.domains.items()
+        },
+        "crossings": [
+            {
+                "signal": c.signal, "source_domain": c.source_domain, "dest_domain": c.dest_domain,
+                "width": c.width, "sync_depth": c.sync_depth, "verdict": c.verdict, "note": c.note,
+            }
+            for c in report.crossings
+        ],
+        "reset_signals": [
+            {"name": r.name, "kind": r.kind, "verdict": r.verdict, "note": r.note}
+            for r in report.reset_signals
+        ],
+        "unsynchronized_count": len(report.unsynchronized_crossings),
+    }
 
 
 @app.post("/api/chat")
