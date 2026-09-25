@@ -56,8 +56,10 @@ user than "this is false."
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -67,6 +69,32 @@ from .base import BackendResult, SimulatorBackend
 
 _STATUS_FILENAME = "status"
 _LOGFILE = "logfile.txt"
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Kill `pid` and every process it spawned, not just `pid` itself.
+
+    `Popen.kill()` (and the timeout path of `subprocess.run`) only
+    terminates the immediate process. On Windows, Python does not place
+    spawned processes into a Job Object by default, so a hung grandchild
+    survives killing the top-level one -- sby spawns yosys-smtbmc, which
+    spawns the actual SMT solver (yices/z3/cvc5/...) as a further child.
+    Confirmed directly, not assumed: a hung `smtbmc cvc5` run left
+    cvc5.exe alive and consuming CPU 45 minutes after this exact code
+    path's old plain `subprocess.run(timeout=...)` should have killed it.
+    `taskkill /T` (Windows) / killing the whole process group (POSIX)
+    kills the tree explicitly instead of relying on it to cascade.
+    """
+    if platform.system() == "Windows":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True, check=False,
+        )
+    else:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def _find_trace(job_path: Path) -> Path | None:
@@ -227,30 +255,20 @@ class SymbiYosysBackend(SimulatorBackend):
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
 
         log_lines: list[str] = ["=== SYMBIYOSYS ===", " ".join(run_cmd)]
+        popen_kwargs: dict = {}
+        if platform.system() == "Windows":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True  # own process group, for killpg on timeout
         try:
-            r = subprocess.run(
+            proc = subprocess.Popen(
                 run_cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 cwd=str(work_abs),
                 env=env,
-                timeout=timeout_sec + 30,
-            )
-            log_lines.append(r.stdout or "")
-            log_lines.append(r.stderr or "")
-        except subprocess.TimeoutExpired:
-            # Only reachable if sby ignored its own [options] timeout above
-            # (e.g. hung inside a subprocess it doesn't poll) — the normal
-            # path is sby noticing its own timeout first and writing status
-            # "TIMEOUT" itself, which the status-file read below picks up.
-            log_lines.append("SymbiYosys timed out (outer safety-net kill — sby did not exit on its own timeout).")
-            return BackendResult(
-                success=False,
-                log="\n".join(log_lines),
-                vcd_path=None,
-                work_dir=work_abs,
-                duration_sec=time.perf_counter() - t0,
-                status="TIMEOUT",
+                **popen_kwargs,
             )
         except FileNotFoundError as e:
             log_lines.append(f"sby executable missing: {e}")
@@ -261,6 +279,36 @@ class SymbiYosysBackend(SimulatorBackend):
                 work_dir=work_abs,
                 duration_sec=time.perf_counter() - t0,
                 status="ERROR",
+            )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_sec + 30)
+            log_lines.append(stdout or "")
+            log_lines.append(stderr or "")
+        except subprocess.TimeoutExpired:
+            # Only reachable if sby ignored its own [options] timeout above
+            # (e.g. hung inside a subprocess it doesn't poll) — the normal
+            # path is sby noticing its own timeout first and writing status
+            # "TIMEOUT" itself, which the status-file read below picks up.
+            # Kill the WHOLE process tree, not just `proc` itself -- see
+            # _kill_process_tree's docstring for why that distinction is
+            # not theoretical.
+            _kill_process_tree(proc.pid)
+            try:
+                proc.communicate(timeout=10)
+            except Exception:  # noqa: BLE001 — best-effort reap after a forced kill
+                pass
+            log_lines.append(
+                "SymbiYosys timed out (outer safety-net kill — sby did not exit on its own "
+                "timeout; killed the full process tree, including any spawned solver process, "
+                "not just sby itself)."
+            )
+            return BackendResult(
+                success=False,
+                log="\n".join(log_lines),
+                vcd_path=None,
+                work_dir=work_abs,
+                duration_sec=time.perf_counter() - t0,
+                status="TIMEOUT",
             )
 
         status_file = job_path / _STATUS_FILENAME

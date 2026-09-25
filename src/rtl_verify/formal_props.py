@@ -265,15 +265,25 @@ def recommended_engine_chain(module: RtlModule, kind: str = "assert", depth_over
     overall status unresolved rather than reporting a false FAIL, so this
     chain only advancing past non-PASS/FAIL statuses is sound — a FAIL from
     any engine here is a genuine counterexample, never a k-induction
-    artifact. The chain also varies the underlying SMT solver (yices, then
-    z3) since a solver-specific ERROR on one attempt is often just that —
-    solver-specific, not a real problem with the property.
+    artifact. The chain also varies the underlying SMT solver (yices, z3,
+    bitwuzla) since a solver-specific ERROR on one attempt is often just
+    that — solver-specific, not a real problem with the property. cvc5 is
+    deliberately excluded from this particular chain — confirmed by direct
+    testing to genuinely hang under sby's k-induction "prove" protocol on
+    this toolchain (not merely slow: a 20-second timeout left the process
+    running 45 minutes later, which also surfaced and led to fixing a real
+    process-tree-kill bug in backends/symbiyosys.py). It works fine under
+    mode="cover" below, which is a different, simpler bounded-BMC query
+    pattern that doesn't hit whatever this incompatibility is.
 
     For cover/BMC (bounded, same depth across the chain), the algorithm
     doesn't change between attempts — only the solver does — since a
     reachability search at a fixed bound should agree across solvers that
     implement the same SMT semantics; the only thing a different solver
     can recover from here is an ERROR/TIMEOUT specific to the first one.
+    All five available solvers (yices, z3, boolector, cvc5, bitwuzla) are
+    usable here — confirmed individually, including cvc5's specific
+    prove-mode incompatibility not applying to this mode.
 
     Combinational designs get a single-entry chain: a single BMC/cover step
     is already exhaustive (see recommended_formal_config's docstring), so
@@ -295,6 +305,8 @@ def recommended_engine_chain(module: RtlModule, kind: str = "assert", depth_over
             {"label": "cover (yices)", "mode": "cover", "engine": "smtbmc", "depth": depth},
             {"label": "cover (z3)", "mode": "cover", "engine": "smtbmc z3", "depth": depth},
             {"label": "cover (boolector)", "mode": "cover", "engine": "smtbmc boolector", "depth": depth},
+            {"label": "cover (cvc5)", "mode": "cover", "engine": "smtbmc cvc5", "depth": depth},
+            {"label": "cover (bitwuzla)", "mode": "cover", "engine": "smtbmc bitwuzla", "depth": depth},
         ]
 
     if not module.is_sequential:
@@ -305,4 +317,17 @@ def recommended_engine_chain(module: RtlModule, kind: str = "assert", depth_over
         {"label": "PDR", "mode": "prove", "engine": "abc pdr", "depth": 0},
         {"label": "k-induction (yices)", "mode": "prove", "engine": "smtbmc", "depth": 0},
         {"label": "k-induction (z3)", "mode": "prove", "engine": "smtbmc z3", "depth": 0},
+        {"label": "k-induction (bitwuzla)", "mode": "prove", "engine": "smtbmc bitwuzla", "depth": 0},
+        # cvc5 deliberately NOT included here: confirmed by direct testing
+        # to genuinely hang (not just run slowly) under sby's k-induction
+        # "prove" protocol on this toolchain -- a real counterexample-free
+        # run left cvc5.exe alive and consuming CPU 45 minutes after a
+        # 20-second timeout should have ended it (this also uncovered and
+        # fixed a real bug in backends/symbiyosys.py: killing sby's own
+        # process did not kill the solver it had spawned as a grandchild on
+        # Windows -- see _kill_process_tree). cvc5 runs fine, fast, and
+        # correctly under mode="cover" (the same BMC-style bounded search,
+        # confirmed both cases with a real solver run) -- it is included
+        # above for that reason. Not simply omitted without explanation:
+        # this is what was actually found, not assumed.
     ]
