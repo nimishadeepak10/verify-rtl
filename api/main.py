@@ -39,6 +39,8 @@ from rtl_verify.failure_triage import answer_question  # noqa: E402
 from rtl_verify.dut_probe import generate_probed_rtl  # noqa: E402
 from rtl_verify.vacuity import run_vacuity_check  # noqa: E402
 from rtl_verify.cross_check import cross_check_property  # noqa: E402
+from rtl_verify import regression  # noqa: E402
+from rtl_verify.regression import BaselineProperty  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
 
@@ -304,8 +306,8 @@ async def formal_check(
         props = json.loads(properties) if properties.strip() else []
     except json.JSONDecodeError as e:
         return {"error": f"Invalid JSON in properties: {e}"}
-    if not isinstance(props, list) or not props:
-        return {"error": "properties must be a non-empty JSON list"}
+    if not isinstance(props, list):
+        return {"error": "properties must be a JSON list"}
 
     try:
         probed_source, mod = _analyze_and_probe(rtl_source, top_module)
@@ -343,6 +345,43 @@ async def formal_check(
             assumed_constraints.append(entry)
         else:
             target_props.append((i, entry))
+
+    # Regression detection: has this module's RTL changed since the last
+    # time it was checked? If so, automatically re-run every property this
+    # project has ever recorded a verdict for -- not just what THIS call
+    # submitted -- so editing one part of a design surfaces a break in a
+    # property nobody thought to re-test. Hashed on the ORIGINAL rtl_source
+    # (before dut_probe.py's instrumentation), so this tracks the user's
+    # actual RTL, not incidental changes to the instrumentation logic.
+    rtl_hash = regression.compute_rtl_hash(rtl_source)
+    baseline = regression.load_baseline(mod.name)
+    already_named = {entry["name"] for _, entry in target_props}
+    auto_added_names: set[str] = set()
+    if baseline is not None and baseline.rtl_hash != rtl_hash:
+        for bp in baseline.properties:
+            if bp.name in already_named:
+                continue  # this call already resubmitted it -- don't run it twice
+            next_i = len(props) + len(auto_added_names)
+            target_props.append((next_i, {
+                "name": bp.name, "description": "[auto re-run: regression check]",
+                "expr": bp.expr, "kind": bp.kind, "paired_cover": "", "rationale": "",
+            }))
+            auto_added_names.add(bp.name)
+
+    if not target_props:
+        if baseline is None:
+            return {"error": "properties must be a non-empty JSON list (no prior baseline exists for this module to fall back on)"}
+        return {
+            "module": mod.name,
+            "success": True,
+            "properties": [],
+            "assumed_constraints": assumed_constraints,
+            "regression_report": {
+                "baseline_existed": True, "rtl_changed": False,
+                "checked_count": 0, "regressions": [], "fixed": [], "unchanged_count": 0,
+            },
+            "note": "RTL unchanged since the last recorded baseline and no new properties submitted — nothing to check.",
+        }
 
     # Only ERROR (a genuine tool/compile problem — bad syntax, missing
     # signal) is worth an LLM-driven expression fix. TIMEOUT/UNKNOWN mean
@@ -563,6 +602,36 @@ async def formal_check(
                 "status": "ERROR", "note": f"Vacuity check itself failed: {e}",
             }
 
+    # Regression report: diff every baseline property that got (re)run this
+    # call against its last recorded verdict, then persist the new
+    # baseline -- last-known verdicts for properties untouched this call
+    # carry forward unchanged, everything actually run this call gets its
+    # fresh verdict recorded.
+    rerun_results = {r["name"]: r.get("verdict", "ERROR") for r in results}
+    reg_report = regression.diff_against_baseline(baseline, rtl_hash, rerun_results)
+    merged: dict[str, BaselineProperty] = {
+        p.name: p for p in (baseline.properties if baseline else [])
+    }
+    for r in results:
+        merged[r["name"]] = BaselineProperty(
+            name=r["name"], expr=r.get("expr", ""), kind=r["kind"],
+            verdict=r.get("verdict", "ERROR"),
+        )
+    regression.save_baseline(mod.name, rtl_hash, list(merged.values()))
+
+    def _entry_dict(e) -> dict:
+        return {"name": e.name, "expr": e.expr, "kind": e.kind,
+                "old_verdict": e.old_verdict, "new_verdict": e.new_verdict}
+
+    regression_report = {
+        "baseline_existed": reg_report.baseline_existed,
+        "rtl_changed": reg_report.rtl_changed,
+        "checked_count": len(reg_report.checked),
+        "regressions": [_entry_dict(e) for e in reg_report.regressions],
+        "fixed": [_entry_dict(e) for e in reg_report.fixed],
+        "unchanged_count": len(reg_report.unchanged),
+    }
+
     verdict_counts: dict[str, int] = {}
     for r in results:
         verdict_counts[r.get("verdict", "ERROR")] = verdict_counts.get(r.get("verdict", "ERROR"), 0) + 1
@@ -577,6 +646,7 @@ async def formal_check(
         "cross_checks_performed": sum(1 for r in results if r.get("cross_check", {}).get("performed")),
         "cross_check_disagreements": sum(1 for r in results if r.get("cross_check", {}).get("agrees") is False),
         "retries": sum(1 for r in results if r.get("retried")),
+        "regressions_found": len(reg_report.regressions),
         "success": all(r.get("success") for r in results),
     })
 
@@ -588,6 +658,7 @@ async def formal_check(
         "properties": results,
         "assumed_constraints": assumed_constraints,
         "work_dir": base.as_posix(),
+        "regression_report": regression_report,
     }
 
 

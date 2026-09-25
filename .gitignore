@@ -17,6 +17,10 @@ xvlog.pb
 # Formal-tab attempt log (local, not shared — see formal_log.py)
 logs/
 
+# Regression baselines (local, rebuildable by re-running verification --
+# see regression.py)
+regressions/
+
 # SymbiYosys run-output workdirs (rebuildable from the .sby configs + RTL --
 # model dumps, SMT2, solver logs, VCD/.yw traces, status.sqlite). Keep the
 # .sby configs and source RTL, not the run output.
