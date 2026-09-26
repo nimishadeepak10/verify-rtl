@@ -339,6 +339,43 @@ def main() -> None:
     )
     print("OK\n")
 
+    fpga_path = ROOT.parent / "external_rtl_cache" / "fpga.v"
+    if fpga_path.is_file():
+        print("=== Real-world confirmation of the same limitation: fpga.v, the actual "
+              "deployed VCU118 25G board top (alexforencich/verilog-ethernet) ===")
+        # The real top-level integration file for a genuine multi-port 25G
+        # Ethernet NIC -- a PLL-derived internal clock (Xilinx MMCME3_BASE),
+        # per-QSFP-port MGT reference clocks, an SGMII PHY clock, and
+        # several MAC IP instantiations. Structurally the most multi-clock
+        # design in this entire series -- yet it has only ONE `always`
+        # block of its own (a small reset-generation block on the
+        # PLL-derived clock); every real cross-clock relationship is
+        # expressed purely through instantiation port connections to
+        # submodules (the MACs already validated separately, plus
+        # sync_signal/sync_reset instances), none of which this scanner
+        # reads. This is the sharpest possible illustration of why a clean
+        # "0 crossings" result on an integration-level top file must never
+        # be read as "verified safe" -- top files are precisely where this
+        # scanner's blind spot is worst, since they're almost always
+        # instantiation-heavy with minimal inline logic of their own.
+        fpga_source = fpga_path.read_text(encoding="utf-8")
+        fpga_mod = analyze_rtl(fpga_source, top_module="fpga")
+        fpga_report = analyze_cdc(fpga_mod, fpga_source)
+        print(f"  domains={list(fpga_report.domains.keys())} crossings={len(fpga_report.crossings)} "
+              f"(expect exactly 1 domain, 0 crossings -- not because this design is "
+              f"single-clock, it very much isn't, but because none of its real "
+              f"cross-clock logic lives in fpga.v's own always blocks)")
+        assert list(fpga_report.domains.keys()) == ["clk_125mhz_int"], fpga_report.domains
+        assert len(fpga_report.crossings) == 0, fpga_report.crossings
+        print("OK\n")
+    else:
+        print(
+            "(skipping fpga.v check -- fetch "
+            "https://raw.githubusercontent.com/alexforencich/verilog-ethernet/master/"
+            "example/VCU118/fpga_25g/rtl/fpga.v "
+            f"to {fpga_path} to include it)\n"
+        )
+
     print("=== Sanity: single-clock design (rv32i_core.v) -> expect zero crossings ===")
     rv32i_source = (ROOT / "examples" / "rv32i_core.v").read_text(encoding="utf-8")
     rv32i_mod = analyze_rtl(rv32i_source, top_module="rv32i_core")
