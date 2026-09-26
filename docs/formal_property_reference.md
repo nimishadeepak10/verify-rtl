@@ -43,6 +43,35 @@ already flagged) or too vague to compile into an unambiguous assertion. Phase 2'
 review step should tag each proposed property with which pattern it is, not just accept free-form
 prose.
 
+**The taxonomy's second, independent dimension — scope — was previously undocumented here even
+though pattern was.** Every pattern above applies WITHIN some scope: where in an execution the
+claim is actually being made. Five scopes, from the same source:
+
+- **Global** — the entire execution; the property holds throughout, no bounding event. Most
+  hardware properties are genuinely Global, and forcing a narrower scope where none is warranted
+  is its own mistake, not more rigorous by default.
+- **Before** *event* — from the start of execution up to (not including) a named event. Hardware
+  example: "the FIFO stays empty before the first write."
+- **After** *event* — from a named event to the end of execution. Hardware example: "the state
+  machine reaches IDLE after reset deasserts" — a real, common reset-recovery claim that a purely
+  Global framing can't express correctly (the claim is false at t=0 while reset is still held, so
+  stating it as Global rather than After-reset would be a real, avoidable false negative).
+- **Between** *event1* and *event2* — from one named event to a second. Hardware example: "busy
+  stays asserted between a request being accepted and its response," bounded on both sides.
+- **After-Until** *event1* Until *event2* — like Between, but the window continues even if
+  *event2* never occurs. Hardware example: "once an error latches, it stays latched until a clear
+  pulse, if one ever comes."
+
+**Why this project already needed this, not just for taxonomic completeness:** the $past()-history
+guard `generate_formal_wrapper()` applies to every one-cycle-back claim (`!$initstate() && <reset
+not currently or previously asserted>`, see §6 of this project's README) is *already, mechanically,
+always applying something functionally close to an After-reset scope* — it was just never surfaced
+as a first-class modeling decision a property author or reviewer reasons about, only baked silently
+into the wrapper. Making scope an explicit, required tag turns that implicit mechanical guard into
+a visible one, and lets a real gap — e.g. every proposed property being Global, with nothing
+specifically checked immediately after reset or during a specific multi-cycle transaction — be
+pointed at directly instead of staying invisible.
+
 Source: Dwyer, Avrunin & Corbett, *"Patterns in Property Specifications for Finite-State
 Verification,"* ICSE 1999 — [dl.acm.org/doi/10.1145/302405.302672](https://dl.acm.org/doi/10.1145/302405.302672);
 pattern catalog maintained at [matthewbdwyer.github.io/psp](https://matthewbdwyer.github.io/psp/patterns.html).

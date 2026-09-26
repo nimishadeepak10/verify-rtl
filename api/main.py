@@ -29,6 +29,7 @@ from rtl_verify.formal_props import (  # noqa: E402
     recommended_engine_chain,
 )
 from rtl_verify.property_suggester import suggest_properties  # noqa: E402
+from rtl_verify.spec_patterns import summarize_pattern_scope_coverage  # noqa: E402
 from rtl_verify.property_to_sva import convert_to_sva, convert_to_sva_retry  # noqa: E402
 from rtl_verify.llm_client import LLMNotConfigured  # noqa: E402
 from rtl_verify import formal_log  # noqa: E402
@@ -1031,15 +1032,18 @@ async def formal_suggest(
     kind_counts: dict[str, int] = {}
     for p in proposals:
         kind_counts[p.get("kind", "?")] = kind_counts.get(p.get("kind", "?"), 0) + 1
+    pattern_coverage = summarize_pattern_scope_coverage(proposals)
     formal_log.log_event("suggest", {
         "module": mod.name,
         "rtl_lines": len(rtl_source.splitlines()),
         "spec_provided": bool(spec.strip()),
         "num_proposed": len(proposals),
         "kind_counts": kind_counts,
+        "missing_patterns": pattern_coverage["missing_patterns"],
+        "missing_scopes": pattern_coverage["missing_scopes"],
     })
 
-    return {"module": mod.name, "properties": proposals}
+    return {"module": mod.name, "properties": proposals, "pattern_coverage": pattern_coverage}
 
 
 @app.post("/api/formal/convert")

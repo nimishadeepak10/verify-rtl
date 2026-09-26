@@ -20,14 +20,10 @@ from pathlib import Path
 
 from . import llm_client
 from .analyzer import RtlModule
+from .spec_patterns import PATTERNS, SCOPES  # noqa: F401 (PATTERNS re-exported for existing callers)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _REFERENCE_PATH = _ROOT / "docs" / "formal_property_reference.md"
-
-PATTERNS = [
-    "Absence", "Existence", "Bounded Existence", "Universality",
-    "Precedence", "Response", "Chain Precedence", "Chain Response",
-]
 
 SUGGEST_SCHEMA = {
     "type": "object",
@@ -40,13 +36,16 @@ SUGGEST_SCHEMA = {
                     "name": {"type": "string"},
                     "kind": {"type": "string", "enum": ["assert", "assume", "cover"]},
                     "pattern": {"type": "string", "enum": PATTERNS},
+                    "scope": {"type": "string", "enum": SCOPES},
+                    "scope_detail": {"type": "string"},
                     "description": {"type": "string"},
                     "signals": {"type": "array", "items": {"type": "string"}},
                     "rationale": {"type": "string"},
                     "paired_cover": {"type": "string"},
                 },
                 "required": [
-                    "name", "kind", "pattern", "description", "signals", "rationale", "paired_cover",
+                    "name", "kind", "pattern", "scope", "scope_detail",
+                    "description", "signals", "rationale", "paired_cover",
                 ],
                 "additionalProperties": False,
             },
@@ -86,7 +85,17 @@ empty string only if the assert genuinely holds unconditionally (true for every 
 no triggering scenario to confirm) — never leave it empty just because you forgot to propose the \
 cover; propose the cover first, then link it. Cover and assume-kind properties should set \
 "paired_cover" to "".
-- Tag each property with the closest Dwyer/Avrunin/Corbett pattern name from the reference.
+- Tag each property with the closest Dwyer/Avrunin/Corbett pattern name from the reference, AND \
+its scope -- the taxonomy's second, independent dimension, for WHERE in execution the pattern \
+applies: "Global" (holds throughout, no bounding event), "Before" (up to a named event), "After" \
+(from a named event onward), "Between" (from one named event to a second), or "After-Until" (like \
+Between, but the window continues even if the second event never happens). Put the actual \
+bounding event(s) in "scope_detail" (e.g. "After reset deasserts", "Between grant asserted and \
+the corresponding ack", or "" for Global). Most hardware properties are genuinely Global -- don't \
+force a narrower scope where none is warranted -- but a real reset-recovery claim, a claim that \
+only holds during a specific multi-cycle transaction, or a claim about behavior strictly before \
+some one-time event should be tagged with the scope that actually matches it, not flattened to \
+Global by default.
 - Where the design's signal names match a standard OVL checker role (one-hot, handshake/req-ack, \
 fifo, mutex), say so explicitly in the rationale.
 - Every expression must use the DUT's own port names exactly as given below — never invent a \
