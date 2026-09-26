@@ -311,7 +311,29 @@ class SymbiYosysBackend(SimulatorBackend):
 
         status_file = job_path / _STATUS_FILENAME
         status_word = "ERROR"
-        if status_file.is_file():
+        if not status_file.is_file() and "Reached TIMEOUT" in (stdout or ""):
+            # sby's own [options] timeout fired (as configured, and logged
+            # via its own "Reached TIMEOUT (Ns)" message) but sby itself
+            # then crashed trying to write the status file -- confirmed a
+            # real, reproducible sby-internal bug, not hypothetical: on a
+            # large design where the timeout fires WHILE yosys synthesis
+            # is still running (before `self.design` exists), sby's own
+            # update_unknown_props() hits `self.design.hierarchy` on None
+            # and raises AttributeError instead of writing "TIMEOUT". The
+            # root cause here genuinely is the wall-clock budget running
+            # out, not a tool/expression error -- classifying this as
+            # ERROR would be misleading (an LLM syntax-fix retry can't fix
+            # "the design was too big to even synthesize in time," and
+            # this same misclassification would silently block
+            # auto_blackbox's escalation, since it only triggers on a
+            # genuine TIMEOUT/UNKNOWN/CANCELLED, never on ERROR).
+            status_word = "TIMEOUT"
+            log_lines.append(
+                "(status inferred as TIMEOUT: sby logged 'Reached TIMEOUT' but crashed "
+                "before writing its own status file -- see this backend's own comment "
+                "for the confirmed sby-internal cause.)"
+            )
+        elif status_file.is_file():
             first_line = status_file.read_text(encoding="utf-8", errors="replace").strip()
             status_word = (first_line.split() or ["ERROR"])[0]
 

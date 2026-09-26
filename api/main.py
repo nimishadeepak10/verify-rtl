@@ -41,7 +41,7 @@ from rtl_verify.vacuity import run_vacuity_check  # noqa: E402
 from rtl_verify.cross_check import cross_check_property  # noqa: E402
 from rtl_verify import regression  # noqa: E402
 from rtl_verify.regression import BaselineProperty  # noqa: E402
-from rtl_verify.blackbox import generate_blackboxed_rtl  # noqa: E402
+from rtl_verify.blackbox import generate_blackboxed_rtl, recommend_blackbox_candidates  # noqa: E402
 from rtl_verify.cdc_check import analyze_cdc  # noqa: E402
 
 app = FastAPI(title="RTL Verify Automation", version="0.1.0")
@@ -242,6 +242,7 @@ async def formal_check(
     depth_override: int = Form(0),
     cross_check: bool = Form(True),
     blackbox_modules: str = Form(""),
+    auto_blackbox: bool = Form(False),
 ):
     """Check one or more hand-written boolean properties with SymbiYosys.
 
@@ -294,6 +295,24 @@ async def formal_check(
     what was tried and rejected first). Only black-box a submodule whose
     internal computation the property genuinely doesn't depend on — its
     OUTPUTS becoming free can change or break a property that does.
+
+    `auto_blackbox` (default False, ignored if `blackbox_modules` is
+    already set manually): only when a property comes back genuinely
+    inconclusive (TIMEOUT/UNKNOWN/CANCELLED) after the full engine chain
+    — never for a real PROVEN/FALSIFIED verdict — automatically retries
+    it with black-boxing candidates from `recommend_blackbox_candidates()`
+    (see blackbox.py; ranked by researched, cited criteria: large memory/
+    register arrays first, wide multiply/divide next, plain size as a
+    last resort), one candidate at a time, stopping at the first
+    definitive verdict. A verdict reached this way carries its own
+    `auto_blackbox` field naming exactly what was tried and abstracted —
+    a PROVEN result here is real but WEAKER than a full-whitebox PROVEN
+    (it assumes the abstracted module's real behavior doesn't matter to
+    this property), and a FALSIFIED result may be a black-box artifact
+    (the abstracted module's now-free outputs triggering behavior
+    impossible in the real design) rather than a genuine bug — both
+    explicitly caveated, never silently presented as equivalent to an
+    unabstracted verdict.
 
     Independent of /api/verify — this never touches pipeline.py or the
     simulator backends, only the formal backend from Phase 1.
@@ -416,7 +435,7 @@ async def formal_check(
     _INCONCLUSIVE_STATUSES = {"TIMEOUT", "UNKNOWN", "CANCELLED"}
     MAX_RETRIES = 1
 
-    def _run_chain(work: Path, expr_to_run: str, name: str, kind: str):
+    def _run_chain(work: Path, expr_to_run: str, name: str, kind: str, run_rtl_path: Path = rtl_path):
         """Walk recommended_engine_chain(), stopping at the first PASS/FAIL.
 
         Every non-definitive status (ERROR/TIMEOUT/UNKNOWN/CANCELLED) is
@@ -431,6 +450,12 @@ async def formal_check(
         given in full to each attempt — otherwise the documented "wall-clock
         budget handed to sby" would silently balloon to N times what the
         caller asked for. Each rung still gets at least 30s.
+
+        `run_rtl_path` defaults to the manually-black-boxed (or plain)
+        `rtl_path` written once above, but the auto-black-box escalation
+        path below passes a DIFFERENT, per-candidate black-boxed copy —
+        `mod` (the top module's own ports) is unaffected either way, since
+        black-boxing only ever replaces a named SUBMODULE's body.
         """
         wrapper_sv = generate_formal_wrapper(mod, assume_props + [(name, expr_to_run, kind)])
         chain = recommended_engine_chain(mod, kind=kind, depth_override=depth_override)
@@ -445,7 +470,7 @@ async def formal_check(
         for i, config in enumerate(chain):
             attempt_dir = work / f"engine_{i}"
             result = engine.run(
-                rtl_path, wrapper_path, attempt_dir,
+                run_rtl_path, wrapper_path, attempt_dir,
                 top=f"{mod.name}_formal_top",
                 depth=config["depth"], mode=config["mode"], engine=config["engine"],
                 timeout_sec=per_attempt_timeout,
@@ -531,6 +556,77 @@ async def formal_check(
         else:
             verdict = "PROVEN" if result.success else "FALSIFIED"
 
+        # Auto-black-box escalation: only for a genuinely inconclusive
+        # verdict, only when the caller opted in, and only when they
+        # haven't already picked their own black-box set manually (mixing
+        # the two would make it unclear which module caused which effect).
+        # Never fires for ERROR (a syntax fix, not an abstraction, is the
+        # right response) or for a real PROVEN/FALSIFIED/REACHED/UNREACHED
+        # — this can only ever act on "the solver didn't decide," never
+        # override a decision the solver actually reached.
+        auto_blackbox_info = None
+        if verdict in _INCONCLUSIVE_STATUSES and auto_blackbox and not blackbox_names:
+            candidates = recommend_blackbox_candidates(mod, rtl_source)
+            tried = []
+            for cand in candidates[:3]:
+                try:
+                    bb_source = generate_blackboxed_rtl(probed_source, [cand.module_name])
+                except ValueError as e:
+                    tried.append({"module": cand.module_name, "reason": cand.reason,
+                                  "status": "SKIPPED", "detail": str(e)})
+                    continue
+                bb_dir = base / f"prop_{i}_autobb_{cand.module_name}"
+                bb_dir.mkdir(parents=True, exist_ok=True)
+                bb_rtl_path = bb_dir / rtl_path.name
+                bb_rtl_path.write_text(bb_source, encoding="utf-8")
+                bb_result, bb_config, bb_attempts = _run_chain(
+                    bb_dir / "run", current_expr, name, kind, run_rtl_path=bb_rtl_path,
+                )
+                tried.append({
+                    "module": cand.module_name, "reason": cand.reason, "detail": cand.detail,
+                    "status": bb_result.status,
+                })
+                if bb_result.status in ("PASS", "FAIL"):
+                    result, config = bb_result, bb_config
+                    all_attempts.extend(bb_attempts)
+                    if kind == "cover":
+                        verdict = "REACHED" if result.success else "UNREACHED"
+                    else:
+                        verdict = "PROVEN" if result.success else "FALSIFIED"
+                    waveform_json_data = None
+                    if result.vcd_path is not None:
+                        waveform_json_data = vcd_to_json(result.vcd_path, module=mod)
+                        if "error" in waveform_json_data:
+                            waveform_json_data = None
+                    auto_blackbox_info = {
+                        "resolved": True, "blackboxed_module": cand.module_name,
+                        "reason": cand.reason, "candidates_tried": tried,
+                        "caveat": (
+                            f"This {verdict} verdict was only reached after black-boxing "
+                            f"'{cand.module_name}' (its outputs are treated as free/"
+                            "unconstrained, not its real logic). If PROVEN: real, but weaker "
+                            "than a full-whitebox proof — it assumes this property doesn't "
+                            "actually depend on what that module computes. If FALSIFIED: the "
+                            "counterexample may be a black-box artifact — the abstracted "
+                            "module's now-free outputs triggering behavior impossible in the "
+                            "real design — verify the trace against that module's real logic "
+                            "before treating this as a confirmed bug."
+                        ),
+                    }
+                    break
+            if auto_blackbox_info is None:
+                auto_blackbox_info = {
+                    "resolved": False, "blackboxed_module": None, "reason": None,
+                    "candidates_tried": tried,
+                    "caveat": (
+                        "Auto-black-box escalation was attempted but no candidate resolved "
+                        "this to a definitive verdict — the original inconclusive result "
+                        "stands." if tried else
+                        "Auto-black-box escalation found no directly-instantiated, locally-"
+                        "defined submodule to try — the original inconclusive result stands."
+                    ),
+                }
+
         entry_out = {
             **entry,
             "expr": current_expr,
@@ -544,12 +640,26 @@ async def formal_check(
             "waveform_json": waveform_json_data,
             "retried": attempt > 0,
             "retry_note": retry_note,
+            "auto_blackbox": auto_blackbox_info,
         }
 
         # Independent second-engine cross-check: only meaningful once a
         # definitive verdict exists (never for ERROR/TIMEOUT/UNKNOWN, which
-        # already say the primary run itself didn't produce an answer).
-        if cross_check and result.status in ("PASS", "FAIL"):
+        # already say the primary run itself didn't produce an answer), and
+        # never after an auto-black-box escalation resolved it — that
+        # verdict belongs to a DIFFERENT design (one submodule stubbed out)
+        # than the plain `rtl_path` this cross-check would re-run against,
+        # so comparing them wouldn't mean what cross_check's own contract
+        # assumes (the same design, a second engine). Skipped explicitly,
+        # not silently, with a note explaining why.
+        if auto_blackbox_info is not None and auto_blackbox_info["resolved"]:
+            entry_out["cross_check"] = {
+                "performed": False, "engine_label": None, "status": None, "agrees": None,
+                "note": "Skipped: this verdict came from an auto-black-boxed design, not the "
+                        "plain RTL — cross-checking against a different design wouldn't be a "
+                        "valid second opinion on the same result.",
+            }
+        elif cross_check and result.status in ("PASS", "FAIL"):
             cc = cross_check_property(
                 mod, rtl_path, engine, name, current_expr, kind,
                 primary_success=result.success,
