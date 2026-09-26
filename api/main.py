@@ -38,6 +38,7 @@ from rtl_verify.spec_traceability import build_traceability_matrix  # noqa: E402
 from rtl_verify.failure_triage import answer_question  # noqa: E402
 from rtl_verify.dut_probe import generate_probed_rtl  # noqa: E402
 from rtl_verify.vacuity import run_vacuity_check  # noqa: E402
+from rtl_verify.assumption_check import check_assumption_consistency  # noqa: E402
 from rtl_verify.cross_check import cross_check_property  # noqa: E402
 from rtl_verify import regression  # noqa: E402
 from rtl_verify.regression import BaselineProperty  # noqa: E402
@@ -261,6 +262,16 @@ async def formal_check(
     instead of checking reachability), so their verdict label is
     REACHED/UNREACHED, not PROVEN/FALSIFIED.
 
+    Whenever any assume-kind properties are supplied, `assumption_consistency`
+    in the response reports whether they're jointly satisfiable at all — a
+    real `cover(1)` under every assumption together, not a heuristic (see
+    src/rtl_verify/assumption_check.py). An over-constrained assumption set
+    makes every PROVEN/UNREACHED verdict in the same run suspect, for the
+    same reason a vacuous guard makes one assert's own PROVEN suspect — this
+    catches the set-wide version of that failure mode, with the specific
+    conflicting assumption(s) isolated automatically rather than left for
+    manual bisection.
+
     `timeout_sec` is the wall-clock budget handed to sby itself (not just
     an external kill) — default 300s, override for harder proofs (a
     multiplier, a cache tag array) that legitimately need more time.
@@ -388,6 +399,24 @@ async def formal_check(
             assumed_constraints.append(entry)
         else:
             target_props.append((i, entry))
+
+    # Assumption consistency ("over-constraint") check: is there any
+    # legal input scenario at all once every supplied assumption is
+    # applied together? Runs ONCE per call (assumptions are shared
+    # across every property in this run, not per-property), before any
+    # property is actually checked -- an over-constrained assumption set
+    # makes every PROVEN/UNREACHED verdict below suspect for the same
+    # reason a single vacuous guard makes one assert's PROVEN suspect
+    # (see assumption_check.py's own module docstring for the researched
+    # citation trail). A real solver call, not a heuristic; skipped
+    # entirely (no extra solver time spent) when no assumptions were
+    # submitted.
+    assumption_consistency = check_assumption_consistency(
+        mod, rtl_path, engine, assume_props,
+        timeout_sec=max(60, timeout_sec // max(1, len(target_props) or 1)),
+        depth_override=depth_override,
+        work_root=base / "assumption_consistency",
+    )
 
     # Regression detection: has this module's RTL changed since the last
     # time it was checked? If so, automatically re-run every property this
@@ -777,6 +806,7 @@ async def formal_check(
         "verdict_counts": verdict_counts,
         "vacuity_warnings": sum(1 for r in results if r.get("vacuity_warning")),
         "vacuous_properties": sum(1 for r in results if r.get("confidence", {}).get("status") == "VACUOUS"),
+        "assumption_over_constrained": assumption_consistency.status == "OVER_CONSTRAINED",
         "cross_checks_performed": sum(1 for r in results if r.get("cross_check", {}).get("performed")),
         "cross_check_disagreements": sum(1 for r in results if r.get("cross_check", {}).get("agrees") is False),
         "retries": sum(1 for r in results if r.get("retried")),
@@ -791,6 +821,12 @@ async def formal_check(
         "success": all(r.get("success") for r in results),
         "properties": results,
         "assumed_constraints": assumed_constraints,
+        "assumption_consistency": {
+            "checked": assumption_consistency.checked,
+            "status": assumption_consistency.status,
+            "note": assumption_consistency.note,
+            "minimal_conflicting_set": assumption_consistency.minimal_conflicting_set,
+        },
         "work_dir": base.as_posix(),
         "regression_report": regression_report,
     }
