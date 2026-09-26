@@ -56,7 +56,6 @@ from .always_model import _extract_balanced_block
 _ALWAYS_HEADER = re.compile(
     r"always(?:_ff)?\s*@\s*\(([^)]*)\)\s*(begin)?", re.IGNORECASE
 )
-_LHS_NONBLOCKING = re.compile(r"(\w+)\s*(?:\[[^\]]*\])?\s*<=")
 _CONCAT_LHS_NONBLOCKING = re.compile(r"\{([^{}]+)\}\s*<=")
 _CONCAT_SHIFT_ASSIGN = re.compile(r"\{([^{}]+)\}\s*<=\s*\{([^{}]+)\}\s*;")
 _EDGE_TRIGGER = re.compile(r"\b(posedge|negedge)\s+(\w+)", re.IGNORECASE)
@@ -152,8 +151,55 @@ def _find_always_blocks(clean_body: str) -> List[AlwaysBlock]:
     return blocks
 
 
+def _lhs_identifier_before(text: str, pos: int) -> Optional[str]:
+    """Walk backward from `pos` (the start of a `<=`) over a plain LHS --
+    an identifier optionally followed by one or more `[...]` index
+    groups, each possibly containing its own nested brackets (e.g. a
+    memory-array write like
+    `mem[wr_addr[SEG_ADDR_WIDTH*n +: INT_ADDR_WIDTH]][i*8 +: 8] <= data;`,
+    a real pattern from a genuine async dual-port RAM). Returns the base
+    identifier, or None if the LHS isn't a plain (optionally indexed)
+    identifier (e.g. a concatenation target, handled separately).
+
+    `_LHS_NONBLOCKING`'s single-bracket, non-nested regex couldn't see
+    this shape at all -- confirmed a real, serious miss on
+    alexforencich/verilog-pcie's dma_psdpram_async.v: the memory array
+    driven in the write-clock domain was never recognized as a register
+    at all, so the genuine write-clock -> read-clock crossing through it
+    was silently invisible (zero crossings reported), not merely
+    misclassified.
+    """
+    j = pos
+    while j > 0 and text[j - 1].isspace():
+        j -= 1
+    while j > 0 and text[j - 1] == "]":
+        depth = 0
+        k = j - 1
+        while k >= 0:
+            if text[k] == "]":
+                depth += 1
+            elif text[k] == "[":
+                depth -= 1
+                if depth == 0:
+                    break
+            k -= 1
+        if k < 0:
+            return None
+        j = k
+    end = j
+    while j > 0 and (text[j - 1].isalnum() or text[j - 1] == "_"):
+        j -= 1
+    if j == end:
+        return None
+    return text[j:end]
+
+
 def _registers_driven(block_body: str) -> Set[str]:
-    regs = {m.group(1) for m in _LHS_NONBLOCKING.finditer(block_body)}
+    regs: Set[str] = set()
+    for m in re.finditer(r"<=", block_body):
+        ident = _lhs_identifier_before(block_body, m.start())
+        if ident:
+            regs.add(ident)
     for m in _CONCAT_LHS_NONBLOCKING.finditer(block_body):
         regs |= {t.strip() for t in m.group(1).split(",") if re.fullmatch(r"\w+", t.strip())}
     return regs
@@ -253,30 +299,63 @@ def _sync_depth_for_crossing(signal: str, dest_body: str, dest_registers: Set[st
             if depth >= 4:
                 return depth, "capture chain traced 4+ stages deep (capped)"
             continue
-        # Every assignment whose RHS references `current` at all.
-        refs = [
-            m for m in re.finditer(rf"(\w+)\s*(?:\[[^\]]*\])?\s*<=\s*([^;]+);", dest_body)
-            if re.search(rf"\b{re.escape(current)}\b", m.group(2))
-        ]
+        # Every assignment whose RHS references `current` at all. Finds
+        # the LHS via the same bracket-aware backward matcher as
+        # _registers_driven -- a nested-bracket LHS (a memory-array
+        # write) must be recognized as a capture target here too, not
+        # just when first cataloguing a domain's registers.
+        refs: List[tuple[str, str, str]] = []  # (lhs_ident, rhs, display_text)
+        for assign_m in re.finditer(r"<=", dest_body):
+            lhs_ident = _lhs_identifier_before(dest_body, assign_m.start())
+            if lhs_ident is None:
+                continue
+            semi = dest_body.find(";", assign_m.end())
+            if semi < 0:
+                continue
+            rhs = dest_body[assign_m.end():semi]
+            if re.search(rf"\b{re.escape(current)}\b", rhs):
+                lhs_start = assign_m.start()
+                while lhs_start > 0 and dest_body[lhs_start - 1] not in "\n;":
+                    lhs_start -= 1
+                refs.append((lhs_ident, rhs, dest_body[lhs_start:semi + 1].strip()))
         if not refs:
             if depth == 0:
                 return depth, "the crossing signal itself is never referenced in the destination domain's clocked logic"
             return depth, f"the chain ends after {depth} plain-capture stage(s) with no further consumer -- a normal, expected terminal point, not a problem"
         plain_captures = [
-            m for m in refs
-            if re.fullmatch(rf"\s*{re.escape(current)}\s*", m.group(2))
+            ref for ref in refs
+            if re.fullmatch(rf"\s*{re.escape(current)}\s*", ref[1])
         ]
-        non_plain = [m for m in refs if m not in plain_captures]
+        non_plain = [ref for ref in refs if ref not in plain_captures]
         if non_plain:
             # Used directly in a real expression/condition somewhere --
             # that's the point synchronization needed to have already
             # happened by, regardless of any capture register that also
             # happens to exist elsewhere.
-            return depth, f"used directly in a non-capture expression (e.g. `{non_plain[0].group(0).strip()[:60]}`)"
+            example = non_plain[0][2][:60]
+            if re.search(rf"\b{re.escape(current)}\s*\[", non_plain[0][1]):
+                # `current[...]` on the RHS -- an array/memory read, not a
+                # flip-flop reference. Real, not hypothetical: a genuine
+                # async dual-port RAM (alexforencich/verilog-pcie's
+                # dma_psdpram_async.v) crosses domains exactly this way,
+                # through a shared `mem` array written in one clock and
+                # read in another -- a fundamentally different mechanism
+                # from a flop-based synchronizer (the memory primitive
+                # itself has to be metastability-safe for this access
+                # pattern), so the generic "add a sync stage" framing
+                # would be actively misleading here.
+                return depth, (
+                    f"read directly from an array/memory indexed by a value from the "
+                    f"other domain (e.g. `{example}`) -- this is a memory-based crossing, "
+                    "not a flip-flop one: adding a synchronizer register doesn't apply the "
+                    "same way here. Verify the underlying memory is a genuine dual-port "
+                    "primitive safe for this access pattern, not a plain register array."
+                )
+            return depth, f"used directly in a non-capture expression (e.g. `{example}`)"
         # Every reference was a plain single-signal capture -- advance
         # the chain through the first such target not already visited
         # (guards against a pathological self-referential loop).
-        target = plain_captures[0].group(1)
+        target = plain_captures[0][0]
         if target in seen:
             return depth, "capture chain loops back on itself"
         seen.add(target)

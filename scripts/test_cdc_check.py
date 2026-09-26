@@ -175,6 +175,35 @@ module core_b (
 endmodule
 """
 
+# A genuine async dual-port RAM crossing, written via a nested-bracket
+# memory-array LHS (`mem[addr[hi:lo]][7:0] <= data;`) -- the real shape
+# found in alexforencich/verilog-pcie's dma_psdpram_async.v. The
+# original single-bracket, non-nested LHS regex couldn't recognize
+# `mem` as a register driven in wr_clk's domain at all, so this real
+# crossing was completely invisible (zero crossings reported), not
+# merely misclassified -- a more serious miss than the earlier bugs.
+ASYNC_RAM_CROSSING = """
+module async_ram_crossing (
+    input  wire        clk_wr,
+    input  wire [3:0]  wr_addr,
+    input  wire [7:0]  wr_data,
+    input  wire        wr_en,
+    input  wire        clk_rd,
+    input  wire [3:0]  rd_addr,
+    output reg  [7:0]  rd_data
+);
+    reg [7:0] mem [15:0];
+
+    always @(posedge clk_wr) begin
+        if (wr_en) mem[wr_addr[3:0]][7:0] <= wr_data;
+    end
+
+    always @(posedge clk_rd) begin
+        rd_data <= mem[rd_addr];
+    end
+endmodule
+"""
+
 
 def main() -> None:
     print("=== Synthetic: proper 2+ stage synchronizer -> expect LIKELY_OK ===")
@@ -243,6 +272,16 @@ def main() -> None:
     assert len(report_a.crossings) == 0 and len(report_b.crossings) == 0
     print("OK\n")
 
+    print("=== Synthetic: async dual-port RAM crossing via nested-bracket memory LHS ===")
+    ram_mod = analyze_rtl(ASYNC_RAM_CROSSING, top_module="async_ram_crossing")
+    ram_report = analyze_cdc(ram_mod, ASYNC_RAM_CROSSING)
+    print(f"  crossings found: {[(c.signal, c.verdict) for c in ram_report.crossings]}")
+    assert any(c.signal == "mem" for c in ram_report.crossings), (
+        "the memory array crossing must not be silently invisible")
+    mem_c = next(c for c in ram_report.crossings if c.signal == "mem")
+    assert mem_c.verdict == "UNSYNCHRONIZED" and "memory-based crossing" in mem_c.note, mem_c
+    print("OK\n")
+
     print("=== Sanity: single-clock design (rv32i_core.v) -> expect zero crossings ===")
     rv32i_source = (ROOT / "examples" / "rv32i_core.v").read_text(encoding="utf-8")
     rv32i_mod = analyze_rtl(rv32i_source, top_module="rv32i_core")
@@ -262,11 +301,21 @@ def main() -> None:
               f"unsynchronized: {len(real_report.unsynchronized_crossings)}")
         for c in real_report.crossings:
             print(f"    {c.signal}: {c.source_domain}->{c.dest_domain} depth={c.sync_depth} verdict={c.verdict}")
-        # A well-reviewed, widely-used reference design should not come
-        # back with any UNSYNCHRONIZED crossing -- if this ever fails,
-        # investigate whether it's a real finding or a heuristic gap
-        # before assuming either.
-        assert not real_report.unsynchronized_crossings, real_report.unsynchronized_crossings
+        # The FIFO's own storage array ("mem") is written on s_clk and
+        # read on m_clk directly -- a real, correctly-flagged
+        # UNSYNCHRONIZED finding by this scanner's own rules (no flop-
+        # based capture on the data path), and also the textbook-correct
+        # way to build an async FIFO: safety here comes from the
+        # gray-code pointer synchronization (already reported LIKELY_OK
+        # elsewhere in this same report), not from synchronizing the
+        # memory read itself, which is exactly what the checker's own
+        # memory-crossing note says to go verify instead of assuming
+        # broken. Confirmed real via a dedicated nested-bracket LHS fix
+        # (see cdc_check.py's _lhs_identifier_before docstring) --
+        # before that fix this crossing was invisible, not flagged.
+        assert len(real_report.unsynchronized_crossings) == 1, real_report.unsynchronized_crossings
+        mem_crossing = real_report.unsynchronized_crossings[0]
+        assert mem_crossing.signal == "mem" and "memory-based crossing" in mem_crossing.note, mem_crossing
         print("OK\n")
     else:
         print(
@@ -327,15 +376,16 @@ def main() -> None:
         assert not top_report.unsynchronized_crossings, top_report.unsynchronized_crossings
 
         # The real dual-clock FIFO buried 4 modules deep in this combined
-        # file must report the exact same 12-crossing result already
-        # validated standalone above -- confirms module-scoping holds at
-        # this larger scale, not just picorv32's.
+        # file must report the exact same 13-crossing result already
+        # validated standalone above (12 flop-based + the memory-based
+        # "mem" crossing) -- confirms module-scoping holds at this larger
+        # scale, not just picorv32's.
         afifo_mod = analyze_rtl(eth_source, top_module="axis_async_fifo")
         afifo_report = analyze_cdc(afifo_mod, eth_source)
         print(f"  axis_async_fifo (embedded) crossings={len(afifo_report.crossings)} "
-              f"(expect 12, matching the standalone result above)")
-        assert len(afifo_report.crossings) == 12, afifo_report.crossings
-        assert not afifo_report.unsynchronized_crossings
+              f"(expect 13, matching the standalone result above)")
+        assert len(afifo_report.crossings) == 13, afifo_report.crossings
+        assert len(afifo_report.unsynchronized_crossings) == 1
 
         # A purely combinational adapter module in the same file must not
         # pick up any neighboring module's clock domain.
@@ -372,12 +422,12 @@ def main() -> None:
 
         # axis_async_fifo now sits 4 modules deep (fifo -> ... -> adapter
         # -> fifo) in this even larger file -- must still match the
-        # standalone 12-crossing result exactly.
+        # standalone 13-crossing result exactly.
         afifo10g_mod = analyze_rtl(eth10g_source, top_module="axis_async_fifo")
         afifo10g_report = analyze_cdc(afifo10g_mod, eth10g_source)
         print(f"  axis_async_fifo (embedded, 4 levels deep) crossings={len(afifo10g_report.crossings)} "
-              f"(expect 12)")
-        assert len(afifo10g_report.crossings) == 12, afifo10g_report.crossings
+              f"(expect 13)")
+        assert len(afifo10g_report.crossings) == 13, afifo10g_report.crossings
 
         # A pure-wrapper module (instantiation only, no own always blocks)
         # must correctly report zero domains, not inherit a neighbor's.
