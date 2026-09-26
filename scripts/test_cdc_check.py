@@ -303,6 +303,54 @@ def main() -> None:
             f"to {picorv32_path} to include it)\n"
         )
 
+    eth_path = ROOT.parent / "external_rtl_cache" / "eth_mac_1g_fifo_combined.v"
+    if eth_path.is_file():
+        print("=== Real: eth_mac_1g_fifo + its real dependencies, concatenated "
+              "(alexforencich/verilog-ethernet + verilog-axis) -- 3500+ lines, 7 modules ===")
+        # eth_mac_1g_fifo.v alone is a thin ~330-line wrapper around
+        # submodules defined in separate files (eth_mac_1g, an async FIFO
+        # adapter, the async FIFO itself, GMII rx/tx, an LFSR for CRC) --
+        # this project doesn't resolve cross-file dependencies on its own
+        # (a documented limitation), so all 6 real files are concatenated
+        # here, exercising that documented workaround on a genuinely
+        # larger, hierarchical, real multi-clock SoC assembly than
+        # picorv32.v (bigger file, more modules, a different codebase).
+        eth_source = eth_path.read_text(encoding="utf-8")
+
+        top_mod = analyze_rtl(eth_source, top_module="eth_mac_1g_fifo")
+        top_report = analyze_cdc(top_mod, eth_source)
+        print(f"  eth_mac_1g_fifo domains={list(top_report.domains.keys())} "
+              f"crossings={len(top_report.crossings)}")
+        # A real 3-clock-domain design (tx_clk/rx_clk/logic_clk) -- more
+        # domains than anything else validated so far.
+        assert set(top_report.domains.keys()) == {"tx_clk", "rx_clk", "logic_clk"}, top_report.domains
+        assert not top_report.unsynchronized_crossings, top_report.unsynchronized_crossings
+
+        # The real dual-clock FIFO buried 4 modules deep in this combined
+        # file must report the exact same 12-crossing result already
+        # validated standalone above -- confirms module-scoping holds at
+        # this larger scale, not just picorv32's.
+        afifo_mod = analyze_rtl(eth_source, top_module="axis_async_fifo")
+        afifo_report = analyze_cdc(afifo_mod, eth_source)
+        print(f"  axis_async_fifo (embedded) crossings={len(afifo_report.crossings)} "
+              f"(expect 12, matching the standalone result above)")
+        assert len(afifo_report.crossings) == 12, afifo_report.crossings
+        assert not afifo_report.unsynchronized_crossings
+
+        # A purely combinational adapter module in the same file must not
+        # pick up any neighboring module's clock domain.
+        adapter_mod = analyze_rtl(eth_source, top_module="axis_async_fifo_adapter")
+        adapter_report = analyze_cdc(adapter_mod, eth_source)
+        assert adapter_report.domains == {}, adapter_report.domains
+        print("OK\n")
+    else:
+        print(
+            "(skipping eth_mac_1g_fifo check -- fetch eth_mac_1g_fifo.v, eth_mac_1g.v, "
+            "axis_async_fifo_adapter.v, axis_async_fifo.v, axis_gmii_rx.v, axis_gmii_tx.v, "
+            "lfsr.v from alexforencich/verilog-ethernet and verilog-axis, concatenate them, "
+            f"and save the result to {eth_path} to include it)\n"
+        )
+
     print("=== ALL CASES MATCHED EXPECTATIONS ===")
 
 
