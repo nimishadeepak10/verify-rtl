@@ -204,6 +204,47 @@ module async_ram_crossing (
 endmodule
 """
 
+# KNOWN LIMITATION (documented, not a bug to fix here): a crossing
+# synchronized by INSTANTIATING a reusable synchronizer submodule --
+# the idiomatic, professional way real engineers write this (see
+# alexforencich/verilog-ethernet's own sync_signal.v, a parameterized
+# N-stage synchronizer meant to be instantiated at every crossing) --
+# is completely invisible to this scanner, since it only reads the
+# target module's own `always` blocks and doesn't trace into
+# instantiated submodules at all. This test locks in and documents that
+# honest current behavior (0 crossings reported, not a false
+# "LIKELY_OK") so it isn't mistaken for an accidentally-unfixed bug,
+# and so a future change to this behavior updates this test
+# deliberately rather than by surprise.
+HIERARCHICAL_SYNC = """
+module sync2 (
+    input wire clk,
+    input wire in,
+    output wire out
+);
+    reg [1:0] sync_reg;
+    always @(posedge clk) sync_reg <= {sync_reg[0], in};
+    assign out = sync_reg[1];
+endmodule
+
+module top_with_submodule_sync (
+    input wire clk_a,
+    input wire clk_b,
+    input wire d,
+    output wire q
+);
+    reg d_reg;
+    always @(posedge clk_a) d_reg <= d;
+
+    wire synced;
+    sync2 sync_inst (.clk(clk_b), .in(d_reg), .out(synced));
+
+    reg q_reg;
+    always @(posedge clk_b) q_reg <= synced;
+    assign q = q_reg;
+endmodule
+"""
+
 
 def main() -> None:
     print("=== Synthetic: proper 2+ stage synchronizer -> expect LIKELY_OK ===")
@@ -280,6 +321,22 @@ def main() -> None:
         "the memory array crossing must not be silently invisible")
     mem_c = next(c for c in ram_report.crossings if c.signal == "mem")
     assert mem_c.verdict == "UNSYNCHRONIZED" and "memory-based crossing" in mem_c.note, mem_c
+    print("OK\n")
+
+    print("=== KNOWN LIMITATION: crossing synchronized via an instantiated submodule "
+          "is invisible (documented, not a bug) ===")
+    hmod = analyze_rtl(HIERARCHICAL_SYNC, top_module="top_with_submodule_sync")
+    hreport = analyze_cdc(hmod, HIERARCHICAL_SYNC)
+    print(f"  domains={list(hreport.domains.keys())} crossings={len(hreport.crossings)} "
+          f"(expect 0 -- the real crossing through sync_inst is genuinely invisible "
+          f"to this single-module, always-block-only scanner; see cdc_check.py's "
+          f"module docstring)")
+    assert set(hreport.domains.keys()) == {"clk_a", "clk_b"}, hreport.domains
+    assert len(hreport.crossings) == 0, (
+        "if this now finds a crossing, hierarchical/instantiation-aware analysis "
+        "was added -- update this test and its comment, and the docstring in "
+        "cdc_check.py, deliberately rather than treating this as a regression"
+    )
     print("OK\n")
 
     print("=== Sanity: single-clock design (rv32i_core.v) -> expect zero crossings ===")

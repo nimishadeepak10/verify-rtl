@@ -28,6 +28,30 @@ design's *own* reset tree to start), or is it derived from combinational
 logic within this module -- a real, common RDC bug pattern (a
 glitch on that combinational path can assert/deassert reset
 asynchronously and unpredictably), reported as such.
+
+A real, significant scope boundary, found via testing (not assumed):
+this scan only looks at the target module's OWN `always` blocks. It
+does not trace into instantiated submodules at all -- so a crossing
+synchronized by INSTANTIATING a reusable synchronizer primitive (e.g.
+alexforencich/verilog-ethernet's own `sync_signal.v`, a parameterized
+N-stage synchronizer meant to be instantiated at every crossing, which
+is the idiomatic, professional way real engineers write this, not an
+edge case) is completely invisible: the crossing signal only appears as
+a port-connection argument in an instantiation statement, never inside
+an `always` block body this scanner reads. Confirmed directly: a
+two-clock-domain design where domain A's signal is properly
+synchronized through an instantiated 2-flop synchronizer submodule
+before domain B consumes it reports **zero crossings** -- not
+"LIKELY_OK", not "UNSYNCHRONIZED", nothing at all. This is meaningfully
+different from every other documented limitation above (which describe
+things this scanner sees but can't fully certify) -- here it doesn't
+see the crossing exists in the first place. Fixing this properly needs
+genuine hierarchical elaboration (parsing instantiation port
+connections, resolving each instance's own clock, recursing into its
+definition) which this project deliberately hasn't built yet rather
+than approximate with an unreliable heuristic; treat a "0 crossings"
+result on a design with instantiated synchronizer submodules as "not
+analyzed", not "verified safe".
 """
 
 from __future__ import annotations
