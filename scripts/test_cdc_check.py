@@ -631,30 +631,39 @@ def main() -> None:
         # picorv32 and picorv32_wb, now embedded in this even larger file
         # (16 modules, spanning two different subdirectories of the same
         # repo concatenated together), must still match their standalone
-        # domains and register counts exactly -- 185 and 38 respectively,
-        # up from the pre-hierarchical-tracing 177 and 9: picorv32 itself
-        # instantiates picorv32_regs/pcpi_mul/pcpi_fast_mul/pcpi_div
-        # (all sharing "clk"), whose output ports are now correctly
-        # attributed to picorv32's own domain; picorv32_wb instantiates
-        # picorv32 itself via `.clk(clk)`, where clk is just
-        # `assign clk = wb_clk_i;` (an alias, correctly resolved by
-        # _resolve_clock_alias -- without that fix this fabricated two
-        # fake crossings between "wb_clk_i" and "clk" for the exact same
-        # physical clock net, confirmed and fixed during this feature's
-        # own development), so the CPU core's own signals now correctly
-        # join the wb_clk_i domain too. Zero crossings in both cases,
-        # either way -- growth in registers, not new (false) crossings.
+        # domains and register counts exactly -- 162 and 22 respectively.
+        # (These were 185 and 38 right after hierarchical tracing landed,
+        # and 177/9 before that -- the drop from 185/38 to 162/22 is a
+        # SEPARATE, later correctness fix, not a regression: picorv32.v
+        # declares its RVFI ports and internal rvfi_* trace registers
+        # inside `ifdef RISCV_FORMAL`, a macro this project's formal
+        # backend never defines (SymbiYosys's `read -formal` only
+        # implicitly defines FORMAL) -- analyze_rtl() previously included
+        # ifdef-guarded content unconditionally, over-counting registers
+        # that don't exist in a real, default synthesis build. Fixed by
+        # resolving `ifdef`/`ifndef` in analyze_rtl() itself against
+        # {"FORMAL"} as the only defined macro, matching what actually
+        # gets compiled.) picorv32 itself instantiates picorv32_regs/
+        # pcpi_mul/pcpi_fast_mul/pcpi_div (all sharing "clk"), whose
+        # output ports are now correctly attributed to picorv32's own
+        # domain; picorv32_wb instantiates picorv32 itself via
+        # `.clk(clk)`, where clk is just `assign clk = wb_clk_i;` (an
+        # alias, correctly resolved by _resolve_clock_alias -- without
+        # that fix this fabricated two fake crossings between "wb_clk_i"
+        # and "clk" for the exact same physical clock net), so the CPU
+        # core's own signals now correctly join the wb_clk_i domain too.
+        # Zero crossings in both cases, either way.
         pico_mod = analyze_rtl(picosoc_source, top_module="picorv32")
         pico_report = analyze_cdc(pico_mod, picosoc_source)
         print(f"  picorv32 (embedded): domains={ {k: len(v.registers) for k, v in pico_report.domains.items()} }")
         assert list(pico_report.domains.keys()) == ["clk"]
-        assert len(pico_report.domains["clk"].registers) == 185, pico_report.domains["clk"].registers
+        assert len(pico_report.domains["clk"].registers) == 162, pico_report.domains["clk"].registers
         assert len(pico_report.crossings) == 0, pico_report.crossings
 
         wb_mod = analyze_rtl(picosoc_source, top_module="picorv32_wb")
         wb_report = analyze_cdc(wb_mod, picosoc_source)
         assert list(wb_report.domains.keys()) == ["wb_clk_i"]
-        assert len(wb_report.domains["wb_clk_i"].registers) == 38, wb_report.domains["wb_clk_i"].registers
+        assert len(wb_report.domains["wb_clk_i"].registers) == 22, wb_report.domains["wb_clk_i"].registers
         assert len(wb_report.crossings) == 0, wb_report.crossings
         print("OK\n")
     else:

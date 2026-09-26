@@ -70,12 +70,14 @@ from .analyzer import (
     strip_ifdef_blocks,
 )
 
-# Verification-only scaffolding macros (SymbiYosys/riscv-formal/ZipCPU
-# convention) whose guarded branch must be excluded from this structural
-# scan -- e.g. ZipCPU's `(* gclk *) reg gbl_clk;` proof-only clock
-# abstraction, which doesn't exist in synthesized hardware and would
-# otherwise be mistaken for a genuine third clock domain.
-_VERIFICATION_ONLY_MACROS = {"FORMAL"}
+# No macro is treated as defined for this scan's purposes -- FORMAL,
+# RISCV_FORMAL, DEBUG*, and anything else guarding scaffolding (e.g.
+# ZipCPU's `(* gclk *) reg gbl_clk;` proof-only clock abstraction inside
+# `ifdef FORMAL`) is excluded, since none of it is genuinely
+# always-synthesized hardware, regardless of what a given formal *run*
+# happens to define (unlike `analyze_rtl()`'s own `strip_ifdef_blocks`
+# call, which matches SymbiYosys's actual `-formal` convention instead).
+_VERIFICATION_ONLY_MACROS: Set[str] = set()
 from .always_model import _extract_balanced_block
 
 _ALWAYS_HEADER = re.compile(

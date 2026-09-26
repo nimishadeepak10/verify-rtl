@@ -263,17 +263,33 @@ def _strip_comments(rtl: str) -> str:
     return rtl
 
 
-def strip_ifdef_blocks(text: str, exclude_macros: Set[str]) -> str:
-    """Blank out the branch of an `` `ifdef``/`` `ifndef`` guarded by a macro
-    in ``exclude_macros`` (e.g. ``FORMAL``), line-for-line so line numbers
-    stay stable. A directive for a macro not in ``exclude_macros`` is left
-    untouched -- this is a targeted strip for known verification-only
-    scaffolding (the `` `ifdef FORMAL`` convention used throughout SymbiYosys/
-    riscv-formal/ZipCPU-style RTL for assumptions, cover statements, and
-    proof-only clock abstractions like ZipCPU's ``(* gclk *)`` trick), not a
-    general Verilog preprocessor. Nesting is handled via a stack; an
-    `` `else`` under an excluded branch is kept (it's the real, synthesized
-    path when the macro isn't defined).
+def strip_ifdef_blocks(text: str, defined_macros: Set[str]) -> str:
+    """Resolve every `` `ifdef``/`` `ifndef``/`` `else``/`` `endif`` in `text`
+    against the given set of macros assumed DEFINED -- every other macro is
+    assumed UNDEFINED -- blanking out the branch that wouldn't actually be
+    compiled, line-for-line so line numbers stay stable. Not a general
+    Verilog preprocessor (no `` `define``/nested-macro-value handling), but
+    correct for the common case of a macro simply being defined or not.
+
+    The direction of this default matters and was the source of a real,
+    previously-latent bug: an earlier version of this function took an
+    ``exclude_macros`` set and left any OTHER macro's directive completely
+    unresolved, which silently defaulted every unlisted macro to
+    "defined" (its `` `ifdef`` branch kept, `` `else`` branch dropped).
+    Confirmed wrong in practice on YosysHQ/picorv32.v: its RVFI ports are
+    declared inside `` `ifdef RISCV_FORMAL``, a macro this project's own
+    formal backend never defines (SymbiYosys's `read -formal` implicitly
+    defines only `` FORMAL``) -- `analyze_rtl()` was including those ports
+    in the parsed module anyway, so `generate_formal_wrapper()` built a DUT
+    instantiation connecting a port that plain synthesis (matching what
+    sby's own read step actually produces) doesn't have at all, a hard
+    yosys error, not a proof-complexity problem. Defaulting every
+    unlisted macro to UNDEFINED instead matches what a real build with no
+    extra `-D` flags actually compiles -- the correct default for both of
+    this function's callers (`cdc_check.py` passes an empty set, since
+    none of FORMAL/RISCV_FORMAL/DEBUG*-guarded content is genuinely
+    always-synthesized hardware; `analyze_rtl()` passes ``{"FORMAL"}``,
+    matching SymbiYosys's own `-formal` convention).
     """
     lines = text.split("\n")
     stack: List[bool] = []
@@ -282,7 +298,8 @@ def strip_ifdef_blocks(text: str, exclude_macros: Set[str]) -> str:
         m = re.match(r"^\s*`(ifdef|ifndef)\s+(\w+)", line)
         if m:
             directive, macro = m.group(1), m.group(2)
-            exclude_branch = (macro in exclude_macros) if directive == "ifdef" else False
+            is_defined = macro in defined_macros
+            exclude_branch = not is_defined if directive == "ifdef" else is_defined
             stack.append(exclude_branch)
             out_lines.append("")
             continue
@@ -301,6 +318,20 @@ def strip_ifdef_blocks(text: str, exclude_macros: Set[str]) -> str:
 def analyze_rtl(rtl: str, top_module: Optional[str] = None) -> RtlModule:
     """Extract the first (or named) module and its ports from RTL text."""
     clean = _strip_comments(rtl)
+    # Resolve `ifdef`/`ifndef` against what this project's own formal
+    # backend actually defines when it reads a file (SymbiYosys's
+    # `read -formal` implicitly defines FORMAL, nothing else) -- so a
+    # module's parsed ports/structure match what real synthesis under
+    # this project's pipeline actually produces, not the raw source text
+    # with every conditional branch left in. Confirmed a real, not
+    # hypothetical, gap: YosysHQ/picorv32.v declares its RVFI ports
+    # inside `ifdef RISCV_FORMAL` (a macro this project never defines);
+    # without this resolution, analyze_rtl() included those ports
+    # anyway, so generate_formal_wrapper() built a DUT instantiation
+    # connecting a port plain synthesis doesn't have -- a hard yosys
+    # error ("does not have a port named ..."), not a proof-complexity
+    # problem.
+    clean = strip_ifdef_blocks(clean, {"FORMAL"})
     modules = list(re.finditer(r"\bmodule\s+(\w+)\s*[#(]?", clean))
     if not modules:
         raise ValueError("No module declaration found in RTL")
