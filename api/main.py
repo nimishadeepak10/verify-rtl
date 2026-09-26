@@ -956,6 +956,12 @@ async def cdc_check(
     docstring for exactly what that does and doesn't claim). Runs no
     solver, so this is fast and needs no formal backend.
 
+    Also traces one level of instantiation: a crossing synchronized by
+    INSTANTIATING a reusable synchronizer submodule (the idiomatic way
+    real engineers write this, not hand-inlined flip-flops) is resolved
+    if that submodule is defined in the same submitted RTL text, with
+    the capture depth traced inside the submodule's own body.
+
     Returns: `domains` (clock signal -> register count), `crossings`
     (every signal referenced across a clock-domain boundary, with a
     best-effort synchronizer-depth verdict: NON_VACUOUS-style

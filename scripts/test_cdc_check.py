@@ -215,16 +215,22 @@ endmodule
 # honest current behavior (0 crossings reported, not a false
 # "LIKELY_OK") so it isn't mistaken for an accidentally-unfixed bug,
 # and so a future change to this behavior updates this test
-# deliberately rather than by surprise.
+# deliberately rather than by surprise. Since hierarchical instantiation
+# tracing was added (see cdc_check.py's _hierarchical_crossings), this
+# case is now CORRECTLY detected -- kept here (renamed/re-asserted below)
+# as the regression case proving that fix, rather than a documented gap.
 HIERARCHICAL_SYNC = """
 module sync2 (
     input wire clk,
     input wire in,
     output wire out
 );
-    reg [1:0] sync_reg;
-    always @(posedge clk) sync_reg <= {sync_reg[0], in};
-    assign out = sync_reg[1];
+    reg stage1, stage2;
+    always @(posedge clk) begin
+        stage1 <= in;
+        stage2 <= stage1;
+    end
+    assign out = stage2;
 endmodule
 
 module top_with_submodule_sync (
@@ -242,6 +248,40 @@ module top_with_submodule_sync (
     reg q_reg;
     always @(posedge clk_b) q_reg <= synced;
     assign q = q_reg;
+endmodule
+"""
+
+# A crossing that's UNSYNCHRONIZED even through an instantiated
+# submodule (it's clocked, but captures its input mixed into an
+# expression rather than a plain capture) -- confirms the hierarchical
+# tracer reports a real problem as a real problem, not just treating
+# every instantiated submodule as automatically safe.
+HIERARCHICAL_UNSYNC = """
+module bad_sync (
+    input wire clk,
+    input wire in,
+    input wire en,
+    output reg out
+);
+    always @(posedge clk) begin
+        out <= in & en;
+    end
+endmodule
+
+module top_with_bad_submodule_sync (
+    input wire clk_a,
+    input wire clk_b,
+    input wire d,
+    input wire en,
+    output reg q
+);
+    reg d_reg;
+    always @(posedge clk_a) d_reg <= d;
+
+    wire passed;
+    bad_sync b_inst (.clk(clk_b), .in(d_reg), .en(en), .out(passed));
+
+    always @(posedge clk_b) q <= passed;
 endmodule
 """
 
@@ -323,57 +363,82 @@ def main() -> None:
     assert mem_c.verdict == "UNSYNCHRONIZED" and "memory-based crossing" in mem_c.note, mem_c
     print("OK\n")
 
-    print("=== KNOWN LIMITATION: crossing synchronized via an instantiated submodule "
-          "is invisible (documented, not a bug) ===")
+    print("=== Hierarchical: crossing synchronized via an instantiated submodule "
+          "-> expect LIKELY_OK depth=2 ===")
     hmod = analyze_rtl(HIERARCHICAL_SYNC, top_module="top_with_submodule_sync")
     hreport = analyze_cdc(hmod, HIERARCHICAL_SYNC)
-    print(f"  domains={list(hreport.domains.keys())} crossings={len(hreport.crossings)} "
-          f"(expect 0 -- the real crossing through sync_inst is genuinely invisible "
-          f"to this single-module, always-block-only scanner; see cdc_check.py's "
-          f"module docstring)")
+    print(f"  domains={list(hreport.domains.keys())} crossings={len(hreport.crossings)}")
+    for c in hreport.crossings:
+        print(f"    {c.signal}: {c.source_domain}->{c.dest_domain} depth={c.sync_depth} verdict={c.verdict}")
     assert set(hreport.domains.keys()) == {"clk_a", "clk_b"}, hreport.domains
-    assert len(hreport.crossings) == 0, (
-        "if this now finds a crossing, hierarchical/instantiation-aware analysis "
-        "was added -- update this test and its comment, and the docstring in "
-        "cdc_check.py, deliberately rather than treating this as a regression"
+    assert len(hreport.crossings) == 1, hreport.crossings
+    hc = hreport.crossings[0]
+    assert hc.signal == "sync_inst.in" and hc.verdict == "LIKELY_OK" and hc.sync_depth == 2, hc
+    assert "synced" in hreport.domains["clk_b"].registers, (
+        "the instance's output-port-connected wire must be attributed to its own "
+        "clock domain for free, so further downstream crossings are caught too"
     )
     print("OK\n")
 
-    fpga_path = ROOT.parent / "external_rtl_cache" / "fpga.v"
+    print("=== Hierarchical: crossing through a submodule that does NOT synchronize "
+          "-> expect UNSYNCHRONIZED, not a blanket pass ===")
+    umod = analyze_rtl(HIERARCHICAL_UNSYNC, top_module="top_with_bad_submodule_sync")
+    ureport = analyze_cdc(umod, HIERARCHICAL_UNSYNC)
+    print(f"  crossings found: {[(c.signal, c.verdict) for c in ureport.crossings]}")
+    assert len(ureport.crossings) == 1, ureport.crossings
+    uc = ureport.crossings[0]
+    assert uc.signal == "b_inst.in" and uc.verdict == "UNSYNCHRONIZED" and uc.sync_depth == 0, uc
+    print("OK\n")
+
+    fpga_path = ROOT.parent / "external_rtl_cache" / "fpga_combined.v"
     if fpga_path.is_file():
-        print("=== Real-world confirmation of the same limitation: fpga.v, the actual "
-              "deployed VCU118 25G board top (alexforencich/verilog-ethernet) ===")
+        print("=== Real: fpga.v + fpga_core.v + sync_signal.v, concatenated -- the actual "
+              "deployed VCU118 25G board top, now with hierarchical tracing (alexforencich/"
+              "verilog-ethernet) ===")
         # The real top-level integration file for a genuine multi-port 25G
         # Ethernet NIC -- a PLL-derived internal clock (Xilinx MMCME3_BASE),
-        # per-QSFP-port MGT reference clocks, an SGMII PHY clock, and
-        # several MAC IP instantiations. Structurally the most multi-clock
-        # design in this entire series -- yet it has only ONE `always`
-        # block of its own (a small reset-generation block on the
-        # PLL-derived clock); every real cross-clock relationship is
-        # expressed purely through instantiation port connections to
-        # submodules (the MACs already validated separately, plus
-        # sync_signal/sync_reset instances), none of which this scanner
-        # reads. This is the sharpest possible illustration of why a clean
-        # "0 crossings" result on an integration-level top file must never
-        # be read as "verified safe" -- top files are precisely where this
-        # scanner's blind spot is worst, since they're almost always
-        # instantiation-heavy with minimal inline logic of their own.
+        # per-QSFP-port MGT reference clocks, an SGMII PHY clock. It has
+        # only ONE `always` block of its own; every other clock domain
+        # relationship goes through instantiations of fpga_core and
+        # sync_signal (both included here) or vendor primitives / modules
+        # not fetched (sync_reset, debounce_switch, the MAC IP cores --
+        # already validated separately). Before hierarchical tracing was
+        # added, this reported exactly one domain and zero crossings,
+        # completely missing fpga_core's own clock domain. Now:
+        # fpga_core's OWN clock domain is correctly discovered (attributed
+        # from its output-port connections) with zero crossings into it --
+        # an honest, correct result: fpga_core's inputs really are
+        # primary board I/O (buttons, switches, MAC data), not registers
+        # driven by fpga.v's own clk_125mhz_int logic, so there is
+        # genuinely no crossing to find at this specific instantiation
+        # boundary. fpga_core is instantiated as `.clk(clk_390mhz_int)`,
+        # but clk_390mhz_int is itself just
+        # `assign clk_390mhz_int = qsfp1_tx_clk_1_int;` -- a continuous-
+        # assignment alias, not a distinct clock -- so
+        # _resolve_clock_alias correctly walks through it to the true
+        # root name, qsfp1_tx_clk_1_int, instead of reporting the alias
+        # as if it were its own domain. sync_signal_inst's and
+        # debounce_switch_inst's own port connections use concatenation
+        # expressions (`.in({uart_rxd, uart_cts})`) -- resolved too (see
+        # _split_concat_identifiers), though here their sources are also
+        # primary inputs, so still no crossing to report.
         fpga_source = fpga_path.read_text(encoding="utf-8")
         fpga_mod = analyze_rtl(fpga_source, top_module="fpga")
         fpga_report = analyze_cdc(fpga_mod, fpga_source)
-        print(f"  domains={list(fpga_report.domains.keys())} crossings={len(fpga_report.crossings)} "
-              f"(expect exactly 1 domain, 0 crossings -- not because this design is "
-              f"single-clock, it very much isn't, but because none of its real "
-              f"cross-clock logic lives in fpga.v's own always blocks)")
-        assert list(fpga_report.domains.keys()) == ["clk_125mhz_int"], fpga_report.domains
+        print(f"  domains={ {k: len(v.registers) for k, v in fpga_report.domains.items()} } "
+              f"crossings={len(fpga_report.crossings)}")
+        assert set(fpga_report.domains.keys()) == {"clk_125mhz_int", "qsfp1_tx_clk_1_int"}, fpga_report.domains
+        assert len(fpga_report.domains["qsfp1_tx_clk_1_int"].registers) > 0, (
+            "fpga_core's own clock domain must now be discovered via hierarchical "
+            "tracing, not just fpga.v's single inline always block's domain"
+        )
         assert len(fpga_report.crossings) == 0, fpga_report.crossings
         print("OK\n")
     else:
         print(
-            "(skipping fpga.v check -- fetch "
-            "https://raw.githubusercontent.com/alexforencich/verilog-ethernet/master/"
-            "example/VCU118/fpga_25g/rtl/fpga.v "
-            f"to {fpga_path} to include it)\n"
+            "(skipping fpga.v check -- fetch fpga.v, fpga_core.v, sync_signal.v from "
+            "alexforencich/verilog-ethernet's example/VCU118/fpga_25g/rtl/, concatenate "
+            f"them in that order, and save the result to {fpga_path} to include it)\n"
         )
 
     print("=== Sanity: single-clock design (rv32i_core.v) -> expect zero crossings ===")
@@ -566,17 +631,31 @@ def main() -> None:
         # picorv32 and picorv32_wb, now embedded in this even larger file
         # (16 modules, spanning two different subdirectories of the same
         # repo concatenated together), must still match their standalone
-        # register counts and domains exactly.
+        # domains and register counts exactly -- 185 and 38 respectively,
+        # up from the pre-hierarchical-tracing 177 and 9: picorv32 itself
+        # instantiates picorv32_regs/pcpi_mul/pcpi_fast_mul/pcpi_div
+        # (all sharing "clk"), whose output ports are now correctly
+        # attributed to picorv32's own domain; picorv32_wb instantiates
+        # picorv32 itself via `.clk(clk)`, where clk is just
+        # `assign clk = wb_clk_i;` (an alias, correctly resolved by
+        # _resolve_clock_alias -- without that fix this fabricated two
+        # fake crossings between "wb_clk_i" and "clk" for the exact same
+        # physical clock net, confirmed and fixed during this feature's
+        # own development), so the CPU core's own signals now correctly
+        # join the wb_clk_i domain too. Zero crossings in both cases,
+        # either way -- growth in registers, not new (false) crossings.
         pico_mod = analyze_rtl(picosoc_source, top_module="picorv32")
         pico_report = analyze_cdc(pico_mod, picosoc_source)
         print(f"  picorv32 (embedded): domains={ {k: len(v.registers) for k, v in pico_report.domains.items()} }")
         assert list(pico_report.domains.keys()) == ["clk"]
-        assert len(pico_report.domains["clk"].registers) == 177, pico_report.domains["clk"].registers
+        assert len(pico_report.domains["clk"].registers) == 185, pico_report.domains["clk"].registers
+        assert len(pico_report.crossings) == 0, pico_report.crossings
 
         wb_mod = analyze_rtl(picosoc_source, top_module="picorv32_wb")
         wb_report = analyze_cdc(wb_mod, picosoc_source)
         assert list(wb_report.domains.keys()) == ["wb_clk_i"]
-        assert len(wb_report.domains["wb_clk_i"].registers) == 9
+        assert len(wb_report.domains["wb_clk_i"].registers) == 38, wb_report.domains["wb_clk_i"].registers
+        assert len(wb_report.crossings) == 0, wb_report.crossings
         print("OK\n")
     else:
         print(

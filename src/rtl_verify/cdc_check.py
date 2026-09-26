@@ -64,6 +64,7 @@ from .analyzer import (
     Port,
     PortDirection,
     RtlModule,
+    analyze_rtl,
     _extract_module_body,
     _strip_comments,
     strip_ifdef_blocks,
@@ -259,6 +260,168 @@ def _identifiers_referenced(text: str) -> Set[str]:
     return set(re.findall(r"\b[A-Za-z_]\w*\b", text))
 
 
+def _find_matching_close(text: str, open_idx: int, open_ch: str, close_ch: str) -> int:
+    """Index of the `close_ch` matching the `open_ch` at `open_idx`, or -1."""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        if text[i] == open_ch:
+            depth += 1
+        elif text[i] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+@dataclass
+class Instantiation:
+    module_name: str
+    instance_name: str
+    connections: Dict[str, str]  # port name -> connected signal text (raw, stripped)
+
+
+_IDENT_ONLY = re.compile(r"\w+")
+_SIMPLE_ASSIGN_ALIAS = re.compile(r"\bassign\s+(\w+)\s*=\s*(\w+)\s*;")
+
+
+def _resolve_clock_alias(clean_body: str, signal: str, domains: Dict[str, ClockDomain]) -> str:
+    """If `signal` isn't itself a known domain but is a simple continuous-
+    assignment alias of one (`assign signal = other;`), resolve to the
+    aliased domain's name instead of treating the alias as a genuinely
+    different clock domain.
+
+    A real, common wrapper idiom -- confirmed directly on
+    YosysHQ/picorv32's own `picorv32_wb`, which does
+    `assign clk = wb_clk_i;` before instantiating the CPU core with
+    `.clk(clk)`. Without this resolution, the hierarchical tracer would
+    treat `clk` as a different domain from `wb_clk_i` even though
+    they're the exact same physical clock net under two names,
+    fabricating a fake crossing between a signal and itself.
+    """
+    seen = {signal}
+    current = signal
+    aliases: Optional[Dict[str, str]] = None
+    while current not in domains:
+        if aliases is None:
+            aliases = dict(_SIMPLE_ASSIGN_ALIAS.findall(clean_body))
+        nxt = aliases.get(current)
+        if nxt is None or nxt in seen:
+            break
+        seen.add(nxt)
+        current = nxt
+    return current
+
+
+def _split_concat_identifiers(conn_sig: str) -> Optional[List[str]]:
+    """If `conn_sig` is a bare identifier, or a `{a, b, c}` concatenation
+    of bare identifiers -- a real, common way to bundle several signals
+    onto one port at an instantiation (e.g. `.in({uart_rxd, uart_cts})`,
+    from a real board-level integration file) -- return the constituent
+    identifier(s); else None (an arbitrary expression this scope
+    deliberately doesn't resolve, rather than guessing at it)."""
+    if re.fullmatch(r"\w+", conn_sig):
+        return [conn_sig]
+    if conn_sig.startswith("{") and conn_sig.endswith("}"):
+        terms = [t.strip() for t in conn_sig[1:-1].split(",")]
+        if terms and all(re.fullmatch(r"\w+", t) for t in terms):
+            return terms
+    return None
+
+
+def _find_instantiations(clean_body: str, known_modules: Set[str]) -> List[Instantiation]:
+    """Every `MODULE_NAME [#(...)] instance_name (.port(sig), ...);`
+    instantiation of a module DEFINED IN THIS SAME SOURCE TEXT, found in
+    `clean_body`. Restricting to known module names (rather than a
+    generic "identifier identifier (" pattern) avoids false positives
+    from other statement shapes that superficially resemble one.
+
+    Only NAMED port connections (`.port(signal)`) whose connected signal
+    is a bare identifier are resolved here -- positional connections and
+    connections that are themselves expressions (not a simple wire/reg
+    name) are silently skipped for hierarchical tracing (see
+    `_hierarchical_crossings`), a deliberate, narrow scope limit rather
+    than an unreliable heuristic over arbitrary expressions.
+    """
+    if not known_modules:
+        return []
+    names_pattern = "|".join(re.escape(n) for n in sorted(known_modules, key=len, reverse=True))
+    header_re = re.compile(rf"^[ \t]*({names_pattern})\b", re.MULTILINE)
+    results: List[Instantiation] = []
+    n = len(clean_body)
+    for m in header_re.finditer(clean_body):
+        module_name = m.group(1)
+        i = m.end()
+        while i < n and clean_body[i].isspace():
+            i += 1
+        if i < n and clean_body[i] == "#":
+            close = _find_matching_close(clean_body, i + 1, "(", ")")
+            if close < 0:
+                continue
+            i = close + 1
+            while i < n and clean_body[i].isspace():
+                i += 1
+        inst_m = _IDENT_ONLY.match(clean_body, i)
+        if not inst_m:
+            continue
+        instance_name = inst_m.group(0)
+        i = inst_m.end()
+        while i < n and clean_body[i].isspace():
+            i += 1
+        if i >= n or clean_body[i] != "(":
+            continue
+        close = _find_matching_close(clean_body, i, "(", ")")
+        if close < 0:
+            continue
+        port_list_text = clean_body[i + 1:close]
+        j = close + 1
+        while j < n and clean_body[j].isspace():
+            j += 1
+        if j >= n or clean_body[j] != ";":
+            continue  # not actually an instantiation statement -- skip
+        connections: Dict[str, str] = {}
+        for pm in re.finditer(r"\.(\w+)\s*\(", port_list_text):
+            popen = pm.end() - 1
+            pclose = _find_matching_close(port_list_text, popen, "(", ")")
+            if pclose < 0:
+                continue
+            connections[pm.group(1)] = port_list_text[popen + 1:pclose].strip()
+        results.append(Instantiation(module_name=module_name, instance_name=instance_name, connections=connections))
+    return results
+
+
+def _compute_domains(clean_body: str) -> tuple[Dict[str, ClockDomain], Dict[str, str], List[AlwaysBlock]]:
+    """Group a module's `always` blocks into clock domains: which
+    registers each domain drives, and (for capture-depth tracing) each
+    domain's combined body text across every block that shares its
+    clock -- factored out so both a module's own crossing detection and
+    the hierarchical tracer's per-callee analysis (see
+    `_hierarchical_crossings`) use the exact same logic.
+    """
+    blocks = _find_always_blocks(clean_body)
+    domains: Dict[str, ClockDomain] = {}
+    domain_bodies: Dict[str, List[str]] = {}
+    for b in blocks:
+        if b.clock_signal is None:
+            continue
+        dom = domains.setdefault(b.clock_signal, ClockDomain(clock_signal=b.clock_signal))
+        dom.registers |= _registers_driven(b.body)
+        domain_bodies.setdefault(b.clock_signal, []).append(b.body)
+    # A synchronizer chain commonly spans more than one `always` block in
+    # the same domain (e.g. one block updates a pointer, a separate block
+    # captures it into a sync register) -- confirmed a real, not
+    # hypothetical, case: a real async FIFO's wr_ptr_sync_commit_reg is
+    # captured into wr_ptr_commit_sync_reg in a DIFFERENT always block
+    # than the one where the crossing was first detected, and tracing
+    # only the first block's text alone underreported a 2-stage chain as
+    # 1-stage (WEAK instead of the correct LIKELY_OK). Search the whole
+    # domain's combined text, not just one block, for exactly this reason.
+    domain_full_text = {clk: "\n".join(bodies) for clk, bodies in domain_bodies.items()}
+    return domains, domain_full_text, blocks
+
+
 @dataclass
 class ClockDomain:
     clock_signal: str
@@ -389,9 +552,131 @@ def _sync_depth_for_crossing(signal: str, dest_body: str, dest_registers: Set[st
             return depth, "capture chain traced 4+ stages deep (capped)"
 
 
+def _hierarchical_crossings(
+    module: RtlModule,
+    rtl_source: str,
+    clean_body: str,
+    domains: Dict[str, ClockDomain],
+    seen_pairs: Set[tuple[str, str, str]],
+) -> List[CDCCrossing]:
+    """Trace crossings synchronized by INSTANTIATING a reusable
+    synchronizer submodule, rather than hand-inlining flip-flops in the
+    consuming module -- the idiomatic, professional way real engineers
+    write this (see this module's own docstring for the real-world case,
+    alexforencich/verilog-ethernet's `sync_signal.v`, that motivated
+    building this). Before this function existed, such a crossing was
+    completely invisible: the crossing signal only ever appears as a
+    port-connection argument in an instantiation statement, never inside
+    an `always` block body the rest of this scanner reads.
+
+    For each directly-instantiated module DEFINED IN THIS SAME SOURCE
+    TEXT (one level deep -- see the scope note below), this:
+      1. Resolves which caller-side signal drives the instance's own
+         clock port (`.clk_port_name(some_signal)`); that signal becomes
+         the instance's clock-domain name, reusing an existing domain of
+         the same name if the caller already has one.
+      2. Attributes every instance OUTPUT port's connected signal to
+         that domain, so ordinary same-module crossing detection (in
+         `analyze_cdc`) picks up any FURTHER downstream use of that
+         signal in a different domain for free, with no new logic.
+      3. For every instance INPUT port whose connected signal belongs to
+         one of the caller's OTHER domains, reports a crossing -- with
+         the capture depth traced INSIDE the callee's own body (reusing
+         `_sync_depth_for_crossing` exactly as intra-module crossings
+         do), so a genuinely well-synchronized instantiated primitive
+         still reports `LIKELY_OK`, not a blanket "can't tell."
+
+    Scope, deliberately: only ONE level of instantiation is traced (the
+    target module's own direct instantiations, not its instantiations'
+    instantiations) -- full recursive elaboration to arbitrary depth is
+    a substantially larger feature; analyze each intermediate module
+    directly (as this project's own test suite already does for every
+    real design) to see crossings nested deeper than that. Only NAMED
+    port connections with a bare-identifier signal are resolved (see
+    `_find_instantiations`); a submodule not defined in this same source
+    text, or itself a documented-unsupported multi-clock module with no
+    single identifiable clock port, is skipped gracefully, not guessed at.
+    """
+    defined_modules = set(re.findall(r"\bmodule\s+(\w+)\b", rtl_source)) - {module.name}
+    instantiations = _find_instantiations(clean_body, defined_modules)
+    crossings: List[CDCCrossing] = []
+
+    for inst in instantiations:
+        try:
+            callee_mod = analyze_rtl(rtl_source, top_module=inst.module_name)
+        except Exception:
+            continue  # callee not resolvable from this source text -- skip gracefully
+        if not callee_mod.is_sequential or not callee_mod.clock_port:
+            continue  # combinational, or itself an unsupported multi-clock module -- skip
+
+        clk_conn = inst.connections.get(callee_mod.clock_port)
+        if not clk_conn or not re.fullmatch(r"\w+", clk_conn):
+            continue  # can't resolve a simple clock connection -- documented scope limit
+
+        instance_domain = _resolve_clock_alias(clean_body, clk_conn, domains)
+        callee_clean = strip_ifdef_blocks(
+            _extract_module_body(_strip_comments(rtl_source), callee_mod.name),
+            _VERIFICATION_ONLY_MACROS,
+        )
+        callee_domains, callee_domain_text, _ = _compute_domains(callee_clean)
+        callee_dom = callee_domains.get(callee_mod.clock_port)
+        callee_registers = callee_dom.registers if callee_dom else set()
+        callee_body_text = callee_domain_text.get(callee_mod.clock_port, "")
+        callee_port_dirs = {p.name: p.direction for p in callee_mod.ports}
+
+        dom = domains.setdefault(instance_domain, ClockDomain(clock_signal=instance_domain))
+        for port_name, conn_sig in inst.connections.items():
+            if port_name == callee_mod.clock_port:
+                continue
+            idents = _split_concat_identifiers(conn_sig)
+            if idents is None:
+                continue
+            if callee_port_dirs.get(port_name) == PortDirection.OUTPUT:
+                dom.registers.update(idents)
+
+        for port_name, conn_sig in inst.connections.items():
+            if port_name == callee_mod.clock_port:
+                continue
+            if callee_port_dirs.get(port_name) != PortDirection.INPUT:
+                continue
+            idents = _split_concat_identifiers(conn_sig)
+            if idents is None:
+                continue
+            src_domain_name = next((
+                src_name for src_name, src_dom in domains.items()
+                if src_name != instance_domain and any(ident in src_dom.registers for ident in idents)
+            ), None)
+            if src_domain_name is None:
+                continue
+            key = (f"{inst.instance_name}.{port_name}", src_domain_name, instance_domain)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            depth, why = _sync_depth_for_crossing(port_name, callee_body_text, callee_registers)
+            if depth == 0:
+                verdict = "UNSYNCHRONIZED"
+            elif depth == 1:
+                verdict = "WEAK"
+            else:
+                verdict = "LIKELY_OK"
+            note = (
+                f"Crosses via instantiated submodule '{inst.instance_name}' "
+                f"({inst.module_name}), port '{port_name}': {depth}-stage capture chain "
+                f"inside that submodule's own '{callee_mod.clock_port}' domain ({why})."
+            )
+            crossings.append(CDCCrossing(
+                signal=f"{inst.instance_name}.{port_name}",
+                source_domain=src_domain_name, dest_domain=instance_domain,
+                width=1, sync_depth=depth, verdict=verdict, note=note,
+            ))
+    return crossings
+
+
 def analyze_cdc(module: RtlModule, rtl_source: str) -> CDCReport:
     """Build a CDCReport: clock domains, every cross-domain signal
-    reference, and every async-reset signal's provenance.
+    reference (both hand-inlined and via an instantiated synchronizer
+    submodule one level deep -- see `_hierarchical_crossings`), and
+    every async-reset signal's provenance.
     """
     # Scope the scan to this module's own body -- rtl_source may contain
     # other modules entirely (a real, not hypothetical, risk: confirmed on
@@ -401,26 +686,7 @@ def analyze_cdc(module: RtlModule, rtl_source: str) -> CDCReport:
     # clock domain and several crossings that don't exist in that module).
     module_body = _extract_module_body(_strip_comments(rtl_source), module.name)
     clean = strip_ifdef_blocks(module_body, _VERIFICATION_ONLY_MACROS)
-    blocks = _find_always_blocks(clean)
-
-    domains: Dict[str, ClockDomain] = {}
-    domain_bodies: Dict[str, List[str]] = {}
-    for b in blocks:
-        if b.clock_signal is None:
-            continue
-        dom = domains.setdefault(b.clock_signal, ClockDomain(clock_signal=b.clock_signal))
-        dom.registers |= _registers_driven(b.body)
-        domain_bodies.setdefault(b.clock_signal, []).append(b.body)
-    # A synchronizer chain commonly spans more than one `always` block in
-    # the same domain (e.g. one block updates a pointer, a separate block
-    # captures it into a sync register) -- confirmed a real, not
-    # hypothetical, case: a real async FIFO's wr_ptr_sync_commit_reg is
-    # captured into wr_ptr_commit_sync_reg in a DIFFERENT always block
-    # than the one where the crossing was first detected, and tracing
-    # only the first block's text alone underreported a 2-stage chain as
-    # 1-stage (WEAK instead of the correct LIKELY_OK). Search the whole
-    # domain's combined text, not just one block, for exactly this reason.
-    domain_full_text = {clk: "\n".join(bodies) for clk, bodies in domain_bodies.items()}
+    domains, domain_full_text, blocks = _compute_domains(clean)
 
     port_widths = {p.name: p.width for p in module.ports}
 
@@ -461,6 +727,8 @@ def analyze_cdc(module: RtlModule, rtl_source: str) -> CDCReport:
                     signal=sig, source_domain=src_clock, dest_domain=dest_clock,
                     width=width, sync_depth=depth, verdict=verdict, note=note,
                 ))
+
+    crossings.extend(_hierarchical_crossings(module, rtl_source, clean, domains, seen_pairs))
 
     # Reset-domain check: every distinct edge-triggered signal that is
     # NOT itself used as a clock trigger anywhere (i.e. it's only ever
