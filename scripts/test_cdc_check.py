@@ -351,6 +351,51 @@ def main() -> None:
             f"and save the result to {eth_path} to include it)\n"
         )
 
+    eth10g_path = ROOT.parent / "external_rtl_cache" / "eth_mac_10g_fifo_combined.v"
+    if eth10g_path.is_file():
+        print("=== Real: eth_mac_phy_10g_fifo + its real dependencies, concatenated "
+              "(alexforencich/verilog-ethernet + verilog-axis) -- 5000+ lines, 14 modules ===")
+        # A real 10G MAC/PHY design: deeper hierarchy than the 1G case
+        # above (fifo -> phy_10g -> rx_if -> frame_sync/ber_mon/watchdog,
+        # 4 levels vs. the 1G design's 3) and roughly 40% more modules.
+        # Same documented multi-file workaround: all 11 new dependency
+        # files concatenated with the 3 already fetched for the 1G case
+        # (axis_async_fifo_adapter, axis_async_fifo, lfsr are shared).
+        eth10g_source = eth10g_path.read_text(encoding="utf-8")
+
+        top10g_mod = analyze_rtl(eth10g_source, top_module="eth_mac_phy_10g_fifo")
+        top10g_report = analyze_cdc(top10g_mod, eth10g_source)
+        print(f"  eth_mac_phy_10g_fifo domains={list(top10g_report.domains.keys())} "
+              f"crossings={len(top10g_report.crossings)}")
+        assert set(top10g_report.domains.keys()) == {"tx_clk", "rx_clk", "logic_clk"}, top10g_report.domains
+        assert not top10g_report.unsynchronized_crossings, top10g_report.unsynchronized_crossings
+
+        # axis_async_fifo now sits 4 modules deep (fifo -> ... -> adapter
+        # -> fifo) in this even larger file -- must still match the
+        # standalone 12-crossing result exactly.
+        afifo10g_mod = analyze_rtl(eth10g_source, top_module="axis_async_fifo")
+        afifo10g_report = analyze_cdc(afifo10g_mod, eth10g_source)
+        print(f"  axis_async_fifo (embedded, 4 levels deep) crossings={len(afifo10g_report.crossings)} "
+              f"(expect 12)")
+        assert len(afifo10g_report.crossings) == 12, afifo10g_report.crossings
+
+        # A pure-wrapper module (instantiation only, no own always blocks)
+        # must correctly report zero domains, not inherit a neighbor's.
+        wrapper_mod = analyze_rtl(eth10g_source, top_module="eth_mac_phy_10g")
+        wrapper_report = analyze_cdc(wrapper_mod, eth10g_source)
+        assert wrapper_report.domains == {}, wrapper_report.domains
+        print("OK\n")
+    else:
+        print(
+            "(skipping eth_mac_phy_10g_fifo check -- fetch eth_mac_phy_10g_fifo.v, "
+            "eth_mac_phy_10g.v, eth_mac_phy_10g_rx.v, eth_mac_phy_10g_tx.v, "
+            "eth_phy_10g_rx_if.v, eth_phy_10g_tx_if.v, axis_baser_rx_64.v, axis_baser_tx_64.v, "
+            "eth_phy_10g_rx_frame_sync.v, eth_phy_10g_rx_ber_mon.v, eth_phy_10g_rx_watchdog.v "
+            "from alexforencich/verilog-ethernet, plus axis_async_fifo_adapter.v, "
+            "axis_async_fifo.v, and lfsr.v (already used above), concatenate them all, "
+            f"and save the result to {eth10g_path} to include it)\n"
+        )
+
     print("=== ALL CASES MATCHED EXPECTATIONS ===")
 
 
