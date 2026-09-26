@@ -36,7 +36,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
-from .analyzer import Port, PortDirection, RtlModule, _strip_comments, strip_ifdef_blocks
+from .analyzer import (
+    Port,
+    PortDirection,
+    RtlModule,
+    _extract_module_body,
+    _strip_comments,
+    strip_ifdef_blocks,
+)
 
 # Verification-only scaffolding macros (SymbiYosys/riscv-formal/ZipCPU
 # convention) whose guarded branch must be excluded from this structural
@@ -283,7 +290,14 @@ def analyze_cdc(module: RtlModule, rtl_source: str) -> CDCReport:
     """Build a CDCReport: clock domains, every cross-domain signal
     reference, and every async-reset signal's provenance.
     """
-    clean = strip_ifdef_blocks(_strip_comments(rtl_source), _VERIFICATION_ONLY_MACROS)
+    # Scope the scan to this module's own body -- rtl_source may contain
+    # other modules entirely (a real, not hypothetical, risk: confirmed on
+    # picorv32.v, whose file defines 8 modules; scanning the raw file text
+    # misattributed a completely different module's `wb_clk_i`-clocked
+    # always blocks to the actual `picorv32` core, fabricating a second
+    # clock domain and several crossings that don't exist in that module).
+    module_body = _extract_module_body(_strip_comments(rtl_source), module.name)
+    clean = strip_ifdef_blocks(module_body, _VERIFICATION_ONLY_MACROS)
     blocks = _find_always_blocks(clean)
 
     domains: Dict[str, ClockDomain] = {}

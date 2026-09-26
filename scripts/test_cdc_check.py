@@ -144,6 +144,38 @@ endmodule
 """
 
 
+# Two unrelated modules in the same file, each genuinely single-clock on
+# its own -- but with DIFFERENT clock names. Scanning the raw file text
+# instead of scoping to the target module's own body would misattribute
+# the other module's always blocks, fabricating a second clock domain
+# and crossings that don't exist in either module. Confirmed a real,
+# not hypothetical, risk on picorv32.v (8 modules in one file): the
+# actual `picorv32` core's CDC report picked up a completely unrelated
+# `picorv32_wb` wrapper module's `wb_clk_i`-clocked logic.
+MULTI_MODULE_FILE = """
+module core_a (
+    input  wire clk_a,
+    input  wire d,
+    output reg  q
+);
+    always @(posedge clk_a) q <= d;
+endmodule
+
+module core_b (
+    input  wire clk_b,
+    input  wire d,
+    output reg  q
+);
+    reg stage1, stage2;
+    always @(posedge clk_b) begin
+        stage1 <= d;
+        stage2 <= stage1;
+        q <= stage2;
+    end
+endmodule
+"""
+
+
 def main() -> None:
     print("=== Synthetic: proper 2+ stage synchronizer -> expect LIKELY_OK ===")
     mod = analyze_rtl(GOOD_SYNC, top_module="good_sync")
@@ -199,6 +231,18 @@ def main() -> None:
     assert len(report6.crossings) == 0
     print("OK\n")
 
+    print("=== Synthetic: multi-module file, scan must scope to the target module only ===")
+    mod_a = analyze_rtl(MULTI_MODULE_FILE, top_module="core_a")
+    report_a = analyze_cdc(mod_a, MULTI_MODULE_FILE)
+    mod_b = analyze_rtl(MULTI_MODULE_FILE, top_module="core_b")
+    report_b = analyze_cdc(mod_b, MULTI_MODULE_FILE)
+    print(f"  core_a domains={list(report_a.domains.keys())} crossings={len(report_a.crossings)}")
+    print(f"  core_b domains={list(report_b.domains.keys())} crossings={len(report_b.crossings)}")
+    assert list(report_a.domains.keys()) == ["clk_a"], report_a.domains
+    assert list(report_b.domains.keys()) == ["clk_b"], report_b.domains
+    assert len(report_a.crossings) == 0 and len(report_b.crossings) == 0
+    print("OK\n")
+
     print("=== Sanity: single-clock design (rv32i_core.v) -> expect zero crossings ===")
     rv32i_source = (ROOT / "examples" / "rv32i_core.v").read_text(encoding="utf-8")
     rv32i_mod = analyze_rtl(rv32i_source, top_module="rv32i_core")
@@ -229,6 +273,34 @@ def main() -> None:
             "(skipping real-design check -- fetch "
             "https://raw.githubusercontent.com/alexforencich/verilog-axis/master/rtl/axis_async_fifo.v "
             f"to {external} to include it)\n"
+        )
+
+    picorv32_path = ROOT.parent / "external_rtl_cache" / "picorv32.v"
+    if picorv32_path.is_file():
+        print("=== Real: picorv32.v (YosysHQ/picorv32) -- multi-module file, 3000+ lines ===")
+        pico_source = picorv32_path.read_text(encoding="utf-8")
+        # picorv32 itself (the core) is genuinely single-clock. Its own
+        # file also defines picorv32_wb, a *separate* module with its own
+        # wb_clk_i clock -- the scan must not let that leak into the
+        # core's report (a real bug found here: an earlier version scanned
+        # the raw file text instead of scoping to the target module's own
+        # body, misattributing picorv32_wb's clock domain to picorv32).
+        pico_mod = analyze_rtl(pico_source, top_module="picorv32")
+        pico_report = analyze_cdc(pico_mod, pico_source)
+        print(f"  picorv32 domains={list(pico_report.domains.keys())} crossings={len(pico_report.crossings)}")
+        assert list(pico_report.domains.keys()) == ["clk"], pico_report.domains
+        assert len(pico_report.crossings) == 0, pico_report.crossings
+
+        wb_mod = analyze_rtl(pico_source, top_module="picorv32_wb")
+        wb_report = analyze_cdc(wb_mod, pico_source)
+        print(f"  picorv32_wb domains={list(wb_report.domains.keys())}")
+        assert list(wb_report.domains.keys()) == ["wb_clk_i"], wb_report.domains
+        print("OK\n")
+    else:
+        print(
+            "(skipping picorv32 check -- fetch "
+            "https://raw.githubusercontent.com/YosysHQ/picorv32/master/picorv32.v "
+            f"to {picorv32_path} to include it)\n"
         )
 
     print("=== ALL CASES MATCHED EXPECTATIONS ===")
