@@ -396,6 +396,53 @@ def main() -> None:
             f"and save the result to {eth10g_path} to include it)\n"
         )
 
+    picosoc_path = ROOT.parent / "external_rtl_cache" / "picosoc_icebreaker_combined.v"
+    if picosoc_path.is_file():
+        print("=== Real: PicoSoC on iCEBreaker (YosysHQ/picorv32) -- a real, deployed "
+              "FPGA board SoC, 4000+ lines, 16 modules ===")
+        # The full board-level design as actually shipped: icebreaker.v
+        # (top, board I/O + reset generation) + ice40up5k_spram.v (vendor
+        # SPRAM wrapper) + picosoc.v (bus/address decode, defines its own
+        # picosoc_regs/picosoc_mem submodules) + spimemio.v (+ its own
+        # spimemio_xfer submodule) + simpleuart.v + picorv32.v (the core
+        # already validated standalone, now embedded in a 16-module file
+        # spanning two different picorv32-repo subdirectories concatenated
+        # together). No PLL and no dual-clock memory anywhere in this
+        # design -- it's genuinely single-clock by construction, so every
+        # module reporting zero crossings is the correct, honest answer,
+        # not a checker limitation.
+        picosoc_source = picosoc_path.read_text(encoding="utf-8")
+
+        for top in ["icebreaker", "picosoc", "spimemio", "simpleuart"]:
+            m = analyze_rtl(picosoc_source, top_module=top)
+            r = analyze_cdc(m, picosoc_source)
+            print(f"  {top}: domains={list(r.domains.keys())} crossings={len(r.crossings)}")
+            assert len(r.crossings) == 0, (top, r.crossings)
+
+        # picorv32 and picorv32_wb, now embedded in this even larger file
+        # (16 modules, spanning two different subdirectories of the same
+        # repo concatenated together), must still match their standalone
+        # register counts and domains exactly.
+        pico_mod = analyze_rtl(picosoc_source, top_module="picorv32")
+        pico_report = analyze_cdc(pico_mod, picosoc_source)
+        print(f"  picorv32 (embedded): domains={ {k: len(v.registers) for k, v in pico_report.domains.items()} }")
+        assert list(pico_report.domains.keys()) == ["clk"]
+        assert len(pico_report.domains["clk"].registers) == 177, pico_report.domains["clk"].registers
+
+        wb_mod = analyze_rtl(picosoc_source, top_module="picorv32_wb")
+        wb_report = analyze_cdc(wb_mod, picosoc_source)
+        assert list(wb_report.domains.keys()) == ["wb_clk_i"]
+        assert len(wb_report.domains["wb_clk_i"].registers) == 9
+        print("OK\n")
+    else:
+        print(
+            "(skipping PicoSoC check -- fetch icebreaker.v, ice40up5k_spram.v, picosoc.v, "
+            "spimemio.v, simpleuart.v from YosysHQ/picorv32's picosoc/ directory, plus "
+            "picorv32.v (already used above) from the repo root, concatenate icebreaker.v "
+            "first (it must precede picosoc.v) through picorv32.v last, and save the result "
+            f"to {picosoc_path} to include it)\n"
+        )
+
     print("=== ALL CASES MATCHED EXPECTATIONS ===")
 
 
