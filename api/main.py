@@ -39,6 +39,7 @@ from rtl_verify.failure_triage import answer_question  # noqa: E402
 from rtl_verify.dut_probe import generate_probed_rtl  # noqa: E402
 from rtl_verify.vacuity import run_vacuity_check  # noqa: E402
 from rtl_verify.assumption_check import check_assumption_consistency  # noqa: E402
+from rtl_verify.mutation_adequacy import run_mutation_adequacy  # noqa: E402
 from rtl_verify.cross_check import cross_check_property  # noqa: E402
 from rtl_verify import regression  # noqa: E402
 from rtl_verify.regression import BaselineProperty  # noqa: E402
@@ -829,6 +830,158 @@ async def formal_check(
         },
         "work_dir": base.as_posix(),
         "regression_report": regression_report,
+    }
+
+
+@app.post("/api/formal/mutation_adequacy")
+async def formal_mutation_adequacy(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    top_module: str = Form(""),
+    properties: str = Form("[]"),
+    timeout_sec: int = Form(300),
+    depth_override: int = Form(0),
+    max_mutants: int = Form(20),
+):
+    """"How many properties is enough, and are they actually any good?" --
+    a real, measured answer via RTL mutation testing (researched from
+    YosysHQ's own published MCY methodology; see src/rtl_verify/mutate.py
+    and mutation_adequacy.py for the full citation trail and the
+    deliberate simplifications versus the full MCY tool).
+
+    `properties` is the same shape as `/api/formal`'s (assert-kind only —
+    assume/cover entries are ignored here). Each is FIRST re-confirmed
+    PROVEN on the real, unmutated design via the same engine/solver
+    fallback chain `/api/formal` uses — scoring mutation coverage against
+    a property that doesn't even hold on the real design is meaningless,
+    so anything that isn't PROVEN here is excluded from scoring, with the
+    reason reported in `baseline`, not silently dropped.
+
+    Only the confirmed-PROVEN subset is then scored against up to
+    `max_mutants` single-operator mutations (relational/logical/bitwise/
+    arithmetic) of the target module's own body — see mutate.py for
+    exactly which operators and why `<=`/`>=` are deliberately excluded
+    as mutation sources (Verilog's nonblocking-assignment ambiguity).
+    Each mutant is tried against only the FASTEST engine in
+    `recommended_engine_chain()`, not the full fallback chain every other
+    property check in this project uses — a deliberate cost bound, since
+    mutation testing already multiplies solver runs by the mutant count.
+
+    A `NOT_CAUGHT` mutant may be a real, honest gap in the property set,
+    or it may be a behaviorally-equivalent change this endpoint has no
+    netlist-level equivalence-checking layer to rule out (unlike the
+    real MCY tool) — every result says so explicitly rather than
+    implying more precision than it has.
+    """
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+
+    formal_engines = formal_backends()
+    if not formal_engines:
+        return {"error": "No formal backend available. Install the OSS CAD Suite."}
+    engine = formal_engines[0]
+
+    try:
+        props = json.loads(properties) if properties.strip() else []
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON in properties: {e}"}
+    if not isinstance(props, list):
+        return {"error": "properties must be a JSON list"}
+
+    try:
+        probed_source, mod = _analyze_and_probe(rtl_source, top_module)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    base = Path(tempfile.mkdtemp(prefix="mutation_adequacy_api_"))
+    ext = dut_source_extension(rtl_source, "systemverilog")
+    rtl_path = base / f"dut{ext}"
+    rtl_path.write_text(probed_source, encoding="utf-8")
+
+    assume_props = []
+    candidate_asserts = []
+    for i, p in enumerate(props):
+        name = str(p.get("name") or f"prop{i}")
+        expr = str(p.get("expr") or "").strip()
+        kind = str(p.get("kind") or "assert")
+        if not expr:
+            continue
+        if kind == "assume":
+            assume_props.append((name, expr, "assume"))
+        elif kind == "assert":
+            candidate_asserts.append((name, expr))
+
+    if not candidate_asserts:
+        return {"error": "properties must include at least one assert-kind property with a non-empty expr"}
+
+    chain = recommended_engine_chain(mod, kind="assert", depth_override=depth_override)
+    per_attempt_timeout = max(30, timeout_sec // max(1, len(candidate_asserts)) // len(chain))
+
+    baseline = []
+    proven_properties: list[tuple[str, str, str]] = []
+    for name, expr in candidate_asserts:
+        try:
+            wrapper_sv = generate_formal_wrapper(mod, assume_props + [(name, expr, "assert")])
+        except ValueError as e:
+            baseline.append({"name": name, "verdict": "ERROR", "note": str(e)})
+            continue
+        work = base / f"baseline_{name}"
+        result = None
+        for i, config in enumerate(chain):
+            attempt_dir = work / f"engine_{i}"
+            wrapper_path = attempt_dir / "wrapper.sv"
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+            wrapper_path.write_text(wrapper_sv, encoding="utf-8")
+            result = engine.run(
+                rtl_path, wrapper_path, attempt_dir,
+                top=f"{mod.name}_formal_top",
+                depth=config["depth"], mode=config["mode"], engine=config["engine"],
+                timeout_sec=per_attempt_timeout,
+            )
+            if result.status in ("PASS", "FAIL"):
+                break
+        if result is not None and result.status == "PASS":
+            baseline.append({"name": name, "verdict": "PROVEN"})
+            proven_properties.append((name, expr, "assert"))
+        else:
+            status = result.status if result is not None else "ERROR"
+            baseline.append({
+                "name": name, "verdict": status,
+                "note": "Excluded from mutation scoring -- only properties confirmed PROVEN on "
+                        "the real, unmutated design are meaningful to score mutation coverage "
+                        "against.",
+            })
+
+    report = run_mutation_adequacy(
+        mod, probed_source, proven_properties, assume_props, engine,
+        max_mutants=max_mutants, per_attempt_timeout_sec=max(15, per_attempt_timeout),
+        depth_override=depth_override, work_root=base / "mutants",
+    )
+
+    return {
+        "module": mod.name,
+        "baseline": baseline,
+        "adequacy": {
+            "checked": report.checked,
+            "total_mutants": report.total_mutants,
+            "caught": report.caught,
+            "not_caught": report.not_caught,
+            "inconclusive": report.inconclusive,
+            "kill_rate": report.kill_rate,
+            "note": report.note,
+            "mutants": [
+                {
+                    "id": m.mutant_id, "operator": m.operator, "location": m.location,
+                    "verdict": m.verdict, "caught_by": m.caught_by, "detail": m.detail,
+                }
+                for m in report.mutants
+            ],
+        },
+        "work_dir": base.as_posix(),
     }
 
 
