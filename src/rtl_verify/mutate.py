@@ -36,6 +36,13 @@ target language):
   - Logical:    &&<->||
   - Bitwise:    &<->|, ^<->~^
   - Arithmetic: +<->-
+  - Constant:   a sized literal (`2'h0`, `4'b0101`, `8'd10`) incremented
+    by one, wrapping within its own declared bit width -- added after
+    testing against a real design (secworks/aes's aes_core.v) whose
+    control FSM uses `case` statements and named constants with NO
+    relational/logical/bitwise/arithmetic operators anywhere in it at
+    all, so the operator-swap families above found literally nothing to
+    mutate despite the module having real, mutable control state.
 
 Only the target module's OWN body is mutated (never a dependency module
 defined elsewhere in the same source text), and never inside a comment
@@ -102,6 +109,44 @@ _OPERATORS: List[Tuple[str, str, str, str]] = [
 ]
 
 
+# Verilog sized literals: `WIDTH'BASEvalue`, e.g. `2'h0`, `4'b0101`,
+# `8'd10`. Deliberately a SEPARATE mutation family from _OPERATORS above,
+# found necessary by testing against a real design: a case-statement-
+# driven control FSM (secworks/aes's aes_core.v) uses no relational,
+# logical, bitwise, or arithmetic operators anywhere in its control
+# logic at all -- confirmed directly, not assumed, by grepping the real
+# file -- so a property set covering exactly that FSM had literally
+# nothing for the operator-swap mutations above to touch, and
+# generate_mutants() returned zero mutants despite the module having
+# real, mutable state (its `case (ctrl_reg)` arms and the CTRL_IDLE/
+# CTRL_INIT/CTRL_NEXT constants they're built from). Constant/literal-
+# value replacement is itself a standard, separate mutation operator
+# family in the wider mutation-testing literature, not RTL-specific.
+_SIZED_LITERAL = re.compile(r"(\d+)'([bBoOdDhH])([0-9a-fA-F_xXzZ]+)")
+_LITERAL_BASE = {"b": 2, "o": 8, "d": 10, "h": 16}
+_LITERAL_FMT = {"b": "b", "o": "o", "d": "d", "h": "x"}
+
+
+def _mutate_sized_literal(width_str: str, base_char: str, digits: str) -> str | None:
+    """Return the literal's digits incremented by one (wrapping within
+    its declared bit width), in the same base -- or None if it contains
+    `x`/`z` (an intentionally don't-care value; incrementing it would
+    change what's being modeled, not just its value) or isn't a clean
+    integer literal this can safely reformat.
+    """
+    base = base_char.lower()
+    if any(c in "xXzZ" for c in digits):
+        return None
+    clean = digits.replace("_", "")
+    try:
+        value = int(clean, _LITERAL_BASE[base])
+        width = int(width_str)
+    except (ValueError, KeyError):
+        return None
+    new_value = (value + 1) % (2 ** width) if width > 0 else value + 1
+    return format(new_value, f"0{len(clean)}{_LITERAL_FMT[base]}")
+
+
 def _excluded_spans(text: str) -> List[Tuple[int, int]]:
     """Comment and string-literal spans -- never mutate inside either."""
     spans = []
@@ -159,4 +204,36 @@ def generate_mutants(module: RtlModule, rtl_source: str, max_mutants: int = 20) 
                 location=snippet[:100],
                 mutated_source=mutated_source,
             ))
+
+    # Second pass: sized-literal (constant) mutation -- see
+    # _mutate_sized_literal's own comment for why this is a genuinely
+    # separate, necessary family, not redundant with the operator swaps
+    # above.
+    for m in _SIZED_LITERAL.finditer(body):
+        if len(mutants) >= max_mutants:
+            break
+        if _in_any_span(m.start(), excluded):
+            continue
+        if any(s <= m.start() < e or s < m.end() <= e for s, e in used_spans):
+            continue
+        new_digits = _mutate_sized_literal(m.group(1), m.group(2), m.group(3))
+        if new_digits is None:
+            continue
+        used_spans.append((m.start(), m.end()))
+        original = m.group(0)
+        replacement = f"{m.group(1)}'{m.group(2)}{new_digits}"
+        mutated_body = body[:m.start()] + replacement + body[m.end():]
+        mutated_source = rtl_source[:start] + mutated_body + rtl_source[end:]
+        line_start = body.rfind("\n", 0, m.start()) + 1
+        line_end = body.find("\n", m.end())
+        if line_end < 0:
+            line_end = len(body)
+        snippet = body[line_start:line_end].strip()
+        mutants.append(Mutant(
+            id=f"m{len(mutants)}",
+            operator=f"constant: {original} -> {replacement}",
+            location=snippet[:100],
+            mutated_source=mutated_source,
+        ))
+
     return mutants

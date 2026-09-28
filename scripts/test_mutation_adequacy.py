@@ -50,18 +50,26 @@ def main() -> None:
     mod = analyze_rtl(TINY_ALU, top_module="tiny_alu")
     backend = SymbiYosysBackend()
 
-    print("=== Mutant generation: only real, unambiguous operator sites, "
+    print("=== Mutant generation: real operator sites plus case-label constants, "
           "never the nonblocking `<=` itself ===")
     mutants = generate_mutants(mod, TINY_ALU, max_mutants=20)
     print(f"  {len(mutants)} mutants: {[m.operator for m in mutants]}")
-    assert len(mutants) == 4, mutants
+    # 4 operator-swap mutants (+/-/&/|) plus 3 constant mutants (one per
+    # case label: 2'b00/2'b01/2'b10 each incremented by one) -- the
+    # constant family was added after testing against a real design
+    # (secworks/aes's aes_core.v) whose case-statement-driven control FSM
+    # had NO relational/logical/bitwise/arithmetic operators anywhere,
+    # so the operator-swap families alone found nothing to mutate despite
+    # real, mutable control state (see mutate.py's own module docstring).
+    assert len(mutants) == 7, mutants
     assert all("<=" not in m.operator for m in mutants), (
         "the nonblocking assignment operator must never itself be a mutation source", mutants
     )
+    assert sum(1 for m in mutants if m.operator.startswith("constant:")) == 3, mutants
     print("OK\n")
 
     print("=== A property that ONLY checks the op=00 (addition) case -> "
-          "the other three opcodes' mutations must show up as a REAL, honest gap ===")
+          "mutations outside that branch must show up as a REAL, honest gap ===")
     # $past() throughout: `result` is a REGISTERED output, one cycle
     # behind `op`/`a`/`b` -- comparing it combinationally against the
     # CURRENT inputs (a real mistake caught by testing this exact
@@ -86,17 +94,23 @@ def main() -> None:
     for mr in report.mutants:
         print(f"    {mr.mutant_id} [{mr.operator}] -> {mr.verdict}")
     assert report.checked
-    # The op=00 mutation (a + b -> a - b) is the ONLY one this weak
-    # property could possibly notice -- everything else is a genuine,
-    # honest gap this property set doesn't cover at all.
-    op00_mutant = next(mr for mr in report.mutants if "2'b00" in mr.location or mr.operator.startswith("arithmetic: + "))
-    assert op00_mutant.verdict == "CAUGHT", op00_mutant
-    other_mutants = [mr for mr in report.mutants if mr is not op00_mutant]
+    # Exactly two mutants touch the op=00 branch this weak property
+    # actually checks: the arithmetic swap (a + b -> a - b) and the
+    # constant mutation that changes the op=00 case label itself
+    # (2'b00 -> 2'b01, which makes NOTHING match 2'b00 anymore, falling
+    # through to `default: result <= a | b;` -- a real, different way to
+    # break exactly the branch this property inspects). Both must be
+    # CAUGHT; everything touching the op=01/op=10/default branches is a
+    # genuine, honest gap this narrow property doesn't cover.
+    by_id = {mr.mutant_id: mr for mr in report.mutants}
+    assert by_id["m0"].verdict == "CAUGHT", by_id["m0"]  # arithmetic: + -> -, op=00 branch
+    assert by_id["m4"].verdict == "CAUGHT", by_id["m4"]  # constant: 2'b00 -> 2'b01
+    other_mutants = [mr for mr in report.mutants if mr.mutant_id not in ("m0", "m4")]
     assert all(mr.verdict == "NOT_CAUGHT" for mr in other_mutants), (
         "every mutation outside the op=00 branch must be a real, uncaught gap "
         "for this deliberately narrow property", other_mutants
     )
-    assert report.caught == 1 and report.not_caught == 3, report
+    assert report.caught == 2 and report.not_caught == 5, report
     print("OK\n")
 
     print("=== A property set covering ALL FOUR opcodes -> every real "
