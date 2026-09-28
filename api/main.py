@@ -41,6 +41,7 @@ from rtl_verify.dut_probe import generate_probed_rtl  # noqa: E402
 from rtl_verify.vacuity import run_vacuity_check  # noqa: E402
 from rtl_verify.assumption_check import check_assumption_consistency  # noqa: E402
 from rtl_verify.mutation_adequacy import run_mutation_adequacy  # noqa: E402
+from rtl_verify.signal_coverage import analyze_signal_coverage  # noqa: E402
 from rtl_verify.cross_check import cross_check_property  # noqa: E402
 from rtl_verify import regression  # noqa: E402
 from rtl_verify.regression import BaselineProperty  # noqa: E402
@@ -273,6 +274,14 @@ async def formal_check(
     catches the set-wide version of that failure mode, with the specific
     conflicting assumption(s) isolated automatically rather than left for
     manual bisection.
+
+    `signal_coverage` in the response reports which of the module's own
+    ports are never referenced by ANY property or assumption run this
+    call — Step 3 ("Cone of Influence Analysis") of the published "Seven
+    Steps of Formal Signoff" methodology (see src/rtl_verify/
+    signal_coverage.py). A static textual reference scan, not a real
+    netlist-level trace — a port being "covered" means some property
+    mentions it by name, not that its full behavior is constrained.
 
     `timeout_sec` is the wall-clock budget handed to sby itself (not just
     an external kill) — default 300s, override for harder proofs (a
@@ -816,6 +825,17 @@ async def formal_check(
         "success": all(r.get("success") for r in results),
     })
 
+    # Signal coverage / cone-of-influence analysis -- step 3 of the
+    # published "Seven Steps of Formal Signoff" methodology: which of the
+    # module's own ports are never referenced by anything checked in this
+    # run at all. Uses every property actually run this call (target_props)
+    # plus the supplied assumptions -- a static textual scan, not a real
+    # netlist-level trace (see signal_coverage.py's own module docstring).
+    signal_coverage = analyze_signal_coverage(
+        mod,
+        assume_props + [(entry["name"], entry["expr"], entry["kind"]) for _i, entry in target_props],
+    )
+
     return {
         "module": mod.name,
         "engine": engine.display_name,
@@ -828,6 +848,13 @@ async def formal_check(
             "status": assumption_consistency.status,
             "note": assumption_consistency.note,
             "minimal_conflicting_set": assumption_consistency.minimal_conflicting_set,
+        },
+        "signal_coverage": {
+            "total_ports": signal_coverage.total_ports,
+            "covered_ports": signal_coverage.covered_ports,
+            "uncovered_ports": signal_coverage.uncovered_ports,
+            "coverage_percent": signal_coverage.coverage_percent,
+            "note": signal_coverage.note,
         },
         "work_dir": base.as_posix(),
         "regression_report": regression_report,
