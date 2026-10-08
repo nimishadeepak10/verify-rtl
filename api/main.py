@@ -50,6 +50,7 @@ from rtl_verify.param_reduce import (  # noqa: E402
 )
 from rtl_verify.rom_abstract import convert_roms_to_case  # noqa: E402
 from rtl_verify.counter_abstract import abstract_counters, find_counter_candidates  # noqa: E402
+from rtl_verify.case_split import check_case_split  # noqa: E402
 from rtl_verify.cross_check import cross_check_property  # noqa: E402
 from rtl_verify import regression  # noqa: E402
 from rtl_verify.regression import BaselineProperty  # noqa: E402
@@ -1378,6 +1379,101 @@ async def formal_mutation_adequacy(
                 for m in report.mutants
             ],
         },
+        "work_dir": base.as_posix(),
+    }
+
+
+@app.post("/api/formal/case_split")
+async def formal_case_split(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    top_module: str = Form(""),
+    cases: str = Form("[]"),
+    properties: str = Form("[]"),
+    timeout_sec: int = Form(300),
+    depth_override: int = Form(0),
+):
+    """Check that a case-split proof is COMPLETE (see src/rtl_verify/
+    case_split.py for the cited post-mortems this exists for).
+
+    `cases` is a JSON list of {"name", "expr"}: each case is one proof run
+    restricted by `expr`. `properties` is the usual shape: assume-kind
+    entries are the GLOBAL assumptions every case shares; assert-kind
+    entries are proven once per case. The response reports whether the
+    cases cover the whole input space (with a concrete uncovered example
+    if not), whether any case is empty under the global assumptions,
+    whether the split signals are held constant over time, and each
+    assert's verdict in each case.
+    """
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+
+    formal_engines = formal_backends()
+    if not formal_engines:
+        return {"error": "No formal backend available. Install the OSS CAD Suite."}
+    engine = formal_engines[0]
+
+    try:
+        case_list = json.loads(cases) if cases.strip() else []
+        props = json.loads(properties) if properties.strip() else []
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON: {e}"}
+    if not isinstance(case_list, list) or len(case_list) < 2:
+        return {"error": "cases must be a JSON list of at least two {name, expr} entries"}
+    parsed_cases = []
+    for i, c in enumerate(case_list):
+        expr = str(c.get("expr") or "").strip()
+        if not expr:
+            return {"error": f"case {i} has an empty expr"}
+        parsed_cases.append((str(c.get("name") or f"case{i}"), expr))
+
+    try:
+        probed_source, mod = _analyze_and_probe(rtl_source, top_module)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    base = Path(tempfile.mkdtemp(prefix="case_split_api_"))
+    ext = dut_source_extension(rtl_source, "systemverilog")
+    rtl_path = base / f"dut{ext}"
+    rtl_path.write_text(probed_source, encoding="utf-8")
+
+    global_assumes, asserts = [], []
+    for i, p in enumerate(props):
+        name = str(p.get("name") or f"prop{i}")
+        expr = str(p.get("expr") or "").strip()
+        kind = str(p.get("kind") or "assert")
+        if not expr:
+            continue
+        if kind == "assume":
+            global_assumes.append((name, expr, "assume"))
+        elif kind == "assert":
+            asserts.append((name, expr, "assert"))
+
+    report = check_case_split(
+        mod, rtl_path, engine, parsed_cases, global_assumes, asserts,
+        timeout_sec=timeout_sec, depth_override=depth_override, work_root=base / "run",
+    )
+    return {
+        "module": mod.name,
+        "verdict": report.verdict,
+        "issues": report.issues,
+        "completeness": {
+            "status": report.completeness, "uncovered_example": report.uncovered_example,
+            "note": report.completeness_note,
+        },
+        "sequence_safety": {
+            "status": report.sequence_safety, "varying_signals": report.varying_signals,
+            "note": report.sequence_note,
+        },
+        "cases": [
+            {"name": o.name, "expr": o.expr, "reachable": o.reachable,
+             "reachable_note": o.reachable_note, "property_verdicts": o.property_verdicts}
+            for o in report.cases
+        ],
         "work_dir": base.as_posix(),
     }
 
