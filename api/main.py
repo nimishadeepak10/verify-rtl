@@ -45,6 +45,10 @@ from rtl_verify.signal_coverage import analyze_signal_coverage  # noqa: E402
 from rtl_verify.sva_lint import lint_sva  # noqa: E402
 from rtl_verify.cutpoint import validate_cutpoints, recommend_cutpoint_candidates  # noqa: E402
 from rtl_verify.assertion_decompose import decompose_assertion  # noqa: E402
+from rtl_verify.param_reduce import (  # noqa: E402
+    apply_parameter_overrides, parse_override_spec, recommend_parameter_reductions,
+)
+from rtl_verify.rom_abstract import convert_roms_to_case  # noqa: E402
 from rtl_verify.cross_check import cross_check_property  # noqa: E402
 from rtl_verify import regression  # noqa: E402
 from rtl_verify.regression import BaselineProperty  # noqa: E402
@@ -253,6 +257,9 @@ async def formal_check(
     cut_signals: str = Form(""),
     auto_cutpoint: bool = Form(False),
     decompose: bool = Form(False),
+    rom_to_case: bool = Form(False),
+    param_overrides: str = Form(""),
+    auto_param_reduction: bool = Form(False),
 ):
     """Check one or more hand-written boolean properties with SymbiYosys.
 
@@ -369,8 +376,42 @@ async def formal_check(
     if not isinstance(props, list):
         return {"error": "properties must be a JSON list"}
 
+    # Design-level transforms applied BEFORE analysis, so the module's
+    # ports/wrapper are derived from the design actually being proved.
+    # `rom_to_case` is exact-semantics (rom_abstract.py); `param_overrides`
+    # is a deliberate bounded-configuration reduction (param_reduce.py).
+    design_source = rtl_source
+    rom_report = None
+    if rom_to_case:
+        design_source, rom_infos = convert_roms_to_case(design_source)
+        rom_report = [
+            {"module": r.module, "memory": r.name, "depth": r.depth, "width": r.width,
+             "converted": r.eligible, "state_bits_removed": r.state_bits_saved, "reason": r.reason}
+            for r in rom_infos
+        ]
+    param_report = None
+    manual_param_overrides: dict[str, int] = {}
+    if param_overrides.strip():
+        manual_param_overrides, spec_errors = parse_override_spec(param_overrides)
+        if spec_errors:
+            return {"error": "Invalid param_overrides: " + "; ".join(spec_errors)}
+        try:
+            top_name = analyze_rtl(design_source, top_module=top_module.strip() or None).name
+            design_source, applied, missing = apply_parameter_overrides(
+                design_source, top_name, manual_param_overrides)
+        except ValueError as e:
+            return {"error": f"Could not apply param_overrides: {e}"}
+        if missing:
+            return {"error": f"param_overrides names matched no literal parameter in '{top_name}': {missing}"}
+        param_report = {
+            "applied": applied,
+            "caveat": ("BOUNDED CONFIGURATION: every verdict in this run is for the REDUCED "
+                       "parameter values above, not the design's real size. PROVEN does not cover "
+                       "the full configuration; FALSIFIED usually carries over but is not guaranteed."),
+        }
+
     try:
-        probed_source, mod = _analyze_and_probe(rtl_source, top_module)
+        probed_source, mod = _analyze_and_probe(design_source, top_module)
     except ValueError as e:
         return {"error": str(e)}
 
@@ -523,7 +564,7 @@ async def formal_check(
     MAX_RETRIES = 1
 
     def _run_chain(work: Path, expr_to_run: str, name: str, kind: str, run_rtl_path: Path = rtl_path,
-                   cutpoints: list[str] | None = None):
+                   cutpoints: list[str] | None = None, mod_override=None):
         """Walk recommended_engine_chain(), stopping at the first PASS/FAIL.
 
         Every non-definitive status (ERROR/TIMEOUT/UNKNOWN/CANCELLED) is
@@ -545,8 +586,9 @@ async def formal_check(
         `mod` (the top module's own ports) is unaffected either way, since
         black-boxing only ever replaces a named SUBMODULE's body.
         """
-        wrapper_sv = generate_formal_wrapper(mod, assume_props + [(name, expr_to_run, kind)])
-        chain = recommended_engine_chain(mod, kind=kind, depth_override=depth_override)
+        use_mod = mod_override or mod
+        wrapper_sv = generate_formal_wrapper(use_mod, assume_props + [(name, expr_to_run, kind)])
+        chain = recommended_engine_chain(use_mod, kind=kind, depth_override=depth_override)
         per_attempt_timeout = max(30, timeout_sec // len(chain))
         work.mkdir(parents=True, exist_ok=True)
         wrapper_path = work / "wrapper.sv"
@@ -559,7 +601,7 @@ async def formal_check(
             attempt_dir = work / f"engine_{i}"
             result = engine.run(
                 run_rtl_path, wrapper_path, attempt_dir,
-                top=f"{mod.name}_formal_top",
+                top=f"{use_mod.name}_formal_top",
                 depth=config["depth"], mode=config["mode"], engine=config["engine"],
                 timeout_sec=per_attempt_timeout,
                 **({"cutpoints": cutpoints if cutpoints is not None else manual_cuts}
@@ -774,6 +816,71 @@ async def formal_check(
                     ),
                 }
 
+        # Auto parameter reduction: the LAST resort, because unlike every
+        # abstraction above it is not sound for the full configuration (see
+        # param_reduce.py). Only structure-named literal parameters are
+        # shrunk; the result is always reported as a bounded configuration.
+        auto_param_info = None
+        if (verdict in _INCONCLUSIVE_STATUSES and auto_param_reduction and not manual_param_overrides
+                and not (auto_blackbox_info and auto_blackbox_info["resolved"])
+                and not (auto_cutpoint_info and auto_cutpoint_info["resolved"])):
+            recs = recommend_parameter_reductions(design_source, mod.name)
+            if not recs:
+                auto_param_info = {
+                    "resolved": False, "overrides": {}, "candidates": [],
+                    "caveat": "No structure-named literal parameter >= 16 found in the top "
+                              "module or its instantiations -- the original inconclusive result stands.",
+                }
+            else:
+                overrides = {r.name: r.proposed for r in recs}
+                try:
+                    red_source, red_applied, _missing = apply_parameter_overrides(
+                        design_source, mod.name, overrides)
+                    red_probed, red_mod = _analyze_and_probe(red_source, top_module)
+                    red_dir = base / f"prop_{i}_autoparam"
+                    red_dir.mkdir(parents=True, exist_ok=True)
+                    red_rtl_path = red_dir / rtl_path.name
+                    red_rtl_path.write_text(red_probed, encoding="utf-8")
+                    red_result, red_config, red_attempts = _run_chain(
+                        red_dir / "run", current_expr, name, kind,
+                        run_rtl_path=red_rtl_path, cutpoints=[], mod_override=red_mod,
+                    )
+                    red_status = red_result.status
+                except ValueError as e:
+                    red_result, red_status, red_applied, red_attempts, red_config = None, f"SKIPPED: {e}", [], [], None
+                cand_list = [{"name": r.name, "from": r.original, "to": r.proposed,
+                              "where": r.where, "reason": r.reason} for r in recs]
+                if red_result is not None and red_status in ("PASS", "FAIL"):
+                    result, config = red_result, red_config
+                    all_attempts.extend(red_attempts)
+                    if kind == "cover":
+                        verdict = "REACHED" if result.success else "UNREACHED"
+                    else:
+                        verdict = "PROVEN" if result.success else "FALSIFIED"
+                    waveform_json_data = None
+                    if result.vcd_path is not None:
+                        waveform_json_data = vcd_to_json(result.vcd_path, module=red_mod)
+                        if "error" in waveform_json_data:
+                            waveform_json_data = None
+                    auto_param_info = {
+                        "resolved": True, "overrides": overrides, "applied": red_applied,
+                        "candidates": cand_list, "bounded_configuration": True,
+                        "caveat": (
+                            f"BOUNDED CONFIGURATION: this {verdict} verdict is for the design with "
+                            f"{overrides} (reduced from the real values), not its real size. If "
+                            "PROVEN: it holds for the reduced design only -- a bug that needs the real "
+                            "size (e.g. a pointer-wrap bug at a specific depth) can be missed, so this "
+                            "is not a full proof. If FALSIFIED: usually also present at full size, but "
+                            "check the trace against the real configuration."
+                        ),
+                    }
+                else:
+                    auto_param_info = {
+                        "resolved": False, "overrides": overrides, "candidates": cand_list,
+                        "caveat": f"Reduced-configuration run ended {red_status}; the original "
+                                  "inconclusive result stands.",
+                    }
+
         entry_out = {
             **entry,
             "expr": current_expr,
@@ -789,6 +896,7 @@ async def formal_check(
             "retry_note": retry_note,
             "auto_blackbox": auto_blackbox_info,
             "auto_cutpoint": auto_cutpoint_info,
+            "auto_param_reduction": auto_param_info,
             "cut_signals": manual_cuts or None,
         }
 
@@ -807,6 +915,13 @@ async def formal_check(
                 "note": "Skipped: this verdict came from an auto-black-boxed design, not the "
                         "plain RTL — cross-checking against a different design wouldn't be a "
                         "valid second opinion on the same result.",
+            }
+        elif (manual_param_overrides or (auto_param_info is not None and auto_param_info["resolved"])):
+            entry_out["cross_check"] = {
+                "performed": False, "engine_label": None, "status": None, "agrees": None,
+                "note": "Skipped: this verdict is for a parameter-reduced configuration, not the "
+                        "real design -- cross-checking the plain RTL wouldn't be a valid second "
+                        "opinion on the same result.",
             }
         elif manual_cuts or (auto_cutpoint_info is not None and auto_cutpoint_info["resolved"]):
             entry_out["cross_check"] = {
@@ -999,6 +1114,8 @@ async def formal_check(
             "note": signal_coverage.note,
         },
         "decomposition": decomposition_report,
+        "rom_to_case": rom_report,
+        "parameter_reduction": param_report,
         "sva_lint": {
             "note": sva_lint_report.note,
             "findings": [
