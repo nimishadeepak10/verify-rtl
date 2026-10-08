@@ -51,6 +51,7 @@ from rtl_verify.param_reduce import (  # noqa: E402
 from rtl_verify.rom_abstract import convert_roms_to_case  # noqa: E402
 from rtl_verify.counter_abstract import abstract_counters, find_counter_candidates  # noqa: E402
 from rtl_verify.case_split import check_case_split  # noqa: E402
+from rtl_verify import invariant_mining  # noqa: E402
 from rtl_verify.data_independence import (  # noqa: E402
     analyze_data_independence, guess_data_signals, property_data_use, recommend_data_width_reductions,
 )
@@ -270,6 +271,9 @@ async def formal_check(
     data_signals: str = Form(""),
     data_width_reduction: bool = Form(False),
     auto_data_width_reduction: bool = Form(False),
+    mine_invariants: bool = Form(False),
+    auto_invariants: bool = Form(False),
+    invariant_candidates: str = Form(""),
 ):
     """Check one or more hand-written boolean properties with SymbiYosys.
 
@@ -646,6 +650,32 @@ async def formal_check(
     _INCONCLUSIVE_STATUSES = {"TIMEOUT", "UNKNOWN", "CANCELLED"}
     MAX_RETRIES = 1
 
+    # Helper-invariant mining (invariant_mining.py). `inv_assumes` holds the
+    # PROVEN invariants as assume-kind properties; they are true of every
+    # reachable state of the design as analyzed here, so adding them removes
+    # only unreachable states and never changes a verdict's meaning. They are
+    # applied only to runs on that exact design (see _run_chain).
+    try:
+        user_inv_candidates = json.loads(invariant_candidates) if invariant_candidates.strip() else []
+        if not isinstance(user_inv_candidates, list) or not all(isinstance(x, str) for x in user_inv_candidates):
+            raise ValueError("expected a JSON list of expression strings")
+    except (json.JSONDecodeError, ValueError) as e:
+        return {"error": f"Invalid invariant_candidates: {e}"}
+    inv_assumes: list = []
+    mining_state: dict = {"report": None}
+
+    def _get_mining():
+        if mining_state["report"] is None:
+            rep = invariant_mining.mine_invariants(
+                mod, probed_source, rtl_path, assume_props, engine, base / "mining",
+                timeout_sec=max(30, min(120, timeout_sec // 2)),
+                user_candidates=user_inv_candidates,
+                engine_kwargs={"cutpoints": manual_cuts} if manual_cuts else None,
+            )
+            mining_state["report"] = rep
+            inv_assumes[:] = rep.assumptions() if rep.status == "PROVEN_SET" else []
+        return mining_state["report"]
+
     def _run_chain(work: Path, expr_to_run: str, name: str, kind: str, run_rtl_path: Path = rtl_path,
                    cutpoints: list[str] | None = None, mod_override=None):
         """Walk recommended_engine_chain(), stopping at the first PASS/FAIL.
@@ -670,7 +700,12 @@ async def formal_check(
         black-boxing only ever replaces a named SUBMODULE's body.
         """
         use_mod = mod_override or mod
-        wrapper_sv = generate_formal_wrapper(use_mod, assume_props + [(name, expr_to_run, kind)])
+        # Invariants were proven on the plain (or manually abstracted) design
+        # with the original module description, so only runs on exactly that
+        # design may use them: not a black-boxed copy, a rewritten module, or
+        # an automatic cut-point run, any of which has extra behaviors.
+        extra = inv_assumes if (run_rtl_path == rtl_path and mod_override is None and cutpoints is None) else []
+        wrapper_sv = generate_formal_wrapper(use_mod, assume_props + extra + [(name, expr_to_run, kind)])
         chain = recommended_engine_chain(use_mod, kind=kind, depth_override=depth_override)
         per_attempt_timeout = max(30, timeout_sec // len(chain))
         work.mkdir(parents=True, exist_ok=True)
@@ -696,6 +731,9 @@ async def formal_check(
                 break
         return result, config, attempts
 
+    if mine_invariants:
+        _get_mining()
+
     results = []
     for i, entry in target_props:
         name, expr, kind = entry["name"], entry["expr"], entry["kind"]
@@ -704,6 +742,7 @@ async def formal_check(
             continue
 
         current_expr = expr
+        inv_at_start = bool(inv_assumes)   # did this property's first run include the invariants?
         attempt = 0
         retry_note = None
         all_attempts = []
@@ -770,6 +809,39 @@ async def formal_check(
             verdict = "REACHED" if result.success else "UNREACHED"
         else:
             verdict = "PROVEN" if result.success else "FALSIFIED"
+
+        # Auto helper-invariant escalation: the only escalation that adds
+        # no behaviors and drops none, so it goes first. Mining runs once per
+        # call; the survivors (each proven by induction) become assumptions
+        # for a fresh run of this property. A FALSIFIED here is therefore a
+        # real counterexample, and a PROVEN is a real proof.
+        auto_inv_info = None
+        if verdict in _INCONCLUSIVE_STATUSES and auto_invariants and not mine_invariants and kind != "cover":
+            mrep = _get_mining()
+            if mrep.status == "PROVEN_SET" and mrep.proven:
+                inv_result, inv_config, inv_attempts = _run_chain(
+                    base / f"prop_{i}_autoinv", current_expr, name, kind)
+                if inv_result.status in ("PASS", "FAIL"):
+                    result, config = inv_result, inv_config
+                    all_attempts.extend(inv_attempts)
+                    verdict = "PROVEN" if result.success else "FALSIFIED"
+                    waveform_json_data = None
+                    if result.vcd_path is not None:
+                        waveform_json_data = vcd_to_json(result.vcd_path, module=mod)
+                        if "error" in waveform_json_data:
+                            waveform_json_data = None
+                    auto_inv_info = {"resolved": True, **mrep.view(),
+                                     "caveat": ("Exact: the helper invariants were each proven (base case plus "
+                                                "induction) and only remove unreachable states, so this verdict "
+                                                "is for the real design.")}
+                else:
+                    auto_inv_info = {"resolved": False, **mrep.view(),
+                                     "caveat": f"Run with the proven invariants still ended {inv_result.status}; "
+                                               "the original inconclusive result stands."}
+            else:
+                auto_inv_info = {"resolved": False, **mrep.view(),
+                                 "caveat": "No inductive helper invariants were found; the original "
+                                           "inconclusive result stands."}
 
         # Auto-black-box escalation: only for a genuinely inconclusive
         # verdict, only when the caller opted in, and only when they
@@ -1100,6 +1172,10 @@ async def formal_check(
                                   "inconclusive result stands.",
                     }
 
+        inv_used = bool(auto_inv_info and auto_inv_info.get("resolved")) or (
+            inv_at_start and not any(
+                x and x.get("resolved") for x in
+                (auto_blackbox_info, auto_counter_info, auto_cutpoint_info, auto_data_info, auto_param_info)))
         entry_out = {
             **entry,
             "expr": current_expr,
@@ -1113,6 +1189,8 @@ async def formal_check(
             "waveform_json": waveform_json_data,
             "retried": attempt > 0,
             "retry_note": retry_note,
+            "auto_invariants": auto_inv_info,
+            "invariants_used": inv_used,
             "auto_blackbox": auto_blackbox_info,
             "auto_cutpoint": auto_cutpoint_info,
             "auto_counter_abstraction": auto_counter_info,
@@ -1162,6 +1240,13 @@ async def formal_check(
                 "note": "Skipped: this verdict came from a design with cut points, not the "
                         "plain RTL -- cross-checking against a different design wouldn't be a "
                         "valid second opinion on the same result.",
+            }
+        elif inv_used:
+            entry_out["cross_check"] = {
+                "performed": False, "engine_label": None, "status": None, "agrees": None,
+                "note": "Skipped: this verdict used proven helper invariants as assumptions; the "
+                        "plain property alone (what a second engine would re-run) is the very "
+                        "proof that did not close.",
             }
         elif cross_check and result.status in ("PASS", "FAIL"):
             cc = cross_check_property(
@@ -1351,6 +1436,7 @@ async def formal_check(
         "parameter_reduction": param_report,
         "counter_abstraction": counter_report,
         "data_independence": data_independence_report,
+        "invariant_mining": mining_state["report"].view() if mining_state["report"] else None,
         "sva_lint": {
             "note": sva_lint_report.note,
             "findings": [
