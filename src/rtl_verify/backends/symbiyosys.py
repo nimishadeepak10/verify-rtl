@@ -181,6 +181,7 @@ class SymbiYosysBackend(SimulatorBackend):
         mode: str = "bmc",
         engine: str = "smtbmc",
         timeout_sec: int = 300,
+        cutpoints: Optional[list] = None,
     ) -> BackendResult:
         t0 = time.perf_counter()
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -231,6 +232,23 @@ class SymbiYosysBackend(SimulatorBackend):
         # case sby itself doesn't respect its own limit.
         options_lines.append(f"timeout {timeout_sec}")
 
+        # Cut points: a signal's driver is replaced by a free ($anyseq) value.
+        # Yosys's `cutpoint` on a NON-flattened module only cuts the net as
+        # seen from OUTSIDE it (confirmed empirically: an output wire's own
+        # internal consumers still saw the original driver), so flatten
+        # first, then cut the hierarchical wire `dut.<signal>` -- the DUT
+        # instance is always named `dut` by formal_props.generate_formal_wrapper.
+        cutpoint_script = ""
+        if cutpoints:
+            # `opt_clean -purge` is what actually realizes the saving: the
+            # logic that only fed the cut signal is now dead, but yosys
+            # keeps any cell that still drives a PUBLIC-named wire (e.g. a
+            # DUT output port) even with no loads. Cost: signals outside
+            # the property's cone are absent from any trace.
+            cutpoint_script = "flatten\n" + "".join(
+                f"cutpoint {top}/w:dut.{sig}\n" for sig in cutpoints
+            ) + "opt_clean -purge\n"
+
         sby_config = (
             f"[options]\n" + "\n".join(options_lines) + "\n"
             f"\n"
@@ -240,6 +258,7 @@ class SymbiYosysBackend(SimulatorBackend):
             f"[script]\n"
             f"read -formal {read_files}\n"
             f"prep -top {top}\n"
+            f"{cutpoint_script}"
             f"\n"
             f"[files]\n" + "".join(f"{f}\n" for f in files)
         )

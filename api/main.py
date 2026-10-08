@@ -42,6 +42,9 @@ from rtl_verify.vacuity import run_vacuity_check  # noqa: E402
 from rtl_verify.assumption_check import check_assumption_consistency  # noqa: E402
 from rtl_verify.mutation_adequacy import run_mutation_adequacy  # noqa: E402
 from rtl_verify.signal_coverage import analyze_signal_coverage  # noqa: E402
+from rtl_verify.sva_lint import lint_sva  # noqa: E402
+from rtl_verify.cutpoint import validate_cutpoints, recommend_cutpoint_candidates  # noqa: E402
+from rtl_verify.assertion_decompose import decompose_assertion  # noqa: E402
 from rtl_verify.cross_check import cross_check_property  # noqa: E402
 from rtl_verify import regression  # noqa: E402
 from rtl_verify.regression import BaselineProperty  # noqa: E402
@@ -247,6 +250,9 @@ async def formal_check(
     cross_check: bool = Form(True),
     blackbox_modules: str = Form(""),
     auto_blackbox: bool = Form(False),
+    cut_signals: str = Form(""),
+    auto_cutpoint: bool = Form(False),
+    decompose: bool = Form(False),
 ):
     """Check one or more hand-written boolean properties with SymbiYosys.
 
@@ -368,6 +374,17 @@ async def formal_check(
     except ValueError as e:
         return {"error": str(e)}
 
+    # Cut points (see cutpoint.py): comma-separated internal signal names
+    # whose driver logic is dropped and replaced by a free value. Validated
+    # against the module's own declarations up front -- a typo'd name is an
+    # error, never a silently-ignored no-op that would look like a clean run.
+    requested_cuts = [n.strip() for n in cut_signals.split(",") if n.strip()]
+    manual_cuts: list[str] = []
+    if requested_cuts:
+        manual_cuts, cut_errors = validate_cutpoints(rtl_source, mod, requested_cuts)
+        if cut_errors:
+            return {"error": "Invalid cut_signals: " + "; ".join(cut_errors)}
+
     blackbox_names = [n.strip() for n in blackbox_modules.split(",") if n.strip()]
     if blackbox_names:
         try:
@@ -466,6 +483,36 @@ async def formal_check(
             "note": "RTL unchanged since the last recorded baseline and no new properties submitted — nothing to check.",
         }
 
+    # Assertion decomposition (see assertion_decompose.py): split compound
+    # asserts into exact-equivalent parts, each checked on its own. Parts
+    # get derived names and remember their parent; a per-parent summary is
+    # built after the run. Only submitted assert-kind properties are split;
+    # covers/assumes and regression auto-re-runs are never touched.
+    decomposition_map: dict[str, list[str]] = {}
+    if decompose:
+        expanded = []
+        next_idx = len(props) + len(auto_added_names) + 1000
+        for i, entry in target_props:
+            if entry["kind"] != "assert" or entry["description"] == "[auto re-run: regression check]":
+                expanded.append((i, entry))
+                continue
+            parts = decompose_assertion(entry["expr"])
+            if len(parts) <= 1:
+                expanded.append((i, entry))
+                continue
+            decomposition_map[entry["name"]] = []
+            for k, part in enumerate(parts, 1):
+                pname = f"{entry['name']}__part{k}"
+                decomposition_map[entry["name"]].append(pname)
+                expanded.append((next_idx, {
+                    **entry, "name": pname, "expr": part,
+                    "description": f"[part {k}/{len(parts)} of {entry['name']}] {entry['description']}",
+                    "paired_cover": "",
+                    "decomposed_from": entry["name"],
+                }))
+                next_idx += 1
+        target_props = expanded
+
     # Only ERROR (a genuine tool/compile problem — bad syntax, missing
     # signal) is worth an LLM-driven expression fix. TIMEOUT/UNKNOWN mean
     # the solver ran without incident but couldn't reach a verdict in the
@@ -475,7 +522,8 @@ async def formal_check(
     _INCONCLUSIVE_STATUSES = {"TIMEOUT", "UNKNOWN", "CANCELLED"}
     MAX_RETRIES = 1
 
-    def _run_chain(work: Path, expr_to_run: str, name: str, kind: str, run_rtl_path: Path = rtl_path):
+    def _run_chain(work: Path, expr_to_run: str, name: str, kind: str, run_rtl_path: Path = rtl_path,
+                   cutpoints: list[str] | None = None):
         """Walk recommended_engine_chain(), stopping at the first PASS/FAIL.
 
         Every non-definitive status (ERROR/TIMEOUT/UNKNOWN/CANCELLED) is
@@ -514,6 +562,8 @@ async def formal_check(
                 top=f"{mod.name}_formal_top",
                 depth=config["depth"], mode=config["mode"], engine=config["engine"],
                 timeout_sec=per_attempt_timeout,
+                **({"cutpoints": cutpoints if cutpoints is not None else manual_cuts}
+                   if (cutpoints or manual_cuts) else {}),
             )
             attempts.append({"label": config["label"], "mode": config["mode"],
                               "engine": config["engine"], "status": result.status})
@@ -667,6 +717,63 @@ async def formal_check(
                     ),
                 }
 
+        # Auto cut-point escalation: same contract as auto-black-box above --
+        # only on a genuinely inconclusive verdict, only when opted in, only
+        # when the caller didn't pick their own cut set, and tried AFTER
+        # black-boxing (a coarser abstraction) had its chance. Each
+        # candidate is tried alone, strongest-first, stopping at the first
+        # definitive verdict.
+        auto_cutpoint_info = None
+        if (verdict in _INCONCLUSIVE_STATUSES and auto_cutpoint and not manual_cuts
+                and not (auto_blackbox_info and auto_blackbox_info["resolved"])):
+            cut_candidates = recommend_cutpoint_candidates(mod, rtl_source)
+            cut_tried = []
+            for cand in cut_candidates[:3]:
+                cut_result, cut_config, cut_attempts = _run_chain(
+                    base / f"prop_{i}_autocut_{cand.signal}", current_expr, name, kind,
+                    run_rtl_path=rtl_path, cutpoints=[cand.signal],
+                )
+                cut_tried.append({"signal": cand.signal, "reason": cand.reason,
+                                  "detail": cand.detail, "status": cut_result.status})
+                if cut_result.status in ("PASS", "FAIL"):
+                    result, config = cut_result, cut_config
+                    all_attempts.extend(cut_attempts)
+                    if kind == "cover":
+                        verdict = "REACHED" if result.success else "UNREACHED"
+                    else:
+                        verdict = "PROVEN" if result.success else "FALSIFIED"
+                    waveform_json_data = None
+                    if result.vcd_path is not None:
+                        waveform_json_data = vcd_to_json(result.vcd_path, module=mod)
+                        if "error" in waveform_json_data:
+                            waveform_json_data = None
+                    auto_cutpoint_info = {
+                        "resolved": True, "cut_signal": cand.signal, "reason": cand.reason,
+                        "candidates_tried": cut_tried,
+                        "caveat": (
+                            f"This {verdict} verdict was only reached after cutting '{cand.signal}' "
+                            "(its driving logic was dropped; the solver may pick any value for it "
+                            "every cycle). If PROVEN: real, and still valid for the real design "
+                            "(a superset of behaviors was covered). If FALSIFIED: the "
+                            "counterexample may be an artifact -- the freed signal can take values "
+                            "its real logic never produces -- check the trace against that signal's "
+                            "real driver before treating it as a bug."
+                        ),
+                    }
+                    break
+            if auto_cutpoint_info is None:
+                auto_cutpoint_info = {
+                    "resolved": False, "cut_signal": None, "reason": None,
+                    "candidates_tried": cut_tried,
+                    "caveat": (
+                        "Auto cut-point escalation was attempted but no candidate resolved this "
+                        "to a definitive verdict -- the original inconclusive result stands."
+                        if cut_tried else
+                        "Auto cut-point escalation found no wide counter or wide-arithmetic "
+                        "signal worth freeing -- the original inconclusive result stands."
+                    ),
+                }
+
         entry_out = {
             **entry,
             "expr": current_expr,
@@ -681,6 +788,8 @@ async def formal_check(
             "retried": attempt > 0,
             "retry_note": retry_note,
             "auto_blackbox": auto_blackbox_info,
+            "auto_cutpoint": auto_cutpoint_info,
+            "cut_signals": manual_cuts or None,
         }
 
         # Independent second-engine cross-check: only meaningful once a
@@ -697,6 +806,13 @@ async def formal_check(
                 "performed": False, "engine_label": None, "status": None, "agrees": None,
                 "note": "Skipped: this verdict came from an auto-black-boxed design, not the "
                         "plain RTL — cross-checking against a different design wouldn't be a "
+                        "valid second opinion on the same result.",
+            }
+        elif manual_cuts or (auto_cutpoint_info is not None and auto_cutpoint_info["resolved"]):
+            entry_out["cross_check"] = {
+                "performed": False, "engine_label": None, "status": None, "agrees": None,
+                "note": "Skipped: this verdict came from a design with cut points, not the "
+                        "plain RTL -- cross-checking against a different design wouldn't be a "
                         "valid second opinion on the same result.",
             }
         elif cross_check and result.status in ("PASS", "FAIL"):
@@ -809,6 +925,13 @@ async def formal_check(
     verdict_counts: dict[str, int] = {}
     for r in results:
         verdict_counts[r.get("verdict", "ERROR")] = verdict_counts.get(r.get("verdict", "ERROR"), 0) + 1
+
+    # Static SVA lint -- runs instantly, no solver involved, and catches a
+    # different class of bug than the solver-based checks above: a
+    # property that compiles and proves, but doesn't mean what its author
+    # thinks it means (see sva_lint.py's module docstring).
+    sva_lint_report = lint_sva(rtl_source)
+
     formal_log.log_event("run", {
         "module": mod.name,
         "engine": engine.display_name,
@@ -822,6 +945,7 @@ async def formal_check(
         "cross_check_disagreements": sum(1 for r in results if r.get("cross_check", {}).get("agrees") is False),
         "retries": sum(1 for r in results if r.get("retried")),
         "regressions_found": len(reg_report.regressions),
+        "sva_lint_findings": len(sva_lint_report.findings),
         "success": all(r.get("success") for r in results),
     })
 
@@ -835,6 +959,24 @@ async def formal_check(
         mod,
         assume_props + [(entry["name"], entry["expr"], entry["kind"]) for _i, entry in target_props],
     )
+
+    decomposition_report = []
+    verdict_of = {r["name"]: r.get("verdict") for r in results}
+    for parent, part_names in decomposition_map.items():
+        vs = [verdict_of.get(n) for n in part_names]
+        if any(v == "FALSIFIED" for v in vs):
+            agg = "FALSIFIED"
+        elif all(v == "PROVEN" for v in vs):
+            agg = "PROVEN"
+        else:
+            agg = "INCONCLUSIVE"
+        decomposition_report.append({
+            "original": parent, "parts": part_names,
+            "part_verdicts": dict(zip(part_names, vs)), "verdict": agg,
+            "falsified_parts": [n for n, v in zip(part_names, vs) if v == "FALSIFIED"],
+            "note": ("Exact Boolean equivalence: the original holds iff every part holds, "
+                     "and fails iff any part fails (see assertion_decompose.py)."),
+        })
 
     return {
         "module": mod.name,
@@ -855,6 +997,20 @@ async def formal_check(
             "uncovered_ports": signal_coverage.uncovered_ports,
             "coverage_percent": signal_coverage.coverage_percent,
             "note": signal_coverage.note,
+        },
+        "decomposition": decomposition_report,
+        "sva_lint": {
+            "note": sva_lint_report.note,
+            "findings": [
+                {
+                    "rule": f.rule,
+                    "severity": f.severity,
+                    "line": f.line,
+                    "snippet": f.snippet,
+                    "message": f.message,
+                }
+                for f in sva_lint_report.findings
+            ],
         },
         "work_dir": base.as_posix(),
         "regression_report": regression_report,
