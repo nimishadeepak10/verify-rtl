@@ -49,6 +49,7 @@ from rtl_verify.param_reduce import (  # noqa: E402
     apply_parameter_overrides, parse_override_spec, recommend_parameter_reductions,
 )
 from rtl_verify.rom_abstract import convert_roms_to_case  # noqa: E402
+from rtl_verify.counter_abstract import abstract_counters, find_counter_candidates  # noqa: E402
 from rtl_verify.cross_check import cross_check_property  # noqa: E402
 from rtl_verify import regression  # noqa: E402
 from rtl_verify.regression import BaselineProperty  # noqa: E402
@@ -260,6 +261,8 @@ async def formal_check(
     rom_to_case: bool = Form(False),
     param_overrides: str = Form(""),
     auto_param_reduction: bool = Form(False),
+    counter_abstraction: str = Form(""),
+    auto_counter_abstraction: bool = Form(False),
 ):
     """Check one or more hand-written boolean properties with SymbiYosys.
 
@@ -408,6 +411,25 @@ async def formal_check(
             "caveat": ("BOUNDED CONFIGURATION: every verdict in this run is for the REDUCED "
                        "parameter values above, not the design's real size. PROVEN does not cover "
                        "the full configuration; FALSIFIED usually carries over but is not guaranteed."),
+        }
+
+    counter_report = None
+    manual_counters = [n.strip() for n in counter_abstraction.split(",") if n.strip()]
+    if manual_counters:
+        try:
+            cnt_top = analyze_rtl(design_source, top_module=top_module.strip() or None).name
+            design_source, counter_applied, counter_errors = abstract_counters(
+                design_source, cnt_top, manual_counters)
+        except ValueError as e:
+            return {"error": f"Could not apply counter_abstraction: {e}"}
+        if counter_errors:
+            return {"error": "Invalid counter_abstraction: " + "; ".join(counter_errors)}
+        counter_report = {
+            "applied": counter_applied,
+            "caveat": ("COUNTER ABSTRACTION: each listed counter may skip forward toward the "
+                       "values the design compares it against. Sound for PROVEN (every real "
+                       "behavior is still possible); a FALSIFIED verdict or REACHED cover may "
+                       "depend on a skip the real counter could only reach after the full count."),
         }
 
     try:
@@ -759,6 +781,69 @@ async def formal_check(
                     ),
                 }
 
+        # Auto counter abstraction: sound for proofs (the real +1 path is
+        # always still possible, see counter_abstract.py) and more precise
+        # than a cut point, so it is tried before cutting. Abstracts every
+        # wide counter that has critical values, in one shot.
+        auto_counter_info = None
+        if (verdict in _INCONCLUSIVE_STATUSES and auto_counter_abstraction and not manual_counters
+                and not (auto_blackbox_info and auto_blackbox_info["resolved"])):
+            cnt_cands = find_counter_candidates(mod, design_source)[:3]
+            if not cnt_cands:
+                auto_counter_info = {
+                    "resolved": False, "counters": [],
+                    "caveat": "No wide counter compared against literal critical values was found "
+                              "-- the original inconclusive result stands.",
+                }
+            else:
+                cand_view = [{"signal": c.signal, "width": c.width, "thresholds": c.thresholds,
+                              "reason": c.reason, "notes": c.notes} for c in cnt_cands]
+                try:
+                    cnt_source, cnt_applied, cnt_errs = abstract_counters(
+                        design_source, mod.name, [c.signal for c in cnt_cands])
+                    cnt_probed, cnt_mod = _analyze_and_probe(cnt_source, top_module)
+                    cnt_dir = base / f"prop_{i}_autocounter"
+                    cnt_dir.mkdir(parents=True, exist_ok=True)
+                    cnt_rtl_path = cnt_dir / rtl_path.name
+                    cnt_rtl_path.write_text(cnt_probed, encoding="utf-8")
+                    cnt_result, cnt_config, cnt_attempts = _run_chain(
+                        cnt_dir / "run", current_expr, name, kind,
+                        run_rtl_path=cnt_rtl_path, cutpoints=[], mod_override=cnt_mod,
+                    )
+                    cnt_status = cnt_result.status
+                except ValueError as e:
+                    cnt_result, cnt_status, cnt_applied, cnt_attempts, cnt_config = None, f"SKIPPED: {e}", [], [], None
+                if cnt_result is not None and cnt_status in ("PASS", "FAIL"):
+                    result, config = cnt_result, cnt_config
+                    all_attempts.extend(cnt_attempts)
+                    if kind == "cover":
+                        verdict = "REACHED" if result.success else "UNREACHED"
+                    else:
+                        verdict = "PROVEN" if result.success else "FALSIFIED"
+                    waveform_json_data = None
+                    if result.vcd_path is not None:
+                        waveform_json_data = vcd_to_json(result.vcd_path, module=cnt_mod)
+                        if "error" in waveform_json_data:
+                            waveform_json_data = None
+                    auto_counter_info = {
+                        "resolved": True, "counters": cand_view, "applied": cnt_applied,
+                        "caveat": (
+                            f"This {verdict} verdict was reached with counter abstraction on "
+                            f"{[c['signal'] for c in cand_view]}: the counter(s) may skip forward "
+                            "toward the values the design compares them against. If PROVEN: valid "
+                            "for the real design (every real behavior is still possible). If "
+                            "FALSIFIED or REACHED: the trace may rely on a skip the real counter "
+                            "could only reach after the full count -- check the cycle count "
+                            "against the real counter before treating it as real."
+                        ),
+                    }
+                else:
+                    auto_counter_info = {
+                        "resolved": False, "counters": cand_view,
+                        "caveat": f"Counter-abstracted run ended {cnt_status}; the original "
+                                  "inconclusive result stands.",
+                    }
+
         # Auto cut-point escalation: same contract as auto-black-box above --
         # only on a genuinely inconclusive verdict, only when opted in, only
         # when the caller didn't pick their own cut set, and tried AFTER
@@ -767,7 +852,8 @@ async def formal_check(
         # definitive verdict.
         auto_cutpoint_info = None
         if (verdict in _INCONCLUSIVE_STATUSES and auto_cutpoint and not manual_cuts
-                and not (auto_blackbox_info and auto_blackbox_info["resolved"])):
+                and not (auto_blackbox_info and auto_blackbox_info["resolved"])
+                and not (auto_counter_info and auto_counter_info["resolved"])):
             cut_candidates = recommend_cutpoint_candidates(mod, rtl_source)
             cut_tried = []
             for cand in cut_candidates[:3]:
@@ -823,7 +909,8 @@ async def formal_check(
         auto_param_info = None
         if (verdict in _INCONCLUSIVE_STATUSES and auto_param_reduction and not manual_param_overrides
                 and not (auto_blackbox_info and auto_blackbox_info["resolved"])
-                and not (auto_cutpoint_info and auto_cutpoint_info["resolved"])):
+                and not (auto_cutpoint_info and auto_cutpoint_info["resolved"])
+                and not (auto_counter_info and auto_counter_info["resolved"])):
             recs = recommend_parameter_reductions(design_source, mod.name)
             if not recs:
                 auto_param_info = {
@@ -896,6 +983,7 @@ async def formal_check(
             "retry_note": retry_note,
             "auto_blackbox": auto_blackbox_info,
             "auto_cutpoint": auto_cutpoint_info,
+            "auto_counter_abstraction": auto_counter_info,
             "auto_param_reduction": auto_param_info,
             "cut_signals": manual_cuts or None,
         }
@@ -915,6 +1003,13 @@ async def formal_check(
                 "note": "Skipped: this verdict came from an auto-black-boxed design, not the "
                         "plain RTL — cross-checking against a different design wouldn't be a "
                         "valid second opinion on the same result.",
+            }
+        elif (manual_counters or (auto_counter_info is not None and auto_counter_info["resolved"])):
+            entry_out["cross_check"] = {
+                "performed": False, "engine_label": None, "status": None, "agrees": None,
+                "note": "Skipped: this verdict came from a counter-abstracted design, not the "
+                        "plain RTL -- cross-checking the plain RTL wouldn't be a valid second "
+                        "opinion on the same result.",
             }
         elif (manual_param_overrides or (auto_param_info is not None and auto_param_info["resolved"])):
             entry_out["cross_check"] = {
@@ -1116,6 +1211,7 @@ async def formal_check(
         "decomposition": decomposition_report,
         "rom_to_case": rom_report,
         "parameter_reduction": param_report,
+        "counter_abstraction": counter_report,
         "sva_lint": {
             "note": sva_lint_report.note,
             "findings": [
