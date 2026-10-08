@@ -234,6 +234,15 @@ def _eval_range_bounds(inner: str, params: Dict[str, int]) -> Optional[tuple[int
         hi = params[m.group(1)] - int(m.group(2))
         lo = params[m.group(3)] - int(m.group(4))
         return hi, lo
+    # Ascending array form with a parameterized upper bound: `[0:DEPTH-1]`.
+    # Returned in the same (first, second) order the all-numeric branch
+    # above uses for `[0:3]` -> (0, 3).
+    m = re.fullmatch(r"(\d+)\s*:\s*(\w+)\s*-\s*(\d+)", inner)
+    if m and m.group(2) in params:
+        return int(m.group(1)), params[m.group(2)] - int(m.group(3))
+    m = re.fullmatch(r"(\d+)\s*:\s*(\w+)", inner)
+    if m and m.group(2) in params:
+        return int(m.group(1)), params[m.group(2)]
     return None
 
 
@@ -565,9 +574,15 @@ def _parse_internal_signals(
             arr_dim = name_m.group(2)
             if arr_dim:
                 bounds = _eval_range_bounds(arr_dim[1:-1], params)
-                if bounds is not None:
-                    is_array = True
-                    array_hi, array_lo = bounds
+                if bounds is None:
+                    # An array whose size cannot be evaluated must not be
+                    # probed as if it were a scalar: dut_probe would emit
+                    # `assign __dbg_x = x;` on a whole array, which does not
+                    # elaborate (confirmed: "Insufficient number of array
+                    # indices"). Leave it out of the probed set instead.
+                    continue
+                is_array = True
+                array_hi, array_lo = bounds
 
             signals.append(
                 InternalSignal(

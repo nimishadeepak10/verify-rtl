@@ -121,7 +121,7 @@ def part2_rom() -> None:
 
 
 def part3_solver() -> None:
-    from api.main import formal_check
+    from _formal_call import formal_check
     import test_cutpoint_and_decompose as t
 
     def call(source, top, props, **kw):

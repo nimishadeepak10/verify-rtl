@@ -51,6 +51,9 @@ from rtl_verify.param_reduce import (  # noqa: E402
 from rtl_verify.rom_abstract import convert_roms_to_case  # noqa: E402
 from rtl_verify.counter_abstract import abstract_counters, find_counter_candidates  # noqa: E402
 from rtl_verify.case_split import check_case_split  # noqa: E402
+from rtl_verify.data_independence import (  # noqa: E402
+    analyze_data_independence, guess_data_signals, property_data_use, recommend_data_width_reductions,
+)
 from rtl_verify.cross_check import cross_check_property  # noqa: E402
 from rtl_verify import regression  # noqa: E402
 from rtl_verify.regression import BaselineProperty  # noqa: E402
@@ -264,6 +267,9 @@ async def formal_check(
     auto_param_reduction: bool = Form(False),
     counter_abstraction: str = Form(""),
     auto_counter_abstraction: bool = Form(False),
+    data_signals: str = Form(""),
+    data_width_reduction: bool = Form(False),
+    auto_data_width_reduction: bool = Form(False),
 ):
     """Check one or more hand-written boolean properties with SymbiYosys.
 
@@ -412,6 +418,60 @@ async def formal_check(
             "caveat": ("BOUNDED CONFIGURATION: every verdict in this run is for the REDUCED "
                        "parameter values above, not the design's real size. PROVEN does not cover "
                        "the full configuration; FALSIFIED usually carries over but is not guaranteed."),
+        }
+
+    data_independence_report = None
+    data_signal_list = [n.strip() for n in data_signals.split(",") if n.strip()]
+    if data_width_reduction:
+        try:
+            di_mod = analyze_rtl(design_source, top_module=top_module.strip() or None)
+        except ValueError as e:
+            return {"error": str(e)}
+        if not data_signal_list:
+            data_signal_list = guess_data_signals(di_mod)
+        di_rep, di_recs = recommend_data_width_reductions(di_mod, design_source, data_signal_list)
+        data_independence_report = {
+            "status": di_rep.status, "data_signals": di_rep.data_signals, "tainted": di_rep.tainted,
+            "violations": [vars(v) for v in di_rep.violations], "unknowns": di_rep.unknowns,
+            "transport_only": di_rep.transport_only,
+            "computations": [vars(v) for v in di_rep.computations], "note": di_rep.note,
+        }
+        if di_rep.status != "INDEPENDENT":
+            return {"error": f"data_width_reduction refused: data independence is {di_rep.status}. "
+                             f"{di_rep.note}", "data_independence": data_independence_report}
+        if not di_recs:
+            return {"error": "data_width_reduction: the design is data-independent, but no literal "
+                             "parameter sizes only data signals, so there is no width to reduce.",
+                    "data_independence": data_independence_report}
+        try:
+            _props_for_check = json.loads(properties) if properties.strip() else []
+        except json.JSONDecodeError:
+            _props_for_check = []  # the real JSON error is reported below
+        for prop in _props_for_check if isinstance(_props_for_check, list) else []:
+            uses_data, uses_arith = property_data_use(str(prop.get("expr") or ""), di_rep.tainted)
+            if uses_data and uses_arith:
+                return {"error": f"data_width_reduction refused: property '{prop.get('name')}' applies "
+                                 "arithmetic or magnitude comparison to data, which does not generalize "
+                                 "across widths (only copy/equality uses of data do)."}
+            if uses_data and not di_rep.transport_only:
+                return {"error": f"data_width_reduction refused: property '{prop.get('name')}' mentions "
+                                 "data, but the design computes on data (arithmetic/logic/comparison), "
+                                 "so a reduced-width result is not evidence for the real width. A "
+                                 "property that mentions no data signal is still allowed.",
+                        "data_independence": data_independence_report}
+        try:
+            design_source, dw_applied, _missing = apply_parameter_overrides(
+                design_source, di_mod.name, {r.name: r.proposed for r in di_recs})
+        except ValueError as e:
+            return {"error": f"Could not apply data width reduction: {e}"}
+        manual_param_overrides = {r.name: r.proposed for r in di_recs}
+        param_report = {
+            "applied": dw_applied,
+            "caveat": ("DATA-WIDTH REDUCTION, justified by a data-independence analysis: data does not "
+                       "reach any control sink, so a property that mentions no data signal gets an "
+                       "EXACT result at the reduced width. A property that does mention data is only "
+                       "covered if it uses data by copy/equality (checked) and is otherwise a "
+                       "reduced-width result."),
         }
 
     counter_report = None
@@ -903,6 +963,76 @@ async def formal_check(
                     ),
                 }
 
+        # Auto data-width reduction: unlike plain parameter reduction this is
+        # justified by an information-flow analysis (data_independence.py)
+        # that data never reaches control, so it is exact for properties
+        # that do not mention data. Needs named (or name-guessed) data signals.
+        auto_data_info = None
+        if (verdict in _INCONCLUSIVE_STATUSES and auto_data_width_reduction
+                and not manual_param_overrides
+                and not (auto_blackbox_info and auto_blackbox_info["resolved"])
+                and not (auto_counter_info and auto_counter_info["resolved"])
+                and not (auto_cutpoint_info and auto_cutpoint_info["resolved"])):
+            sig_list = data_signal_list or guess_data_signals(mod)
+            if not sig_list:
+                auto_data_info = {"resolved": False, "caveat": "No data signals named and none guessed from port names."}
+            else:
+                dr, drecs = recommend_data_width_reductions(mod, design_source, sig_list)
+                uses_data, uses_arith = property_data_use(current_expr, dr.tainted)
+                view = {"status": dr.status, "data_signals": dr.data_signals, "violations": [vars(v) for v in dr.violations],
+                        "unknowns": dr.unknowns, "note": dr.note}
+                if dr.status != "INDEPENDENT":
+                    auto_data_info = {"resolved": False, "independence": view,
+                                      "caveat": f"Data independence is {dr.status}; width reduction would be unsound, so it was not tried."}
+                elif not drecs:
+                    auto_data_info = {"resolved": False, "independence": view,
+                                      "caveat": "Data-independent, but no literal parameter sizes only data signals."}
+                elif uses_data and (uses_arith or not dr.transport_only):
+                    auto_data_info = {"resolved": False, "independence": view,
+                                      "caveat": "This property mentions data, and either applies arithmetic/magnitude comparison to it or the design computes on data; a reduced-width result would not generalize, so it was not tried."}
+                else:
+                    dw_over = {r.name: r.proposed for r in drecs}
+                    try:
+                        dw_source, dw_applied, _m = apply_parameter_overrides(design_source, mod.name, dw_over)
+                        dw_probed, dw_mod = _analyze_and_probe(dw_source, top_module)
+                        dw_dir = base / f"prop_{i}_autodatawidth"
+                        dw_dir.mkdir(parents=True, exist_ok=True)
+                        dw_rtl_path = dw_dir / rtl_path.name
+                        dw_rtl_path.write_text(dw_probed, encoding="utf-8")
+                        dw_result, dw_config, dw_attempts = _run_chain(
+                            dw_dir / "run", current_expr, name, kind,
+                            run_rtl_path=dw_rtl_path, cutpoints=[], mod_override=dw_mod,
+                        )
+                        dw_status = dw_result.status
+                    except ValueError as e:
+                        dw_result, dw_status, dw_applied, dw_attempts, dw_config = None, f"SKIPPED: {e}", [], [], None
+                    if dw_result is not None and dw_status in ("PASS", "FAIL"):
+                        result, config = dw_result, dw_config
+                        all_attempts.extend(dw_attempts)
+                        if kind == "cover":
+                            verdict = "REACHED" if result.success else "UNREACHED"
+                        else:
+                            verdict = "PROVEN" if result.success else "FALSIFIED"
+                        waveform_json_data = None
+                        if result.vcd_path is not None:
+                            waveform_json_data = vcd_to_json(result.vcd_path, module=dw_mod)
+                            if "error" in waveform_json_data:
+                                waveform_json_data = None
+                        auto_data_info = {
+                            "resolved": True, "overrides": dw_over, "applied": dw_applied,
+                            "independence": view, "exact": not uses_data,
+                            "caveat": (
+                                f"This {verdict} verdict is for data width reduced via {dw_over}. Data was "
+                                "shown not to reach control. " + (
+                                    "The property mentions no data signal, so the result is exact for the real width."
+                                    if not uses_data else
+                                    "The property mentions data only by copy/equality; the result is a reduced-width "
+                                    "result, valid for the real width under the standard data-independence argument.")),
+                        }
+                    else:
+                        auto_data_info = {"resolved": False, "independence": view, "overrides": dw_over,
+                                          "caveat": f"Reduced-width run ended {dw_status}; the original inconclusive result stands."}
+
         # Auto parameter reduction: the LAST resort, because unlike every
         # abstraction above it is not sound for the full configuration (see
         # param_reduce.py). Only structure-named literal parameters are
@@ -911,7 +1041,8 @@ async def formal_check(
         if (verdict in _INCONCLUSIVE_STATUSES and auto_param_reduction and not manual_param_overrides
                 and not (auto_blackbox_info and auto_blackbox_info["resolved"])
                 and not (auto_cutpoint_info and auto_cutpoint_info["resolved"])
-                and not (auto_counter_info and auto_counter_info["resolved"])):
+                and not (auto_counter_info and auto_counter_info["resolved"])
+                and not (auto_data_info and auto_data_info["resolved"])):
             recs = recommend_parameter_reductions(design_source, mod.name)
             if not recs:
                 auto_param_info = {
@@ -985,6 +1116,7 @@ async def formal_check(
             "auto_blackbox": auto_blackbox_info,
             "auto_cutpoint": auto_cutpoint_info,
             "auto_counter_abstraction": auto_counter_info,
+            "auto_data_width_reduction": auto_data_info,
             "auto_param_reduction": auto_param_info,
             "cut_signals": manual_cuts or None,
         }
@@ -1004,6 +1136,11 @@ async def formal_check(
                 "note": "Skipped: this verdict came from an auto-black-boxed design, not the "
                         "plain RTL — cross-checking against a different design wouldn't be a "
                         "valid second opinion on the same result.",
+            }
+        elif (auto_data_info is not None and auto_data_info.get("resolved")):
+            entry_out["cross_check"] = {
+                "performed": False, "engine_label": None, "status": None, "agrees": None,
+                "note": "Skipped: this verdict is for a data-width-reduced design, not the plain RTL.",
             }
         elif (manual_counters or (auto_counter_info is not None and auto_counter_info["resolved"])):
             entry_out["cross_check"] = {
@@ -1213,6 +1350,7 @@ async def formal_check(
         "rom_to_case": rom_report,
         "parameter_reduction": param_report,
         "counter_abstraction": counter_report,
+        "data_independence": data_independence_report,
         "sva_lint": {
             "note": sva_lint_report.note,
             "findings": [

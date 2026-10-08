@@ -103,7 +103,7 @@ def main() -> None:
     if picorv32_path.is_file():
         print("=== Real: a genuine formal property against picorv32.v's actual RTL "
               "(the exact bug this fix was found chasing) ===")
-        from api.main import formal_check  # noqa: E402 (local import: avoids app import cost above)
+        from _formal_call import formal_check  # noqa: E402 (local import: avoids app import cost above)
 
         source = picorv32_path.read_text(encoding="utf-8")
         mod3 = analyze_rtl(source, top_module="picorv32")

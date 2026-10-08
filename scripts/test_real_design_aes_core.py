@@ -77,7 +77,7 @@ def main() -> None:
     )
     print("OK\n")
 
-    from api.main import formal_check  # noqa: E402 (local import: avoids app import cost above)
+    from _formal_call import formal_check  # noqa: E402 (local import: avoids app import cost above)
 
     print("=== Real: a genuine FSM invariant on aes_core, proven, with "
           "assumption consistency and signal coverage both reporting honestly ===")

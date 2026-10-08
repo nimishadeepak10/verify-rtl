@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
-from api.main import formal_check  # noqa: E402
+from _formal_call import formal_check  # noqa: E402
 
 PROP = [{"name": "grant_onehot0", "expr": "(grant == 4'd0) || $onehot(grant)", "kind": "assert"}]
 

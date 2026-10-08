@@ -81,7 +81,7 @@ def part2_rewrite() -> None:
 
 
 def part3_solver() -> None:
-    from api.main import formal_check
+    from _formal_call import formal_check
 
     def call(source, props, **kw):
         args = dict(rtl_file=None, rtl_text=source, top_module="timeout_ctrl",

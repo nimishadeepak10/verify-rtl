@@ -102,7 +102,7 @@ PROP = [{"name": "grant_onehot0", "expr": "(grant == 4'd0) || $onehot(grant)", "
 
 
 def part3_real_solver() -> None:
-    from api.main import formal_check
+    from _formal_call import formal_check
 
     source = _wrapper_with_accumulator()
 
