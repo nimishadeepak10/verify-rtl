@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import tempfile
@@ -53,6 +54,7 @@ from rtl_verify.counter_abstract import abstract_counters, find_counter_candidat
 from rtl_verify.case_split import check_case_split  # noqa: E402
 from rtl_verify import invariant_mining  # noqa: E402
 from rtl_verify import assumption_necessity  # noqa: E402
+from rtl_verify import assertion_search, llm_client, signal_bank  # noqa: E402
 from rtl_verify.data_independence import (  # noqa: E402
     analyze_data_independence, guess_data_signals, property_data_use, recommend_data_width_reductions,
 )
@@ -1640,6 +1642,85 @@ async def formal_mutation_adequacy(
             ],
         },
         "work_dir": base.as_posix(),
+    }
+
+
+@app.post("/api/formal/assertion_search")
+async def formal_assertion_search(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    top_module: str = Form(""),
+    spec_text: str = Form(""),
+    signals: str = Form(""),
+    rollouts: int = Form(4),
+    timeout_sec: int = Form(60),
+    depth_override: int = Form(0),
+):
+    """Signal-wise assertion generation by Monte Carlo Tree Self-Refine, with a
+    solver-grounded reward (see src/rtl_verify/assertion_search.py, adapted
+    from SANGAM, IEEE ICLAD 2025).
+
+    For each selected signal (`signals`, comma-separated; default: every
+    signal the specification and the RTL both mention, or every signal when no
+    `spec_text` is given), a search tree of assertion sets is grown for
+    `rollouts` rounds. Each node is scored by real solver runs, and the model
+    is shown the evidence (counterexample values, vacuity, redundancy) when it
+    refines. The response lists, per signal, the assertions that were
+    PROVEN, non-vacuous and not implied by the others (`kept`), the ones that
+    were FALSIFIED with counterexamples for a person to judge
+    (`needs_review`), and everything dropped with its reason.
+
+    Requires ANTHROPIC_API_KEY. Costs roughly (rollouts + 1) model calls per
+    signal, plus several solver runs per assertion.
+    """
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+    if not 1 <= rollouts <= 12:
+        return {"error": "rollouts must be between 1 and 12"}
+    if not llm_client.is_configured():
+        return {"error": "ANTHROPIC_API_KEY is not set; assertion search needs a language model."}
+    formal_engines = formal_backends()
+    if not formal_engines:
+        return {"error": "No formal backend available. Install the OSS CAD Suite."}
+    engine = formal_engines[0]
+    try:
+        probed_source, mod = _analyze_and_probe(rtl_source, top_module)
+    except ValueError as e:
+        return {"error": str(e)}
+    if mod.has_multiple_clocks or (mod.is_sequential and not mod.clock_port):
+        return {"error": "assertion search needs a single-clock (or combinational) design"}
+
+    bank = signal_bank.build_signal_bank(mod, rtl_source, spec_text)
+    wanted = [n.strip() for n in signals.split(",") if n.strip()]
+    missing = [n for n in wanted if n not in bank.signals]
+    if missing:
+        return {"error": f"signals not found in the signal bank: {missing}. Available: {sorted(bank.signals)}"}
+    chosen = wanted or list(bank.signals)
+
+    base = Path(tempfile.mkdtemp(prefix="assert_search_api_"))
+    rtl_path = base / f"dut{dut_source_extension(rtl_source, 'systemverilog')}"
+    rtl_path.write_text(probed_source, encoding="utf-8")
+    evaluator = assertion_search.SolverEvaluator(mod, rtl_path, engine, base / "work",
+                                                 timeout_sec=timeout_sec, depth_override=depth_override)
+    refiner = assertion_search.LLMRefiner(mod)
+    out = []
+    for name in chosen:
+        res = await asyncio.to_thread(assertion_search.search_signal, bank.signals[name], evaluator,
+                                      refiner, rollouts)
+        out.append(res.view())
+    return {
+        "module": mod.name,
+        "signals": out,
+        "signal_bank": {"mapped": list(bank.signals), "rtl_only": bank.rtl_only, "used_spec": bank.used_spec},
+        "solver_runs": evaluator.solver_runs,
+        "note": ("kept = proven, non-vacuous and not implied by the other kept assertions. needs_review "
+                 "= FALSIFIED: either the assertion is wrong or the design has a bug; the counterexample "
+                 "is returned so a person can decide. Nothing here replaces reading kept assertions "
+                 "against the specification."),
     }
 
 
