@@ -54,7 +54,7 @@ from rtl_verify.counter_abstract import abstract_counters, find_counter_candidat
 from rtl_verify.case_split import check_case_split  # noqa: E402
 from rtl_verify import invariant_mining  # noqa: E402
 from rtl_verify import assumption_necessity  # noqa: E402
-from rtl_verify import assertion_search, llm_client, progress_check, signal_bank  # noqa: E402
+from rtl_verify import assertion_search, llm_client, progress_check, signal_bank, strategy_planner  # noqa: E402
 from rtl_verify.data_independence import (  # noqa: E402
     analyze_data_independence, guess_data_signals, property_data_use, recommend_data_width_reductions,
 )
@@ -1808,6 +1808,48 @@ async def formal_progress(
                  "not a proof of it. Fairness assumptions are claims about the environment: keep only "
                  "the ones you can justify, and drop those reported as unneeded."),
     }
+
+
+@app.post("/api/formal/plan")
+async def formal_plan(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    top_module: str = Form(""),
+    goal: str = Form("prove"),
+    properties: str = Form("[]"),
+    data_signals: str = Form(""),
+    has_spec: bool = Form(False),
+):
+    """Recommend which techniques this design needs for this goal. Runs no
+    solver (see src/rtl_verify/strategy_planner.py).
+
+    `goal` is one of prove, signoff, find_bugs, progress, explore: it decides
+    what an abstraction's answer is allowed to mean (a sign-off proof must
+    not rest on a bounded-configuration result; a bug hunt may). Every step
+    in the response carries a decision, the reason, the soundness class, the
+    evidence it was based on, and `apply_with`: the parameters to pass to
+    /api/formal (or the endpoint to use) to apply it. Techniques the design
+    has no structure for come back NOT_APPLICABLE with the reason, so they
+    can be questioned.
+    """
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+    try:
+        props = json.loads(properties) if properties.strip() else []
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON: {e}"}
+    if not isinstance(props, list):
+        return {"error": "properties must be a JSON list"}
+    names = [n.strip() for n in data_signals.split(",") if n.strip()]
+    try:
+        plan = strategy_planner.plan_strategy(rtl_source, top_module, goal, props, names or None, has_spec)
+    except ValueError as e:
+        return {"error": str(e)}
+    return plan.view()
 
 
 @app.post("/api/formal/case_split")
