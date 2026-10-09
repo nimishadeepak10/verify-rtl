@@ -54,7 +54,7 @@ from rtl_verify.counter_abstract import abstract_counters, find_counter_candidat
 from rtl_verify.case_split import check_case_split  # noqa: E402
 from rtl_verify import invariant_mining  # noqa: E402
 from rtl_verify import assumption_necessity  # noqa: E402
-from rtl_verify import assertion_search, llm_client, signal_bank  # noqa: E402
+from rtl_verify import assertion_search, llm_client, progress_check, signal_bank  # noqa: E402
 from rtl_verify.data_independence import (  # noqa: E402
     analyze_data_independence, guess_data_signals, property_data_use, recommend_data_width_reductions,
 )
@@ -1721,6 +1721,92 @@ async def formal_assertion_search(
                  "= FALSIFIED: either the assertion is wrong or the design has a bug; the counterexample "
                  "is returned so a person can decide. Nothing here replaces reading kept assertions "
                  "against the specification."),
+    }
+
+
+@app.post("/api/formal/progress")
+async def formal_progress(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    top_module: str = Form(""),
+    specs: str = Form("[]"),
+    fairness: str = Form("[]"),
+    properties: str = Form("[]"),
+    find_bound: bool = Form(False),
+    max_bound: int = Form(32),
+    timeout_sec: int = Form(120),
+    depth_override: int = Form(0),
+):
+    """Bounded forward-progress checks: deadlock, livelock, starvation (see
+    src/rtl_verify/progress_check.py, adapted from LUBIS EDA's article).
+
+    `specs` is a JSON list of {"name", "request", "response", "bound",
+    optional "competing", optional "sticky"}: the request must be answered
+    within `bound` cycles. `fairness` is a JSON list of {"name", "expr",
+    "within"}: environment conditions assumed to hold at least once in every
+    `within` cycles. `properties` may carry ordinary assume-kind constraints.
+    Each spec gets PROVEN or FALSIFIED; a counterexample is labelled
+    STARVATION / DEADLOCK_LIKE / LIVELOCK_LIKE (a heuristic over that one
+    trace), and a PROVEN verdict says which fairness assumptions it needed.
+    With `find_bound`, the smallest provable bound is searched up to
+    `max_bound`. Expressions may use internal registers as `__dbg_<name>`.
+    """
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+    try:
+        spec_in = json.loads(specs) if specs.strip() else []
+        fair_in = json.loads(fairness) if fairness.strip() else []
+        prop_in = json.loads(properties) if properties.strip() else []
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON: {e}"}
+    if not isinstance(spec_in, list) or not spec_in:
+        return {"error": "specs must be a non-empty JSON list"}
+    try:
+        spec_objs = [progress_check.ProgressSpec(
+            name=str(d["name"]), request=str(d["request"]), response=str(d["response"]),
+            bound=int(d["bound"]), competing=str(d.get("competing", "")),
+            sticky=bool(d.get("sticky", True))) for d in spec_in]
+        fair_objs = [progress_check.Fairness(name=str(d["name"]), expr=str(d["expr"]),
+                                             within=int(d["within"])) for d in fair_in]
+    except (KeyError, TypeError, ValueError) as e:
+        return {"error": f"Invalid spec or fairness entry: {e!r}"}
+    if any(sp.bound < 0 or sp.bound > 4096 for sp in spec_objs) or any(f.within < 1 for f in fair_objs):
+        return {"error": "bound must be 0..4096 and fairness `within` must be at least 1"}
+    assume_props = [(str(p["name"]), str(p["expr"]), "assume") for p in prop_in
+                    if isinstance(p, dict) and p.get("kind") == "assume"]
+
+    formal_engines = formal_backends()
+    if not formal_engines:
+        return {"error": "No formal backend available. Install the OSS CAD Suite."}
+    try:
+        probed_source, mod = _analyze_and_probe(rtl_source, top_module)
+    except ValueError as e:
+        return {"error": str(e)}
+    base = Path(tempfile.mkdtemp(prefix="progress_api_"))
+    rtl_path = base / f"dut{dut_source_extension(rtl_source, 'systemverilog')}"
+    rtl_path.write_text(probed_source, encoding="utf-8")
+    checker = progress_check.ProgressChecker(mod, rtl_path, formal_engines[0], base / "work",
+                                             timeout_sec=timeout_sec, depth_override=depth_override)
+    results = []
+    for sp in spec_objs:
+        res = await asyncio.to_thread(checker.check, sp, fair_objs, assume_props)
+        entry = res.view()
+        if find_bound:
+            entry["bound_search"] = await asyncio.to_thread(checker.find_min_bound, sp, fair_objs,
+                                                            assume_props, max_bound)
+        results.append(entry)
+    return {
+        "module": mod.name,
+        "results": results,
+        "solver_runs": checker.runs,
+        "note": ("A bound is a safety property and is proven for all time, but 'eventually' with no "
+                 "bound is not. A failing spec at every bound up to the cap is evidence of starvation, "
+                 "not a proof of it. Fairness assumptions are claims about the environment: keep only "
+                 "the ones you can justify, and drop those reported as unneeded."),
     }
 
 
