@@ -52,6 +52,7 @@ from rtl_verify.rom_abstract import convert_roms_to_case  # noqa: E402
 from rtl_verify.counter_abstract import abstract_counters, find_counter_candidates  # noqa: E402
 from rtl_verify.case_split import check_case_split  # noqa: E402
 from rtl_verify import invariant_mining  # noqa: E402
+from rtl_verify import assumption_necessity  # noqa: E402
 from rtl_verify.data_independence import (  # noqa: E402
     analyze_data_independence, guess_data_signals, property_data_use, recommend_data_width_reductions,
 )
@@ -274,6 +275,7 @@ async def formal_check(
     mine_invariants: bool = Form(False),
     auto_invariants: bool = Form(False),
     invariant_candidates: str = Form(""),
+    check_assumptions: bool = Form(False),
 ):
     """Check one or more hand-written boolean properties with SymbiYosys.
 
@@ -734,6 +736,7 @@ async def formal_check(
     if mine_invariants:
         _get_mining()
 
+    necessity_inputs: dict = {}
     results = []
     for i, entry in target_props:
         name, expr, kind = entry["name"], entry["expr"], entry["kind"]
@@ -1176,6 +1179,9 @@ async def formal_check(
             inv_at_start and not any(
                 x and x.get("resolved") for x in
                 (auto_blackbox_info, auto_counter_info, auto_cutpoint_info, auto_data_info, auto_param_info)))
+        necessity_inputs[name] = (current_expr, inv_used, not any(
+            x and x.get("resolved") for x in
+            (auto_blackbox_info, auto_counter_info, auto_cutpoint_info, auto_data_info, auto_param_info)))
         entry_out = {
             **entry,
             "expr": current_expr,
@@ -1266,6 +1272,35 @@ async def formal_check(
             }
 
         results.append(entry_out)
+
+    # Assumption necessity (assumption_necessity.py): for each PROVEN assert,
+    # which of the supplied assumptions did the proof actually need? Only for
+    # verdicts reached on the design as analyzed (not an abstraction a rescue
+    # escalation introduced), and only when asked, since it costs one proof
+    # per assumption per property.
+    necessity_summary = None
+    if check_assumptions and assume_props:
+        necessity_reports = []
+        for r in results:
+            info = necessity_inputs.get(r["name"])
+            if info is None or r.get("kind") != "assert" or r.get("verdict") != "PROVEN":
+                continue
+            expr_n, inv_u, plain = info
+            if not plain:
+                nr = assumption_necessity.NecessityReport(
+                    property_name=r["name"], status="NOT_APPLICABLE",
+                    note="this verdict came from an abstraction escalation, so removing an assumption "
+                         "from the plain design would not reproduce it")
+            else:
+                nr = assumption_necessity.check_assumption_necessity(
+                    mod, rtl_path, engine, assume_props, (r["name"], expr_n),
+                    timeout_sec=max(60, timeout_sec // 2), depth_override=depth_override,
+                    work_root=base / f"necessity_{r['name']}",
+                    fixed_assumes=inv_assumes if inv_u else [],
+                    engine_kwargs={"cutpoints": manual_cuts} if manual_cuts else None)
+            r["assumption_necessity"] = nr.view()
+            necessity_reports.append(nr)
+        necessity_summary = assumption_necessity.summarize(necessity_reports, assume_props)
 
     # Vacuity confidence: an assert can be PROVEN only because its own
     # triggering condition never occurs, which "proves" nothing useful.
@@ -1437,6 +1472,7 @@ async def formal_check(
         "counter_abstraction": counter_report,
         "data_independence": data_independence_report,
         "invariant_mining": mining_state["report"].view() if mining_state["report"] else None,
+        "assumption_necessity": necessity_summary,
         "sva_lint": {
             "note": sva_lint_report.note,
             "findings": [
