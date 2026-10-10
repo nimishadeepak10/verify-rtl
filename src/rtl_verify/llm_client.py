@@ -23,6 +23,27 @@ class LLMNotConfigured(RuntimeError):
     pass
 
 
+# Cumulative model usage for this process. Every call below adds to it, so a
+# run can report exactly how many model calls and tokens it spent (and that a
+# deterministic path spent none) instead of asserting it.
+USAGE = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+
+
+def _record(resp) -> None:
+    u = getattr(resp, "usage", None)
+    USAGE["calls"] += 1
+    USAGE["input_tokens"] += int(getattr(u, "input_tokens", 0) or 0)
+    USAGE["output_tokens"] += int(getattr(u, "output_tokens", 0) or 0)
+
+
+def usage_snapshot() -> dict:
+    return dict(USAGE)
+
+
+def usage_since(before: dict) -> dict:
+    return {k: USAGE[k] - before.get(k, 0) for k in USAGE}
+
+
 def is_configured() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
@@ -47,6 +68,7 @@ def complete(system: str, user: str, max_tokens: int = 2000, model: str = DEFAUL
         system=system,
         messages=[{"role": "user", "content": user}],
     )
+    _record(resp)
     return "".join(
         block.text for block in resp.content if getattr(block, "type", "") == "text"
     )
@@ -87,6 +109,7 @@ def complete_structured(
         thinking={"type": "disabled"},
         output_config={"format": {"type": "json_schema", "schema": schema}},
     )
+    _record(resp)
     text = next(
         (block.text for block in resp.content if getattr(block, "type", "") == "text"),
         None,
