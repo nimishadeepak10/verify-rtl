@@ -54,7 +54,7 @@ from rtl_verify.counter_abstract import abstract_counters, find_counter_candidat
 from rtl_verify.case_split import check_case_split  # noqa: E402
 from rtl_verify import invariant_mining  # noqa: E402
 from rtl_verify import assumption_necessity  # noqa: E402
-from rtl_verify import assertion_search, llm_client, progress_check, signal_bank, strategy_planner  # noqa: E402
+from rtl_verify import assertion_search, cex_replay, llm_client, plan_executor, progress_check, signal_bank, strategy_planner  # noqa: E402
 from rtl_verify.data_independence import (  # noqa: E402
     analyze_data_independence, guess_data_signals, property_data_use, recommend_data_width_reductions,
 )
@@ -1850,6 +1850,80 @@ async def formal_plan(
     except ValueError as e:
         return {"error": str(e)}
     return plan.view()
+
+
+@app.post("/api/formal/plan/execute")
+async def formal_plan_execute(
+    rtl_file: UploadFile | None = File(None),
+    rtl_text: str = Form(""),
+    top_module: str = Form(""),
+    goal: str = Form("prove"),
+    properties: str = Form("[]"),
+    data_signals: str = Form(""),
+    timeout_sec: int = Form(300),
+    depth_override: int = Form(0),
+    cross_check: bool = Form(True),
+    max_attempts: int = Form(6),
+    proactive: bool = Form(False),
+):
+    """Run the strategy plan (see src/rtl_verify/plan_executor.py).
+
+    `proactive`: apply a RECOMMENDED sound abstraction first instead of waiting
+    for the plain proof to fail, and confirm any counterexample it produces by
+    replaying it on the real design (src/rtl_verify/cex_replay.py).
+
+    The baseline is the plain proof plus the exact transforms the plan
+    recommends. Techniques held in reserve are then tried one at a time, each
+    only on the properties that are still inconclusive, stopping per property
+    at the first definitive result. Every outcome is labelled by what produced
+    it: a FALSIFIED under an abstraction that adds behaviours comes back
+    FALSIFIED_UNCONFIRMED, never as a bug, and a PROVEN for a reduced
+    configuration comes back PROVEN_FOR_REDUCED_CONFIG. Techniques the goal
+    forbids are skipped with the reason; ones that live at another endpoint
+    are listed, not run.
+    """
+    import inspect
+
+    if rtl_file and rtl_file.filename:
+        rtl_source = (await rtl_file.read()).decode("utf-8", errors="replace")
+    elif rtl_text.strip():
+        rtl_source = rtl_text
+    else:
+        return {"error": "Provide rtl_file or rtl_text"}
+    try:
+        props = json.loads(properties) if properties.strip() else []
+    except json.JSONDecodeError as e:
+        return {"error": f"Invalid JSON: {e}"}
+    if not isinstance(props, list) or not all(isinstance(p, dict) and "name" in p for p in props):
+        return {"error": "properties must be a JSON list of {name, expr, kind} objects"}
+    if not 1 <= max_attempts <= 12:
+        return {"error": "max_attempts must be between 1 and 12"}
+    names = [n.strip() for n in data_signals.split(",") if n.strip()]
+    try:
+        plan = strategy_planner.plan_strategy(rtl_source, top_module, goal, props, names or None)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    defaults = {}
+    for pname, prm in inspect.signature(formal_check).parameters.items():
+        d = prm.default
+        defaults[pname] = getattr(d, "default", d)
+
+    async def run_formal(**kw):
+        return await formal_check(**{**defaults, **kw})
+
+    base = {"rtl_file": None, "rtl_text": rtl_source, "top_module": top_module,
+            "timeout_sec": timeout_sec, "depth_override": depth_override, "cross_check": cross_check}
+    replay = None
+    if proactive:
+        probed_source, probed_mod = _analyze_and_probe(rtl_source, top_module)
+
+        async def replay(name, expr, wf):  # noqa: F811 - closure over the probed design
+            return await asyncio.to_thread(cex_replay.replay_counterexample, probed_mod, probed_source, expr, wf)
+
+    report = await plan_executor.execute_plan(plan, run_formal, base, props, set(defaults), max_attempts,
+                                              proactive=proactive, replay=replay)
+    return {"plan_summary": plan.summary, **report.view()}
 
 
 @app.post("/api/formal/case_split")
